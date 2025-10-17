@@ -1,0 +1,647 @@
+sudo apt install -y iw hostapd iproute2 zram-tools ppp minicom dnsmasq-base ufw
+
+
+sudo apt purge -y modemmanager 
+
+
+tee /usr/local/bin/create_ap_dynamic.sh >/dev/null <<'SH'
+#!/bin/sh
+set -eu
+
+WIFI_IF="${WIFI_IF:-wlan0}"
+SSID="${SSID:-MirakoAP}"
+PASS="${PASS:-12345678}"
+GATEWAY="${GATEWAY:-192.168.13.1}"
+CHANNEL="${CHANNEL:-1}"
+BAND="${BAND:-2.4}"
+CREATE_AP="${CREATE_AP:-/usr/bin/create_ap}"
+
+find_upstream() {
+  # 1) pela rota padrão
+  DEV="$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
+  if [ -n "${DEV:-}" ] && [ "$DEV" != "$WIFI_IF" ]; then
+    echo "$DEV"; return 0
+  fi
+  # 2) varredura por ifs típicas (ignora wlan)
+  for IF in ppp0 end0 eth0 $(ls /sys/class/net 2>/dev/null | grep -E '^(enx|enp|ens|eth|usb|wwan|ppp)' | sort -u); do
+    [ "$IF" = "$WIFI_IF" ] && continue
+    ip link show "$IF" >/dev/null 2>&1 || continue
+    OPER="$(cat /sys/class/net/$IF/operstate 2>/dev/null || echo unknown)"
+    if [ "$OPER" = "up" ] || ip link show "$IF" | grep -q "state UP"; then
+      echo "$IF"; return 0
+    fi
+  done
+  return 1
+}
+
+[ -x "$CREATE_AP" ] || { echo "ERRO: $CREATE_AP não encontrado."; exit 1; }
+ip link show "$WIFI_IF" >/dev/null 2>&1 || { echo "ERRO: $WIFI_IF não existe."; exit 1; }
+
+UPSTREAM_IF="$(find_upstream || true)"
+
+if [ -n "${UPSTREAM_IF:-}" ]; then
+  echo "$(date -Iseconds) [create_ap_dynamic] Upstream: $UPSTREAM_IF (NAT)"
+  exec "$CREATE_AP" -c "$CHANNEL" -w 2 -m nat "$WIFI_IF" "$UPSTREAM_IF" "$SSID" "$PASS" -g "$GATEWAY" --freq-band "$BAND" --no-virt
+else
+  echo "$(date -Iseconds) [create_ap_dynamic] Sem upstream. AP isolado com DHCP (usa DNS do sistema quando houver)."
+  # ⚠️ Força modo sem internet para não exigir "interface de internet"
+  exec "$CREATE_AP" -c "$CHANNEL" -w 2 -m none --no-virt "$WIFI_IF" "$SSID" "$PASS" -g "$GATEWAY" --freq-band "$BAND"
+fi
+SH
+
+chmod +x /usr/local/bin/create_ap_dynamic.sh
+systemctl restart create_ap.service
+
+
+
+
+
+
+
+
+
+
+tee /etc/systemd/system/create_ap.service >/dev/null <<'EOF'
+[Unit]
+Description=Create AP WiFi (auto-detect)
+After=network-online.target
+Wants=network-online.target
+Conflicts=wifi-client@wlan0.service
+
+
+[Service]
+Type=simple
+User=root
+Environment="PATH=/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/usr/local/bin/create_ap_dynamic.sh
+ExecStop=/usr/bin/create_ap --stop wlan0
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+
+
+
+
+
+
+
+
+
+
+systemctl unmask create_ap.service
+systemctl daemon-reload
+systemctl enable --now create_ap.service
+systemctl status create_ap.service
+journalctl -xeu create_ap.service -f
+
+
+
+
+
+nmcli con show "Wired connection 1" || nmcli con add type ethernet ifname end0 con-name "Wired connection 1"
+nmcli con mod "Wired connection 1" connection.autoconnect yes ipv4.method auto ipv6.method auto
+nmcli con up "Wired connection 1"
+
+
+
+
+
+
+tee /etc/NetworkManager/dispatcher.d/20-create-ap-restart >/dev/null <<'SH'
+#!/bin/sh
+# NM chama: $1=IFACE  $2=STATE
+IFACE="$1"; STATE="$2"
+
+# Ignore a Wi-Fi do AP
+[ "$IFACE" = "wlan0" ] && exit 0
+
+# Monitore WANs comuns (cabos, USB/RNDIS, PPP/4G/5G)
+case "$IFACE" in
+  end0|eth*|enx*|enp*|ens*|usb*|ppp*|wwan*) ;;
+  *) exit 0 ;;
+esac
+
+case "$STATE" in
+  up|down|dhcp4-change|carrier|pre-up|post-down|lower-up|unknown)
+    (
+      exec 9>/run/create_ap_restart.lock
+      flock -x -w 5 9 || exit 0
+      logger -t create_ap_dispatcher "Estado $IFACE=$STATE -> restart create_ap.service"
+      systemctl restart create_ap.service
+    ) &
+    ;;
+esac
+exit 0
+SH
+
+chmod +x /etc/NetworkManager/dispatcher.d/20-create-ap-restart
+systemctl restart NetworkManager-dispatcher.service
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+sudo tee /etc/chatscripts/simcom-claro.chat >/dev/null <<'EOF'
+ABORT 'BUSY'
+ABORT 'NO CARRIER'
+ABORT 'NO DIALTONE'
+ABORT 'ERROR'
+ABORT 'NO ANSWER'
+TIMEOUT 20
+'' AT
+OK ATI
+OK ATE0
+# Defina o PDP context 1 com APN da Claro Brasil:
+OK AT+CGDCONT=1,"IP","claro.com.br"
+# (se sua APN for outra, troque acima)
+OK ATD*99***1#
+CONNECT
+EOF
+
+
+
+
+sudo tee /etc/ppp/peers/simcom-ppp >/dev/null <<'EOF'
+/dev/ttyUSB2 115200
+crtscts
+lock
+debug
+# pega rota default e DNS do provedor
+defaultroute
+usepeerdns
+noauth
+# estabilidade / compat:
+noipdefault
+ipcp-accept-local
+ipcp-accept-remote
+novj
+nobsdcomp
+nodeflate
+persist
+holdoff 5
+maxfail 0
+# autenticação (Claro normalmente aceita vazio, mas pode usar 'claro/claro')
+user "claro"
+password "claro"
+# discagem via chat:
+connect "/usr/sbin/chat -v -f /etc/chatscripts/simcom-claro.chat"
+# garante nome/iface
+unit 0
+ifname ppp0
+EOF
+
+
+# sobe o link
+sudo pon simcom-ppp
+
+# acompanhe o log ao vivo
+sudo journalctl -fu pppd -n 100
+
+
+
+
+4) Compartilhar a internet do ppp0 (NAT) com sua LAN/AP
+
+sudo iptables -t nat -A POSTROUTING -o ppp0 -j MASQUERADE
+sudo iptables -A FORWARD -i wlan0 -o ppp0  -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A FORWARD -i ppp0  -o wlan0 -m conntrack --ctstate ESTABLISHED,RELATED     -j ACCEPT
+
+# (opcional) persistir
+sudo apt-get -y install iptables-persistent
+sudo sh -c 'iptables-save > /etc/iptables/rules.v4'
+
+
+
+
+nmcli dev set end0 managed yes 2>/dev/null || true
+
+
+
+sudo tee /etc/sysctl.d/99-multiwan.conf >/dev/null <<'EOF'
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.rp_filter=2
+net.ipv4.conf.default.rp_filter=2
+net.ipv4.conf.end0.rp_filter=2
+net.ipv4.conf.wlan0.rp_filter=2
+EOF
+
+sudo sysctl --system
+
+
+# Habilitar IP forward já foi feito no sysctl
+# Regras NAT
+sudo iptables -t nat -A POSTROUTING -o end0 -j MASQUERADE
+sudo iptables -t nat -A POSTROUTING -o enx+ -j MASQUERADE
+
+# Encaminhar tráfego entre wlan0 e os uplinks
+sudo iptables -A FORWARD -i wlan0 -o end0  -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A FORWARD -i end0  -o wlan0 -m conntrack --ctstate ESTABLISHED,RELATED     -j ACCEPT
+
+sudo iptables -A FORWARD -i wlan0 -o enx+  -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A FORWARD -i enx+  -o wlan0 -m conntrack --ctstate ESTABLISHED,RELATED     -j ACCEPT
+
+
+sudo apt install -y iptables-persistent
+sudo sh -c 'iptables-save > /etc/iptables/rules.v4'
+
+
+
+
+
+sudo mkdir -p /etc/dhcp/dhclient-enter-hooks.d
+sudo tee /etc/dhcp/dhclient-enter-hooks.d/90-route-metric >/dev/null <<'EOF'
+#!/bin/sh
+# Define métricas por interface (menor = mais preferida)
+case "$interface" in
+  end0)  METRIC=100 ;;
+  enx*)  METRIC=200 ;;   # modem SIMCom RNDIS/ECM renomeado
+  *)     METRIC=300 ;;
+esac
+
+# Sempre manter a rota da LAN local
+if [ "$interface" = "end0" ] && [ -n "$new_ip_address" ] && [ -n "$new_subnet_mask" ]; then
+  ip route replace ${new_network_number}/${new_subnet_mask} dev "$interface" src "$new_ip_address" || true
+fi
+
+# Reaplicar default com métrica (dhclient pode inserir sem métrica)
+if [ -n "$new_routers" ]; then
+  for gw in $new_routers; do
+    ip route replace default via "$gw" dev "$interface" metric "$METRIC" || true
+  done
+fi
+EOF
+sudo chmod +x /etc/dhcp/dhclient-enter-hooks.d/90-route-metric
+
+
+
+
+
+
+
+
+
+
+sudo apt install -y modemmanager network-manager usb-modeswitch minicom
+sudo systemctl enable ModemManager --now
+
+testar wifi 
+
+nmcli dev wifi hotspot ifname wlan0 ssid MirakoAP password 12345678 band bg
+
+
+
+# 1) Cria o perfil com SSID
+nmcli con add type wifi ifname wlan0 con-name MirakoAP ssid MirakoAP
+
+# 2) Modo ponto de acesso + banda/canal/país
+nmcli con mod MirakoAP 802-11-wireless.mode ap
+nmcli con mod MirakoAP 802-11-wireless.band bg
+nmcli con mod MirakoAP 802-11-wireless.channel 1
+nmcli con mod MirakoAP 802-11-wireless.country BR
+
+# 3) Segurança WPA2-PSK
+nmcli con mod MirakoAP wifi-sec.key-mgmt wpa-psk
+nmcli con mod MirakoAP wifi-sec.psk "12345678"
+
+# 4) Compartilhamento IPv4 (NAT + DHCP automáticos do NM); desliga IPv6
+nmcli con mod MirakoAP ipv4.method shared
+nmcli con mod MirakoAP ipv6.method ignore
+
+# 5) Autoconectar no boot e manter MAC (evita trocas de MAC no AP)
+nmcli con mod MirakoAP connection.autoconnect yes
+nmcli con mod MirakoAP 802-11-wireless.cloned-mac-address permanent
+
+
+nmcli con mod "Wired connection 1" ipv4.route-metric 100
+nmcli con mod "modem"              ipv4.route-metric 200
+
+
+# cria conexão para o end0 e marca autoconnect
+nmcli -g NAME con show | grep -qxF end0 || nmcli con add type ethernet ifname end0 con-name end0
+nmcli con mod end0 connection.autoconnect yes ipv4.method auto ipv6.method ignore
+nmcli con up end0
+
+
+# pare e desabilite o serviço global
+sudo systemctl disable --now dnsmasq 2>/dev/null || true
+
+# remova o serviço para não voltar no boot (mantendo o binário)
+sudo apt-get -y purge dnsmasq
+
+sudo apt-get -y install dnsmasq-base
+
+# Ative o NetworkManager no boot (geralmente já está)
+sudo systemctl enable NetworkManager
+
+
+
+
+
+sudo mmcli -m 0 --simple-connect="apn=claro.com.br,user=claro,password=claro"
+
+###teste verificacao
+
+mmcli -m 0 --signal-get          # nível de sinal
+mmcli -m 0 --location-get        # opcional: localização (se GNSS ativo)
+mmcli -m 0                       # veja Registration/Operator
+journalctl -u ModemManager -b    # logs da conexão
+
+
+
+
+sudo minicom -D /dev/ttyUSB2 -b 115200
+# dentro do minicom, digite (um por linha):
+AT
+AT+CPIN?
+AT+CSQ
+AT+COPS?
+AT+CGDCONT=1,"IP","claro.com.br"
+AT+CGAUTH=1,1,"claro","claro"
+AT&W   # salva em NVRAM
+
+
+ip link | grep -A2 enx   # descubra o nome
+sudo dhclient enxAC:0C:29:...
+ping -c3 8.8.8.8
+
+
+
+
+
+
+# Encaminhamento de pacotes e rp_filter (multi-WAN)
+echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-multiwan.conf
+echo 'net.ipv4.conf.all.rp_filter=0' | sudo tee -a /etc/sysctl.d/99-multiwan.conf
+echo 'net.ipv4.conf.default.rp_filter=0' | sudo tee -a /etc/sysctl.d/99-multiwan.conf
+sudo sysctl --system
+
+# Regras persistentes de iptables (pacote utilitário)
+sudo apt update
+sudo apt install -y iptables-persistent
+
+
+
+
+# Limpa regras antigas (opcional)
+sudo iptables -t nat -F POSTROUTING
+sudo iptables -F FORWARD
+
+# Permite encaminhamento entre WLAN e uplinks
+sudo iptables -A FORWARD -i wlan0 -o end0 -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A FORWARD -i end0 -o wlan0 -m state --state ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A FORWARD -i wlan0 -o ppp0 -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A FORWARD -i ppp0 -o wlan0 -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# NAT (um MASQUERADE para cada uplink)
+sudo iptables -t nat -A POSTROUTING -o end0 -j MASQUERADE
+sudo iptables -t nat -A POSTROUTING -o ppp0 -j MASQUERADE
+
+# Salva para persistir no boot
+sudo netfilter-persistent save
+
+
+
+
+sudo nano /usr/local/sbin/network.sh
+sudo chmod +x /usr/local/sbin/network.sh
+
+
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ===== Configurações =====
+PRIMARY_IF="end0"            # interface preferida
+SECONDARY_IF="ppp0"          # backup (PPP)
+PRIMARY_CON_NAME="Wired connection 1"  # nome da conexão no NetworkManager (ajuste se necessário)
+
+# Destinos de teste
+PING_TARGETS=("1.1.1.1" "8.8.8.8" "9.9.9.9")
+PING_COUNT=2
+PING_TIMEOUT=2
+REQUIRED_SUCCESSES=1
+
+# Histerese
+FAIL_THRESHOLD=2       # falhas seguidas no primário para cair pro ppp0
+RECOVER_THRESHOLD=3    # sucessos seguidos no primário para voltar
+
+STATE_FILE="/run/network-failover.state"
+
+log() { logger -t network-failover "$*"; echo "[$(date '+%F %T')] $*"; }
+
+has_nm() { systemctl is-active --quiet NetworkManager 2>/dev/null; }
+
+iface_exists() { ip link show "$1" >/dev/null 2>&1; }
+
+# Lê o GW "via X.X.X.X" da rota default *atual* do IF (normalmente vinda do DHCP)
+get_dhcp_gw_for() {
+  local ifc="$1"
+  ip route show default dev "$ifc" 2>/dev/null \
+    | awk '/^default /{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}'
+}
+
+renew_dhcp_primary() {
+  if has_nm; then
+    # Reaplica a conexão do NM para renovar DHCP
+    nmcli -t -g GENERAL.STATE dev show "$PRIMARY_IF" >/dev/null 2>&1 || true
+    nmcli con up "$PRIMARY_CON_NAME" || true
+  else
+    # Tenta com dhclient (se não usar NM)
+    command -v dhclient >/dev/null 2>&1 || return 0
+    dhclient -r "$PRIMARY_IF" || true
+    dhclient -1 "$PRIMARY_IF" || true
+  fi
+}
+
+route_via_primary() {
+  local gw; gw="$(get_dhcp_gw_for "$PRIMARY_IF")"
+  if [[ -z "${gw:-}" ]]; then
+    log "Sem GW DHCP visível em $PRIMARY_IF; tentando renovar DHCP..."
+    renew_dhcp_primary
+    gw="$(get_dhcp_gw_for "$PRIMARY_IF")"
+  fi
+
+  if [[ -n "${gw:-}" ]]; then
+    ip route replace default via "$gw" dev "$PRIMARY_IF"
+    log "Default route -> $PRIMARY_IF via $gw (DHCP)"
+  else
+    # fallback: ainda força por end0 (útil em redes sem 'via', ex.: roteador-bridge)
+    ip route replace default dev "$PRIMARY_IF"
+    log "Default route -> $PRIMARY_IF (sem via; fallback)"
+  fi
+}
+
+route_via_secondary() {
+  # Em PPP, a rota default correta é sem 'via' (point-to-point)
+  ip route replace default dev "$SECONDARY_IF"
+  log "Default route -> $SECONDARY_IF (PPP)"
+}
+
+check_iface() {
+  local ifc="$1"
+  iface_exists "$ifc" || { echo 0; return; }
+  local ok=0
+  for dst in "${PING_TARGETS[@]}"; do
+    if ping -I "$ifc" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$dst" >/dev/null 2>&1; then
+      ok=$((ok+1))
+    fi
+  done
+  echo "$ok"
+}
+
+load_state() {
+  CUR_IF=""
+  FAILS=0
+  SUCC_PRIMARY=0
+  [[ -f "$STATE_FILE" ]] && source "$STATE_FILE" || true
+}
+
+save_state() {
+  umask 077
+  cat >"$STATE_FILE" <<EOF
+CUR_IF="$CUR_IF"
+FAILS=$FAILS
+SUCC_PRIMARY=$SUCC_PRIMARY
+EOF
+}
+
+main() {
+  load_state
+
+  # Qual é a default atual?
+  local def_if
+  def_if=$(ip route | awk '$1=="default"{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}') || true
+  [[ -n "${def_if:-}" ]] && CUR_IF="$def_if"
+
+  local ok_primary ok_secondary
+  ok_primary=$(check_iface "$PRIMARY_IF")
+  ok_secondary=$(check_iface "$SECONDARY_IF")
+
+  log "Checks: $PRIMARY_IF ok=$ok_primary, $SECONDARY_IF ok=$ok_secondary, current=${CUR_IF:-none}, fails=$FAILS succ_primary=$SUCC_PRIMARY"
+
+  if [[ "$CUR_IF" != "$PRIMARY_IF" ]]; then
+    # Estamos no backup (ppp0): volta para o primário após N sucessos
+    if (( ok_primary >= REQUIRED_SUCCESSES )); then
+      SUCC_PRIMARY=$((SUCC_PRIMARY+1))
+      if (( SUCC_PRIMARY >= RECOVER_THRESHOLD )); then
+        route_via_primary
+        CUR_IF="$PRIMARY_IF"
+        SUCC_PRIMARY=0
+        FAILS=0
+      fi
+    else
+      SUCC_PRIMARY=0
+    fi
+  else
+    # Estamos no primário (end0): cai para backup após N falhas seguidas e backup OK
+    if (( ok_primary < REQUIRED_SUCCESSES )); then
+      FAILS=$((FAILS+1))
+      if (( FAILS >= FAIL_THRESHOLD )); then
+        if (( ok_secondary >= REQUIRED_SUCCESSES )); then
+          route_via_secondary
+          CUR_IF="$SECONDARY_IF"
+          FAILS=0
+          SUCC_PRIMARY=0
+        else
+          log "Primário down e backup sem resposta; mantendo rota atual."
+        fi
+      fi
+    else
+      FAILS=0
+    fi
+  fi
+
+  save_state
+}
+
+main "$@"
+
+
+
+
+
+
+sudo tee /etc/systemd/system/network-failover.service >/dev/null <<'EOF'
+[Unit]
+Description=Failover de rota (end0 -> ppp0) com teste de conectividade
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/network.sh
+EOF
+
+
+sudo tee /etc/systemd/system/network-failover.timer >/dev/null <<'EOF'
+[Unit]
+Description=Executa o failover de rota a cada 1 minuto
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Unit=network-failover.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+
+
+
+
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now network-failover.timer
+
+
+systemctl list-timers | grep network-failover
+journalctl -t network-failover -f
+
+
+4g
+
+
+echo -e "blacklist cdc_mbim\nblacklist cdc_ncm\nblacklist cdc_ether\nblacklist usbserial_generic" | sudo tee /etc/modprobe.d/blacklist-huawei.conf
+sudo update-initramfs -u
+
+
+sudo modprobe -r cdc_mbim
+sudo modprobe -r cdc_ncm
+sudo modprobe -r cdc_ether
+sudo modprobe -r huawei_cdc_ncm
+sudo modprobe -r option
+sudo modprobe -r usbserial
+
+sudo modprobe usbserial vendor=0x12d1 product=0x1c05
+sudo modprobe option
+sudo modprobe usbnet
+sudo modprobe huawei_cdc_ncm
+
+
+
+
+
