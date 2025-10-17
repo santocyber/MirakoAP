@@ -1510,6 +1510,6 @@ systemctl enable --now wifi-client@wlan0.service
 
 
 
-com base nessa snoticias recentes sobre proibicao da anvisa sobre cogumelos e canabis como podemos melhorar a argumentacao juridica para fortalecer a ideia da associacao floresta da vida de produzir seus proprios aliemntos e fitoterpicos para conhecimento de todo processo e seguranca dos seus associados , falar sobre experiencia no processo produtico da associacao com vivencias e cursos 
+
 
 
