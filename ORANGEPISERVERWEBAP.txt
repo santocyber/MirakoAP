@@ -1,6 +1,7 @@
 tee /usr/local/bin/netstatus.py >/dev/null <<'PY'
 #!/usr/bin/env python3
 import json, os, re, socket, subprocess, time, math, shutil, urllib.parse
+import glob 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST   = os.environ.get("NETSTATUS_HOST", "0.0.0.0")
@@ -230,15 +231,79 @@ def wifi_stations():
     if cur: stations.append(cur)
     return stations
 
+
+
+def _create_ap_leasefiles():
+    """
+    Descobre arquivos de leases usados pelo dnsmasq do create_ap
+    lendo a linha de comando do processo (-l/--dhcp-leasefile) e
+    também via globs em /tmp.
+    """
+    files = []
+
+    # 1) Tenta ler do processo dnsmasq do create_ap
+    procs = sh("ps -o args= -C dnsmasq | grep create_ap || true")
+    for line in (procs or "").splitlines():
+        m = re.search(r"(?:--dhcp-leasefile=|-l\s+)(\S+)", line)
+        if m:
+            p = m.group(1)
+            if os.path.isfile(p) and p not in files:
+                files.append(p)
+
+    # 2) Globs mais abrangentes (pastas temporárias do create_ap)
+    #    Exemplos:
+    #    /tmp/create_ap.wlan0.conf.XXXX/dnsmasq.leases
+    #    /tmp/create_ap.*/*.leases
+    patterns = [
+        f"/tmp/create_ap.{WIFIIF}.leases",
+        "/tmp/create_ap.*.leases",
+        "/tmp/create_ap*/dnsmasq.leases",
+        "/tmp/create_ap*/*.leases",
+    ]
+    for pat in patterns:
+        for p in glob.glob(pat):
+            if os.path.isfile(p) and p not in files:
+                files.append(p)
+
+    return files
+
 def dhcp_leases():
-    leases_file = "/var/lib/misc/dnsmasq.leases"
-    out = []
-    txt = read_first(leases_file) or ""
-    for line in txt.splitlines():
-        parts = line.split()
-        if len(parts) >= 5:
-            out.append({"ip": parts[2], "mac": parts[1], "host": parts[3], "ts": int(parts[0])})
-    return out
+    """
+    Agrega leases do dnsmasq de locais típicos, incluindo os do create_ap.
+    Formato dnsmasq: <expira_ts> <mac> <ip> <host> <client-id>
+    """
+    files = _create_ap_leasefiles()
+    # dnsmasq “padrão”
+    fallback = [
+        "/run/dnsmasq/dnsmasq.leases",
+        "/var/lib/misc/dnsmasq.leases",
+        "/var/lib/NetworkManager/dnsmasq.leases",
+    ]
+    for p in fallback:
+        if os.path.isfile(p) and p not in files:
+            files.append(p)
+
+    rows = {}  # dedup por IP (ou MAC)
+    for fpath in files:
+        txt = read_first(fpath) or ""
+        for line in txt.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            # dnsmasq: ts mac ip host [clientid]
+            ts_raw, mac, ip, host = parts[0], parts[1], parts[2], parts[3]
+            try:
+                ts = int(ts_raw)
+            except:
+                ts = 0  # “infinite/forever”
+            key = ip or mac
+            cur = rows.get(key)
+            if (cur is None) or (ts >= cur.get("ts", 0)):
+                rows[key] = {"ip": ip, "mac": mac, "host": host, "ts": ts}
+
+    return sorted(rows.values(), key=lambda x: x.get("ts", 0), reverse=True)
+
+
 
 # ------------------ Modem detection (USB/PPP) ------------------
 MODEM_DRIVERS = {
