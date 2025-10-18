@@ -792,7 +792,17 @@ body{margin:20px;background:var(--bg);color:var(--fg);font-family:system-ui,-app
 h1{margin:.2rem 0}
 h3{margin:.2rem 0 .6rem 0}
 .muted{color:var(--muted)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;margin-top:14px}
+.grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(640px,1fr));
+  gap:14px;
+  margin-top:14px
+}
+/* Opcional: em telas pequenas, volta pra 1 coluna */
+@media (max-width: 900px){
+  .grid{ grid-template-columns: 1fr; }
+}
+
 .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;overflow:hidden}
 .kv{display:grid;grid-template-columns:150px 1fr;gap:6px 10px;font-size:14px}
 .kv > div:nth-child(2n){min-width:0}
@@ -829,6 +839,144 @@ pre.terminal{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Libera
 
 </style>
 </head>
+
+
+<!-- ==== LOGIN GATE (coloque logo após <body>) ==== -->
+<style>
+  #loginGate{
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    background:#0b0f14; color:#e5e7eb; font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;
+    z-index:99999;
+  }
+  #loginCard{
+    background:#111827; border:1px solid #1f2937; border-radius:12px; padding:20px; width:320px;
+  }
+  #loginCard h3{ margin:0 0 12px 0 }
+  #loginCard label{ display:block; font-size:12px; color:#9ca3af; margin:8px 0 4px }
+  #loginCard input{
+    width:100%; padding:8px; border:1px solid #374151; border-radius:8px; background:#0b0f14; color:#e5e7eb;
+  }
+  #loginCard button{
+    width:100%; margin-top:12px; padding:10px; border:1px solid #374151; border-radius:8px;
+    background:#1f2937; color:#e5e7eb; cursor:pointer;
+  }
+  #loginMsg{ color:#f87171; font-size:12px; min-height:1.2em; margin-top:8px }
+</style>
+
+<div id="loginGate" role="dialog" aria-modal="true">
+  <div id="loginCard">
+    <h3>Entrar</h3>
+    <label>Usuário</label>
+    <input id="lgUser" type="text" autocomplete="username" placeholder="admin">
+    <label>Senha</label>
+    <input id="lgPass" type="password" autocomplete="current-password" placeholder="••••••">
+    <button id="lgBtn">Acessar</button>
+    <div id="loginMsg"></div>
+  </div>
+</div>
+
+<script>
+(function(){
+  // SHA-256 
+  const expectedHashHex = "84d5ca8010a1606f2203a60f3734a8e86727c648bc841dd22ef39cc699e2325c".toLowerCase().trim();
+
+  // === SHA-256 EMBUTIDO (fallback offline) ===
+  function sha256hex_js(str){
+    // minified sha256 (public domain) – retorna hex minúsculo
+    function r(n,t){return n>>>t|n<<32-t}function n(n){for(var t="",r=0;r<n.length;r++)t+=("00"+n[r].toString(16)).slice(-2);return t}
+    function t(n){for(var t=[],r=0;r<n.length;r++)t.push(n.charCodeAt(r));return new Uint8Array(t)}
+    function e(e){
+      var o=t(e),f=o.length+8,u=new Uint8Array((f+64>>>9<<4)+16<<2),i=new DataView(u.buffer);
+      u.set(o),u[o.length]=128,i.setUint32(u.length-4,o.length<<3);
+      for(var a=[1779033703,3144134277,1013904242,2773480762,1359893119,2600822924,528734635,1541459225],
+              c=[1116352408,1899447441,3049323471,3921009573,961987163,1508970993,2453635748,2870763221,3624381080,310598401,607225278,1426881987,1925078388,2162078206,2614888103,3248222580,3835390401,4022224774,264347078,604807628,770255983,1249150122,1555081692,1996064986,2554220882,2821834349,2952996808,3210313671,3336571891,3584528711,113926993,338241895,666307205,773529912,1294757372,1396182291,1695183700,1986661051,2177026350,2456956037,2730485921,2820302411,3259730800,3345764771,3516065817,3600352804,4094571909,275423344,430227734,506948616,659060556,883997877,958139571,1322822218,1537002063,1747873779,1955562222,2024104815,2227730452,2361852424,2428436474,2756734187,3204031479,3329325298],
+              s=new Uint32Array(64),l=0;l<u.length;l+=64){
+        for(var h=0;h<16;h++)s[h]=i.getUint32(l+4*h);
+        for(h=16;h<64;h++){
+          var v=s[h-15],d=s[h-2];
+          s[h]=((r(v,7)^r(v,18)^v>>>3)>>>0)+s[h-7]+((r(d,17)^r(d,19)^d>>>10)>>>0)+s[h-16]>>>0
+        }
+        var p=a[0],g=a[1],m=a[2],w=a[3],y=a[4],A=a[5],b=a[6],x=a[7];
+        for(h=0;h<64;h++){
+          var S=(r(p,2)^r(p,13)^r(p,22))>>>0,U=(p&g)^(p&m)^(g&m),C=(r(y,6)^r(y,11)^r(y,25))>>>0,E=(y&A)^(~y&b),
+              T=(x+ C + E + c[h] + s[h])>>>0, P=(S + U)>>>0;
+          x=b; b=A; A=y; y=(w+T)>>>0; w=m; m=g; g=p; p=(T+P)>>>0;
+        }
+        a[0]=(a[0]+p)>>>0; a[1]=(a[1]+g)>>>0; a[2]=(a[2]+m)>>>0; a[3]=(a[3]+w)>>>0;
+        a[4]=(a[4]+y)>>>0; a[5]=(a[5]+A)>>>0; a[6]=(a[6]+b)>>>0; a[7]=(a[7]+x)>>>0;
+      }
+      var H=new Uint8Array(32),D=new DataView(H.buffer);
+      for(var z=0;z<8;z++)D.setUint32(4*z,a[z]);
+      return n(H)
+    }
+
+    // força UTF-8
+    try{ return e(unescape(encodeURIComponent(str))); }
+    catch(_){ return e(str); }
+  }
+
+  // tenta WebCrypto; se não der, usa fallback embutido
+  async function sha256hex(txt){
+    if (window.crypto && crypto.subtle && crypto.subtle.digest) {
+      const data = new TextEncoder().encode(txt);
+      const digest = await crypto.subtle.digest("SHA-256", data);
+      const b = new Uint8Array(digest);
+      return Array.from(b, x=>x.toString(16).padStart(2,"0")).join("");
+    }
+    return sha256hex_js(txt);
+  }
+
+  if (sessionStorage.getItem("auth-ok") === "1") unlock();
+
+  const btn  = document.getElementById("lgBtn");
+  const pass = document.getElementById("lgPass");
+  btn.addEventListener("click", doLogin);
+  pass.addEventListener("keydown", e => { if(e.key === "Enter"){ e.preventDefault(); doLogin(); }});
+
+  function setMsg(t){ document.getElementById("loginMsg").textContent = t || ""; }
+
+  async function doLogin(){
+    setMsg("");
+    const u = (document.getElementById("lgUser").value || "").trim();
+    const p = (document.getElementById("lgPass").value || "").trim(); // trim também na senha
+    if(!u || !p){ setMsg("Preencha usuário e senha."); return; }
+
+    try{
+      const hex = (await sha256hex(u + ":" + p)).toLowerCase();
+      if(hex === expectedHashHex){
+        sessionStorage.setItem("auth-ok","1");
+        unlock();
+      } else {
+        console.warn("Hash calculado:", hex, " — esperado:", expectedHashHex);
+        setMsg("Credenciais inválidas.");
+      }
+    }catch(e){
+      console.error(e);
+      setMsg("Erro ao validar.");
+    }
+  }
+
+  function unlock(){
+    const gate = document.getElementById("loginGate");
+    if(gate) gate.remove();
+    const app = document.getElementById("app");
+    if(app) app.style.display = "";
+  }
+})();
+</script>
+
+
+
+<!-- ==== /LOGIN GATE ==== -->
+
+<!-- AQUI você envolve o resto da sua página -->
+<div id="app" style="display:none">
+  <!-- TODO: cole aqui TODO o seu HTML existente (cards, tabelas, scripts etc.) -->
+</div>
+
+
+
+
 <body>
   <div class="topbar">
     <h1>MirakoAP <span class="muted" id="host"></span></h1>
