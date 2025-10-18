@@ -2,6 +2,8 @@ tee /usr/local/bin/netstatus.py >/dev/null <<'PY'
 #!/usr/bin/env python3
 import json, os, re, socket, subprocess, time, math, shutil, urllib.parse
 import glob 
+import pty, select, threading, fcntl, termios, struct, uuid, base64
+
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST   = os.environ.get("NETSTATUS_HOST", "0.0.0.0")
@@ -818,6 +820,13 @@ select, input[type="number"], input[type="text"], input[type="password"]{
   border-radius:8px; padding:6px 8px
 }
 
+.card.wide{ grid-column:1 / -1 }
+pre.terminal{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+             background:#0a0d12; border:1px solid var(--border); border-radius:10px;
+             padding:10px; min-height:300px; max-height:500px; overflow:auto; white-space:pre-wrap;}
+.term-controls{display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px}
+
+
 </style>
 </head>
 <body>
@@ -970,72 +979,114 @@ select, input[type="number"], input[type="text"], input[type="password"]{
   
   
   
-  
+   
+
   
   
   
   </div>
+  
+  
+  
+  
+<div class="card wide" id="termCard">
+  <h3>Terminal (bash)</h3>
+  <div class="term-controls">
+    <button class="btn" id="termStart">Iniciar shell</button>
+    <button class="btn" id="termStop">Encerrar</button>
+    <button class="btn" id="termClear">Limpar</button>
+    <label style="display:flex;gap:6px;align-items:center">
+      <input type="checkbox" id="termStrip"> remover ANSI
+    </label>
+    <button class="btn" id="termCtrlC">Ctrl-C</button>
+    <button class="btn" id="termCtrlD">Ctrl-D</button>
+  </div>
+  <pre class="terminal" id="termBox">(pressione “Iniciar shell”)</pre>
+  <div class="controls" style="margin-top:8px">
+    <input id="termInput" type="text" style="flex:1; min-width:260px" placeholder="digite um comando e tecle Enter">
+    <button class="btn" id="termSend">Enviar</button>
+  </div>
+</div>
+
+    
+    
+  
+  
 
 <script>
+/* ===== Core UI (ES5 safe) ===== */
 (function themeInit(){
-  const html = document.documentElement;
-  const btn  = ()=>document.getElementById('toggleTheme');
-  const apply = (mode)=>{
+  var html = document.documentElement;
+  function btn(){ return document.getElementById('toggleTheme'); }
+  function apply(mode){
     html.setAttribute('data-theme', mode);
-    localStorage.setItem('theme', mode);
-    if(btn()) btn().textContent = 'Tema: '+mode;
-  };
-  const saved = localStorage.getItem('theme') || 'auto';
+    try{ localStorage.setItem('theme', mode); }catch(e){}
+    var b = btn(); if(b) b.textContent = 'Tema: ' + mode;
+  }
+  var saved = (function(){ try{ return localStorage.getItem('theme'); }catch(e){ return null; } })() || 'auto';
   apply(saved);
-  document.addEventListener('click', (e)=>{
-    if(e.target && e.target.id==='toggleTheme'){
-      const cur = localStorage.getItem('theme') || 'auto';
+  document.addEventListener('click', function(e){
+    if(e && e.target && e.target.id==='toggleTheme'){
+      var cur = (function(){ try{ return localStorage.getItem('theme'); }catch(e){ return null; } })() || 'auto';
       apply(cur==='auto' ? 'dark' : (cur==='dark' ? 'light' : 'auto'));
     }
   });
 })();
 
 function escapeHtml(s){
-  return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
+  return String(s).replace(/[&<>\"']/g, function(m){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'})[m]; });
 }
 function fmtUptime(s){
   var d=Math.floor(s/86400); s%=86400;
   var h=Math.floor(s/3600); s%=3600;
   var m=Math.floor(s/60); s%=60;
-  return (d?d+"d ":"")+h+"h "+m+"m "+s+"s";
+  return (d?d+'d ':'')+h+'h '+m+'m '+s+'s';
 }
-function badge(txt,cls){return '<span class="badge '+cls+'">'+escapeHtml(txt)+'</span>'}
+function badge(txt,cls){ return '<span class="badge '+cls+'">'+escapeHtml(txt)+'</span>'; }
 function chips(list){
   if(!list||!list.length) return '—';
-  return '<div class="chips">'+list.map(x=>`<span class="chip" title="${escapeHtml(x)}">${escapeHtml(x)}</span>`).join('')+'</div>';
+  var out = '<div class="chips">';
+  for(var i=0;i<list.length;i++){
+    var x = String(list[i]);
+    out += '<span class="chip" title="'+escapeHtml(x)+'">'+escapeHtml(x)+'</span>';
+  }
+  out += '</div>';
+  return out;
 }
 function kv(htmlId, obj){
-  const el = document.getElementById(htmlId);
+  var el = document.getElementById(htmlId);
   if(!el) return;
-  const rows = [];
-  const push = (k,v,{cls='val',html=false}={})=>{
-    rows.push('<div>'+escapeHtml(k)+'</div><div class="'+cls+'">'+(html?v:escapeHtml(String(v)))+'</div>');
-  };
+  var rows = [];
+  function push(k,v,opts){
+    opts = opts || {};
+    var cls = opts.cls || 'val';
+    var isHtml = !!opts.html;
+    rows.push('<div>'+escapeHtml(k)+'</div><div class="'+cls+'">'+(isHtml?v:escapeHtml(String(v)))+'</div>');
+  }
   if(!obj || !obj.exists){
     el.innerHTML = '<div>—</div><div class="val">Sem dados</div>';
     return;
   }
-  const addrs = (obj.addrs||[]).map(a=>a.local);
-  const link = (obj.link_detected===true || obj.carrier===true || obj.operstate==='up');
+  var addrs = [];
+  var i;
+  if(obj.addrs && obj.addrs.length){
+    for(i=0;i<obj.addrs.length;i++){ addrs.push(obj.addrs[i].local); }
+  }
+  var link = (obj.link_detected===true || obj.carrier===true || obj.operstate==='up');
 
-  push('Interface', (obj.if || '—') + ' ' + (obj.up?badge('up','ok'):badge('down','err')), {html:true});
+  push('Interface', (obj['if'] || '—') + ' ' + (obj.up?badge('up','ok'):badge('down','err')), {html:true});
   if(obj.mac) push('MAC', obj.mac);
   push('Endereços', chips(addrs), {cls:'wrap', html:true});
-  let linktxt = (obj.speed||'?') + (obj.duplex?(' • '+obj.duplex):'');
+  var linktxt = (obj.speed||'?') + (obj.duplex?(' • '+obj.duplex):'');
   push('Link', linktxt + ' ' + (link?badge('link','ok'):badge('no-link','err')), {html:true});
-  if(obj.mtu) push('MTU', obj.mtu+'');
+  if(obj.mtu) push('MTU', String(obj.mtu));
   push('RX/TX bytes', (obj.rx_bytes||0)+' / '+(obj.tx_bytes||0));
   push('RX/TX pkts', (obj.rx_pkts||0)+' / '+(obj.tx_pkts||0));
   if(obj.driver) push('Driver', obj.driver);
-  if(obj.usb) push('USB', obj.usb ? 'sim' : 'não');
+  if(typeof obj.usb!=='undefined') push('USB', obj.usb ? 'sim' : 'não');
 
   if(obj.tests){
-    let t = obj.tests, tb=[];
+    var t = obj.tests, tb=[];
     tb.push('Ping '+(t.ping_internet?badge('ok','ok'):badge('falhou','err')));
     tb.push('DNS '+(t.dns_ok?badge('ok','ok'):badge('falhou','err')));
     if(t.tested_dns) tb.push('<small class="muted">('+escapeHtml(t.tested_dns)+')</small>');
@@ -1045,115 +1096,120 @@ function kv(htmlId, obj){
 }
 
 function render(data){
-  // Sistema
-  document.getElementById('host').textContent = "— "+data.system.hostname;
+  /* Sistema */
+  document.getElementById('host').textContent = '— ' + data.system.hostname;
   document.getElementById('uptime').textContent = fmtUptime(data.system.uptime_s);
   document.getElementById('load').textContent   = (data.system.loadavg||[]).join(' / ');
-  const cpuBits = [];
+  var cpuBits = [];
   if(data.system.cpu_pct!=null) cpuBits.push(data.system.cpu_pct+'%');
   if(data.system.cpu_freq_mhz!=null) cpuBits.push(data.system.cpu_freq_mhz+' MHz');
   if(data.system.cpu_cores!=null) cpuBits.push(data.system.cpu_cores+' cores');
-  document.getElementById('cpu').textContent = cpuBits.join(' • ') || '—';
+  document.getElementById('cpu').textContent = cpuBits.length? cpuBits.join(' • ') : '—';
   document.getElementById('cpu_model').textContent = data.system.cpu_model || '';
-  document.getElementById('temp').textContent = (data.system.temp_c!=null ? data.system.temp_c+' °C' : '—');
+  document.getElementById('temp').textContent = (data.system.temp_c!=null ? (data.system.temp_c+' °C') : '—');
 
-  const mem = data.system;
-  const memTxt = `${mem.mem_used_mb} / ${mem.mem_total_mb} MB${mem.mem_pct!=null?` (${mem.mem_pct}%)`:''}`;
+  var mem = data.system;
+  var memTxt = String(mem.mem_used_mb) + ' / ' + String(mem.mem_total_mb) + ' MB' + (mem.mem_pct!=null? (' ('+mem.mem_pct+'%)'):'');
   document.getElementById('mem').textContent = memTxt;
-  const swpTxt = `${mem.swap_used_mb} / ${mem.swap_total_mb} MB${mem.swap_pct!=null?` (${mem.swap_pct}%)`:''}`;
+  var swpTxt = String(mem.swap_used_mb) + ' / ' + String(mem.swap_total_mb) + ' MB' + (mem.swap_pct!=null? (' ('+mem.swap_pct+'%)'):'');
   document.getElementById('swap').textContent = swpTxt;
-  const d = mem.disk_root||{};
-  document.getElementById('disk').textContent = `${d.used_h||'?'} / ${d.total_h||'?'}${d.pct!=null?` (${d.pct}%)`:''}`;
+  var d = mem.disk_root||{};
+  var diskTxt = (d.used_h||'?') + ' / ' + (d.total_h||'?') + (d.pct!=null? (' ('+d.pct+'%)'):'');
+  document.getElementById('disk').textContent = diskTxt;
 
   document.getElementById('time').textContent = new Date(data.system.time*1000).toLocaleString();
 
-  // Rede
-  document.getElementById('defrt').textContent =
-    (data.default_route.dev||'?') + " via " + (data.default_route.via||'?');
+  /* Rede */
+  document.getElementById('defrt').textContent = (data.default_route.dev||'?') + ' via ' + (data.default_route.via||'?');
   document.getElementById('updev').textContent = data.upstream_dev || '—';
   document.getElementById('dns').innerHTML   = chips(data.dns_servers||[]);
 
-  let tBadges = [];
+  var tBadges = [];
   tBadges.push('Ping '+(data.tests.ping_internet?badge('ok','ok'):badge('falhou','err')));
   tBadges.push('DNS '+(data.tests.dns_resolve?badge('ok','ok'):badge('falhou','err')));
   document.getElementById('tests').innerHTML = tBadges.join(' ');
   document.getElementById('nat').innerHTML   = data.tests.masquerade? badge('MASQUERADE','ok') : badge('sem NAT','warn');
 
-  // Wi-Fi
-  let wi = data.wifi || {};
-  document.getElementById('w_if').textContent    = wi.if || 'wlan0';
+  /* Wi-Fi */
+  var wi = data.wifi || {};
+  document.getElementById('w_if').textContent    = wi['if'] || 'wlan0';
   document.getElementById('w_ssid').textContent  = wi.ssid || '(hostapd)';
   document.getElementById('w_cc').textContent    = wi.country || '—';
   document.getElementById('w_chan').textContent  = (wi.channel||'?') + ' (' + (wi.freq_mhz||'?') + ' MHz)';
-  document.getElementById('w_txp').textContent   = (wi.txpower_dbm!=null ? wi.txpower_dbm+' dBm' : '—');
+  document.getElementById('w_txp').textContent   = (wi.txpower_dbm!=null ? (wi.txpower_dbm+' dBm') : '—');
   var wc = (data.counts && data.counts.wifi_clients!=null)?data.counts.wifi_clients:((data.wifi_clients||[]).length);
   document.getElementById('w_clients').textContent = wc;
 
-  let st = data.wifi_clients||[], tbody='';
-  st.forEach(s=>{
-    const idle = (s.inactive_ms!=null)? (Math.round(s.inactive_ms/1000)+'s') : '';
-    tbody += `<tr><td>${s.mac}</td><td>${s.rssi??''}</td><td>${s.tx_bitrate??''}</td><td>${s.rx_bitrate??''}</td><td>${idle}</td></tr>`;
-  });
-  document.querySelector('#sta tbody').innerHTML = tbody||'<tr><td colspan=5>—</td></tr>';
+  var st = data.wifi_clients||[], tbody='';
+  for(var si=0; si<st.length; si++){
+    var s = st[si];
+    var idle = (s.inactive_ms!=null)? (Math.round(s.inactive_ms/1000)+'s') : '';
+    tbody += '<tr><td>'+ (s.mac||'') +'</td>'
+          +  '<td>'+ ((s.rssi!=null)?s.rssi:'') +'</td>'
+          +  '<td>'+ (s.tx_bitrate||'') +'</td>'
+          +  '<td>'+ (s.rx_bitrate||'') +'</td>'
+          +  '<td>'+ idle +'</td></tr>';
+  }
+  document.querySelector('#sta tbody').innerHTML = tbody || '<tr><td colspan="5">—</td></tr>';
 
-  // LAN & Modem
+  /* LAN & Modem */
   kv('lan_kv', data.lan);
   kv('modem_kv', data.modem);
 
-  // Leases DHCP
-  let ls = data.dhcp_leases||[], lhtml='';
-  ls.forEach(l=>{
-    let dt = new Date(l.ts*1000).toLocaleTimeString();
-    lhtml += `<tr><td>${l.ip}</td><td>${l.mac}</td><td>${l.host}</td><td>${dt}</td></tr>`;
-  });
-  document.querySelector('#leases tbody').innerHTML = lhtml||'<tr><td colspan=4>—</td></tr>';
+  /* Leases DHCP */
+  var ls = data.dhcp_leases||[], lhtml='';
+  for(var li=0; li<ls.length; li++){
+    var L = ls[li];
+    var dt = new Date(L.ts*1000).toLocaleTimeString();
+    lhtml += '<tr><td>'+escapeHtml(L.ip||'')+'</td><td>'+escapeHtml(L.mac||'')+'</td><td>'+escapeHtml(L.host||'')+'</td><td>'+escapeHtml(dt)+'</td></tr>';
+  }
+  document.querySelector('#leases tbody').innerHTML = lhtml || '<tr><td colspan="4">—</td></tr>';
 
-  // Serviços
-  let svcs = data.services, html='';
-  Object.keys(svcs).forEach(k=>{
-    let st=svcs[k];
-    let cls = (st==='active')?'ok':(st==='inactive'||st==='n/a')?'warn':'err';
-    html += `<div>${k}${badge(st,cls)}</div>`;
-  });
+  /* Serviços */
+  var svcs = data.services, html='';
+  for(var k in svcs){
+    if(!Object.prototype.hasOwnProperty.call(svcs,k)) continue;
+    var stv = svcs[k];
+    var cls = (stv==='active')?'ok':((stv==='inactive'||stv==='n/a')?'warn':'err');
+    html += '<div>'+escapeHtml(k)+badge(stv,cls)+'</div>';
+  }
   document.getElementById('svcs').innerHTML = html;
 
-  // Interfaces
-  let ifs = data.interfaces, ifhtml='';
-  Object.keys(ifs).forEach(n=>{
-    let i=ifs[n], up = i.up?'up':'down';
-    let addrs=(i.addrs||[]).map(a=>a.local);
-    ifhtml += `<div class="kv"><div>${escapeHtml(n)}</div><div class="wrap">${chips(addrs)} ${badge(up, i.up?'ok':'err')}</div></div>`;
-  });
+  /* Interfaces */
+  var ifs = data.interfaces, ifhtml='';
+  for(var n in ifs){
+    if(!Object.prototype.hasOwnProperty.call(ifs,n)) continue;
+    var ii = ifs[n], up = ii.up?'up':'down';
+    var addrs2 = [];
+    if(ii.addrs && ii.addrs.length){
+      for(var ai=0; ai<ii.addrs.length; ai++){ addrs2.push(ii.addrs[ai].local); }
+    }
+    ifhtml += '<div class="kv"><div>'+escapeHtml(n)+'</div><div class="wrap">'+chips(addrs2)+' '+badge(up, ii.up?'ok':'err')+'</div></div>';
+  }
   document.getElementById('ifs').innerHTML = ifhtml;
 }
 
-// Logs & Debug
-async function loadLogs(){
-  const kind  = document.getElementById('logKind').value;
-  const lines = document.getElementById('logLines').value || 200;
-  const box   = document.getElementById('logbox');
+/* Logs & Debug */
+function loadLogs(){
+  var kind  = document.getElementById('logKind').value;
+  var lines = document.getElementById('logLines').value || 200;
+  var box   = document.getElementById('logbox');
   try{
     box.textContent = 'Carregando…';
-    const r = await fetch(`/api/logs?kind=${encodeURIComponent(kind)}&n=${encodeURIComponent(lines)}`, {cache:'no-store'});
-    const j = await r.json();
-    box.textContent = j.logs || '(sem dados)';
+    return fetch('/api/logs?kind='+encodeURIComponent(kind)+'&n='+encodeURIComponent(lines), {cache:'no-store'})
+      .then(function(r){ return r.json(); })
+      .then(function(j){ box.textContent = j.logs || '(sem dados)'; })
+      .catch(function(e){ box.textContent = 'Erro ao carregar logs: '+e; });
   }catch(e){
     box.textContent = 'Erro ao carregar logs: '+e;
   }
 }
-
-document.addEventListener('click',(e)=>{
+document.addEventListener('click', function(e){
   if(e.target && e.target.id==='btnLogRefresh'){ loadLogs(); }
 });
 
-
-
-
-
-
-
-let wifiPrevBytes = null;
-
+/* ===== Wi-Fi Cliente ===== */
+var wifiPrevBytes = null;
 function humanBytes(n){
   if(n==null) return '—';
   if(n<1024) return n+' B';
@@ -1167,221 +1223,412 @@ function humanRate(bytesPerSec){
   if(bytesPerSec<1024*1024) return (bytesPerSec/1024).toFixed(1)+' KB/s';
   return (bytesPerSec/1024/1024).toFixed(2)+' MB/s';
 }
+function num(n, def){ n = Number(n); return isFinite(n) ? n : (def||0); }
 
+function wifiLoadStatus(){
+  return fetch('/api/wifi_status',{cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(s){
+      document.getElementById('ws_mode').textContent = s.mode||'—';
+      document.getElementById('ws_ids').textContent  = (s.ssid||'—') + (s.bssid? (' / '+s.bssid):'');
+      document.getElementById('ws_ip').textContent   = (s.ip4||'—') + (s.gw4? (' via '+s.gw4):'');
+      document.getElementById('ws_sig').textContent  = (s.signal_dbm!=null? (s.signal_dbm+' dBm'):'—');
+      document.getElementById('ws_rates').textContent = (s.tx_bitrate||'—') + ' • ' + (s.rx_bitrate||'—');
 
+      var now = num(s.time, Math.floor(Date.now()/1000));
+      var rx = num(s.rx_bytes, 0), tx = num(s.tx_bytes, 0);
+      var rateTxt = '—';
+      if(wifiPrevBytes){
+        var dt = Math.max(1, now - wifiPrevBytes.time);
+        var rxps = (rx - wifiPrevBytes.rx)/dt;
+        var txps = (tx - wifiPrevBytes.tx)/dt;
+        rateTxt = '↓ '+humanRate(Math.max(0, rxps))+' • ↑ '+humanRate(Math.max(0, txps));
+      }
+      wifiPrevBytes = {rx:rx, tx:tx, time: now};
+      document.getElementById('ws_traffic').textContent =
+        rateTxt + '  ('+humanBytes(rx)+' ↓ / '+humanBytes(tx)+' ↑)';
 
-function num(n, def=0){ n = Number(n); return isFinite(n) ? n : def; }
+      var persist = s.persist_client ? 'wpa_supplicant: salvo' : 'wpa_supplicant: não salvo';
+      document.getElementById('ws_persist').textContent = persist;
 
-async function wifiLoadStatus(){
-  try{
-    const r = await fetch('/api/wifi_status',{cache:'no-store'});
-    const s = await r.json();
-    document.getElementById('ws_mode').textContent = s.mode||'—';
-    document.getElementById('ws_ids').textContent  = (s.ssid||'—') + (s.bssid? (' / '+s.bssid):'');
-    document.getElementById('ws_ip').textContent   = (s.ip4||'—') + (s.gw4? (' via '+s.gw4):'');
-    document.getElementById('ws_sig').textContent  = (s.signal_dbm!=null? (s.signal_dbm+' dBm'):'—');
-    document.getElementById('ws_rates').textContent = [(s.tx_bitrate||'—'), (s.rx_bitrate||'—')].join(' • ');
-
-    const now = num(s.time, Math.floor(Date.now()/1000));
-    const rx = num(s.rx_bytes, 0), tx = num(s.tx_bytes, 0);
-    let rateTxt = '—';
-    if(wifiPrevBytes){
-      const dt = Math.max(1, now - wifiPrevBytes.time);
-      const rxps = (rx - wifiPrevBytes.rx)/dt;
-      const txps = (tx - wifiPrevBytes.tx)/dt;
-      rateTxt = `↓ ${humanRate(Math.max(0, rxps))} • ↑ ${humanRate(Math.max(0, txps))}`;
-    }
-    wifiPrevBytes = {rx, tx, time: now};
-    document.getElementById('ws_traffic').textContent =
-      `${rateTxt}  (${humanBytes(rx)} ↓ / ${humanBytes(tx)} ↑)`;
-
-    const persist = s.persist_client ? 'wpa_supplicant: salvo' : 'wpa_supplicant: não salvo';
-    document.getElementById('ws_persist').textContent = persist;
-
-    const en = s.boot_enabled || {};
-    const ifn = s.if || 'wlan0';
-    document.getElementById('ws_boot').textContent =
-      `modo: ${s.boot_mode||'—'} • create_ap: ${en.create_ap||'?'} • wifi-client@${ifn}: ${en['wifi-client@'+ifn]||'?'}`;
-  }catch(e){
-    document.getElementById('ws_mode').textContent = 'erro';
-  }
+      var en = s.boot_enabled || {};
+      var ifn = s['if'] || 'wlan0';
+      var bootTxt = 'modo: '+(s.boot_mode||'—')
+                  + ' • create_ap: '+(en.create_ap||'?')
+                  + ' • wifi-client@'+ifn+': '+(en['wifi-client@'+ifn]||'?');
+      document.getElementById('ws_boot').textContent = bootTxt;
+    })
+    .catch(function(){ document.getElementById('ws_mode').textContent = 'erro'; });
 }
 
-document.getElementById('btnWifiConnect')?.addEventListener('click', wifiConnect);
+(function wireWifiBtns(){
+  var b;
+  b = document.getElementById('btnWifiConnect'); if(b) b.addEventListener('click', wifiConnect);
 
+  b = document.getElementById('btnWifiAP'); if(b) b.addEventListener('click', function(){
+    var persist = window.confirm('Também definir AP como modo de boot?');
+    fetch('/api/wifi_ap_mode', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({persist: persist})})
+      .then(function(){ setWifiMsg('AP reativado' + (persist?' e salvo para boot.':'.'), true); setTimeout(function(){location.reload();}, 1200); })
+      .catch(function(e){ setWifiMsg('Falha ao voltar ao AP: '+e); });
+  });
 
-// botões novos
-document.getElementById('btnWifiAP')?.addEventListener('click', async ()=>{
-  const persist = confirm('Também definir AP como modo de boot?');
-  try{
-    await fetch('/api/wifi_ap_mode', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({persist})});
-    setWifiMsg('AP reativado'+(persist?' e salvo para boot.':'.'), true);
-    setTimeout(()=>location.reload(), 1200);
-  }catch(e){ setWifiMsg('Falha ao voltar ao AP: '+e); }
-});
+  b = document.getElementById('btnWifiReset'); if(b) b.addEventListener('click', function(){
+    fetch('/api/wifi_client_reset', {method:'POST', headers:{'Content-Type':'application/json'}, body: '{}'})
+      .then(function(){ setWifiMsg('Cliente Wi-Fi resetado.', true); wifiPrevBytes=null; wifiLoadStatus(); })
+      .catch(function(e){ setWifiMsg('Falha ao resetar: '+e); });
+  });
+})();
 
-document.getElementById('btnWifiReset')?.addEventListener('click', async ()=>{
-  try{
-    await fetch('/api/wifi_client_reset', {method:'POST', headers:{'Content-Type':'application/json'}, body: '{}'});
-    setWifiMsg('Cliente Wi-Fi resetado.', true);
-    wifiPrevBytes=null;
-    wifiLoadStatus();
-  }catch(e){ setWifiMsg('Falha ao resetar: '+e); }
-});
-
-// seletor de boot (opcional UI rápido)
-async function bootModeSave(mode){
-  try{
-    await fetch('/api/boot_mode', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mode})});
-    setWifiMsg('Modo de boot atualizado para '+mode, true);
-    wifiLoadStatus();
-  }catch(e){ setWifiMsg('Falha ao salvar boot: '+e); }
+function bootModeSave(mode){
+  return fetch('/api/boot_mode', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mode:mode})})
+    .then(function(){ setWifiMsg('Modo de boot atualizado para '+mode, true); wifiLoadStatus(); })
+    .catch(function(e){ setWifiMsg('Falha ao salvar boot: '+e); });
 }
 
-// atualiza status periodicamente
 setInterval(wifiLoadStatus, 3000);
 wifiLoadStatus();
 
-
-
-// ===== Wi-Fi Cliente (UI) =====
-let wifiScanCache = [];
-
-function setWifiMsg(txt, ok=false){
-  const el = document.getElementById('wifiMsg');
+/* Wi-Fi: UI */
+var wifiScanCache = [];
+function setWifiMsg(txt, ok){
+  var el = document.getElementById('wifiMsg');
   if(!el) return;
   el.textContent = txt || '';
   el.style.color = ok ? 'var(--ok)' : 'var(--muted)';
 }
-
 function renderWifiTable(list){
-  const tb = document.querySelector('#wifiList tbody');
+  var tb = document.querySelector('#wifiList tbody');
   if(!tb) return;
   if(!list || !list.length){
     tb.innerHTML = '<tr><td colspan="4">Sem redes encontradas.</td></tr>';
     return;
   }
-  tb.innerHTML = list.map(n=>{
-    const sig = (n.signal_dbm!=null? `${n.signal_dbm} dBm` : '—');
-    const ch  = (n.channel!=null? n.channel : '—');
-    const sec = n.security || '—';
-    const ssidEsc = (n.ssid||'').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    return `<tr data-ssid="${ssidEsc}">
-              <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis">${ssidEsc}</td>
-              <td>${sig}</td><td>${ch}</td><td>${sec}</td>
-            </tr>`;
-  }).join('');
-
-  // seleção por clique
-  tb.querySelectorAll('tr[data-ssid]').forEach(tr=>{
-    tr.addEventListener('click', ()=>{
-      const ssid = tr.getAttribute('data-ssid');
-      document.getElementById('wifiSsid').value = ssid;
-      setWifiMsg(`Selecionado: ${ssid}`);
-    });
-  });
+  var rows = '';
+  for(var i=0;i<list.length;i++){
+    var n = list[i];
+    var sig = (n.signal_dbm!=null? (n.signal_dbm+' dBm') : '—');
+    var ch  = (n.channel!=null? n.channel : '—');
+    var sec = n.security || '—';
+    var ss = (n.ssid||'').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    rows += '<tr data-ssid="'+ss+'">'
+          +   '<td style="max-width:280px;overflow:hidden;text-overflow:ellipsis">'+ss+'</td>'
+          +   '<td>'+sig+'</td><td>'+ch+'</td><td>'+sec+'</td>'
+          + '</tr>';
+  }
+  tb.innerHTML = rows;
+  var trs = tb.querySelectorAll('tr[data-ssid]');
+  for(var j=0;j<trs.length;j++){
+    trs[j].addEventListener('click', (function(tr){
+      return function(){
+        var ssid = tr.getAttribute('data-ssid');
+        document.getElementById('wifiSsid').value = ssid;
+        setWifiMsg('Selecionado: '+ssid);
+      };
+    })(trs[j]));
+  }
 }
-
 function applyWifiFilter(){
-  const q = (document.getElementById('wifiFilter').value || '').toLowerCase().trim();
+  var q = (document.getElementById('wifiFilter').value || '').toLowerCase().trim();
   if(!q){ renderWifiTable(wifiScanCache); return; }
-  const filtered = wifiScanCache.filter(n => (n.ssid||'').toLowerCase().includes(q));
+  var filtered = [];
+  for(var i=0;i<wifiScanCache.length;i++){
+    var n = wifiScanCache[i];
+    var ss = (n.ssid||'').toLowerCase();
+    if(ss.indexOf(q) !== -1) filtered.push(n);
+  }
   renderWifiTable(filtered);
 }
-
-async function wifiScan(){
-  const btn = document.getElementById('btnWifiScan');
+function wifiScan(){
+  var btn = document.getElementById('btnWifiScan');
   if(btn){ btn.disabled = true; btn.textContent = 'Buscando...'; }
   setWifiMsg('Escaneando redes (o AP pausa por alguns segundos)...');
-
-  try{
-    const r = await fetch('/api/wifi_scan', {cache:'no-store'});
-    const j = await r.json();
-    wifiScanCache = (j.networks||[]);
-    renderWifiTable(wifiScanCache);
-    setWifiMsg(`Encontradas ${wifiScanCache.length} rede(s).`, true);
-  }catch(e){
-    setWifiMsg('Falha ao escanear: '+e);
-  }finally{
-    if(btn){ btn.disabled = false; btn.textContent = 'Buscar redes'; }
-  }
+  return fetch('/api/wifi_scan', {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      wifiScanCache = (j.networks||[]);
+      renderWifiTable(wifiScanCache);
+      setWifiMsg('Encontradas '+wifiScanCache.length+' rede(s).', true);
+    })
+    .catch(function(e){ setWifiMsg('Falha ao escanear: '+e); })
+    .then(function(){ if(btn){ btn.disabled = false; btn.textContent = 'Buscar redes'; } });
 }
-
-async function wifiConnect(){
-  const ssid = (document.getElementById('wifiSsid').value || '').trim();
-  const pass = (document.getElementById('wifiPass').value || '');
-  const persist = !!document.getElementById('wifiPersist').checked;
-  const remember = !!document.getElementById('wifiRemember').checked;
-
+function wifiConnect(){
+  var ssid = (document.getElementById('wifiSsid').value || '').trim();
+  var pass = (document.getElementById('wifiPass').value || '');
+  var persist = !!document.getElementById('wifiPersist').checked;
+  var remember = !!document.getElementById('wifiRemember').checked;
   if(!ssid){ setWifiMsg('Informe o SSID.'); return; }
-
   setWifiMsg('Conectando...');
-  try{
-    const r = await fetch('/api/wifi_connect', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ ssid, pass, persist })
-    });
-    const j = await r.json();
-
+  fetch('/api/wifi_connect', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ ssid: ssid, pass: pass, persist: persist })
+  })
+  .then(function(r){ return r.json(); })
+  .then(function(j){
     if(remember){
-      localStorage.setItem('wifiClientSsid', ssid);
-      localStorage.setItem('wifiClientPass', pass);
+      try{ localStorage.setItem('wifiClientSsid', ssid); localStorage.setItem('wifiClientPass', pass); }catch(e){}
     }else{
-      localStorage.removeItem('wifiClientSsid');
-      localStorage.removeItem('wifiClientPass');
+      try{ localStorage.removeItem('wifiClientSsid'); localStorage.removeItem('wifiClientPass'); }catch(e){}
     }
-
-    if(j.ok){
-      setWifiMsg(`Conectado a ${ssid} (IP ${j.ip4||'n/d'}).`, true);
-    }else{
-      setWifiMsg(`Falha: ${j.msg||'não foi possível conectar'}`);
-    }
-  }catch(e){
-    setWifiMsg('Erro: '+e);
-  }
+    if(j.ok){ setWifiMsg('Conectado a '+ssid+' (IP '+(j.ip4||'n/d')+').', true); }
+    else{ setWifiMsg('Falha: '+(j.msg||'não foi possível conectar')); }
+  })
+  .catch(function(e){ setWifiMsg('Erro: '+e); });
 }
 
-// init Wi-Fi Cliente
-(function wifiClientInit(){
-  const f = document.getElementById('wifiFilter');
-  if(f) f.addEventListener('input', applyWifiFilter);
-
-  const bScan = document.getElementById('btnWifiScan');
-  if(bScan) bScan.addEventListener('click', wifiScan);
-
-  const bConn = document.getElementById('btnWifiConnect');
-  if(bConn) bConn.addEventListener('click', wifiConnect);
-
-  // preencher com lembrados no navegador
-  const lsSsid = localStorage.getItem('wifiClientSsid');
-  const lsPass = localStorage.getItem('wifiClientPass');
-  if(lsSsid) document.getElementById('wifiSsid').value = lsSsid;
-  if(lsPass) document.getElementById('wifiPass').value = lsPass;
-  if(lsSsid || lsPass) document.getElementById('wifiRemember').checked = true;
+/* init Wi-Fi Cliente */
+(function(){
+  var f = document.getElementById('wifiFilter'); if(f) f.addEventListener('input', applyWifiFilter);
+  var bScan = document.getElementById('btnWifiScan'); if(bScan) bScan.addEventListener('click', wifiScan);
+  var bConn = document.getElementById('btnWifiConnect'); if(bConn) bConn.addEventListener('click', wifiConnect);
+  try{
+    var lsSsid = localStorage.getItem('wifiClientSsid');
+    var lsPass = localStorage.getItem('wifiClientPass');
+    if(lsSsid) document.getElementById('wifiSsid').value = lsSsid;
+    if(lsPass) document.getElementById('wifiPass').value = lsPass;
+    if(lsSsid || lsPass) document.getElementById('wifiRemember').checked = true;
+  }catch(e){}
 })();
 
-
-
-
-
-// Inicialização
-(async function loop(){
-  async function refresh(){
-    try{
-      const r = await fetch('/api/status',{cache:'no-store'});
-      const j = await r.json();
-      render(j);
-    }catch(e){ console.error(e); }
+/* Inicialização */
+(function(){
+  function refresh(){
+    return fetch('/api/status',{cache:'no-store'})
+      .then(function(r){ return r.json(); })
+      .then(function(j){ render(j); })
+      .catch(function(e){ try{ console.error(e); }catch(_e){} });
   }
-  await refresh();
-  await loadLogs();
+  refresh().then(function(){ return loadLogs(); });
   setInterval(refresh, 3000);
 })();
 </script>
+
+
+
+<script>
+(function(){
+  if (!window.fetch) {
+    window.fetch = function(url, opts){
+      return new Promise(function(resolve, reject){
+        var x = new XMLHttpRequest();
+        x.open((opts && opts.method) || 'GET', url, true);
+        if (opts && opts.headers) {
+          for (var k in opts.headers) {
+            if (Object.prototype.hasOwnProperty.call(opts.headers, k)) {
+              x.setRequestHeader(k, opts.headers[k]);
+            }
+          }
+        }
+        x.onload = function(){
+          resolve({
+            ok: (x.status >= 200 && x.status < 300),
+            status: x.status,
+            json: function(){
+              try { return Promise.resolve(JSON.parse(x.responseText || '{}')); }
+              catch(e){ return Promise.resolve({}); }
+            },
+            text: function(){ return Promise.resolve(x.responseText || ''); }
+          });
+        };
+        x.onerror = function(){ reject(new Error('network')); };
+        x.send((opts && opts.body) || null);
+      });
+    };
+  }
+})();
+</script>
+<script>
+(function(){
+  var termSid=null, termPos=0, termTimer=null;
+
+  function atobUtf8(b64){
+    try{ return decodeURIComponent(escape(atob(b64))); }
+    catch(e){ return atob(b64); }
+  }
+  function stripAnsi(s){
+    return s.replace(/\\x1B\[[0-9;]*[ -/]*[@-~]/g,'').replace(/\\x1B[@-Z\\-_]/g,'');
+  }
+  function termAppend(txt){
+    var box=document.getElementById('termBox');
+    var stripEl=document.getElementById('termStrip');
+    var strip=stripEl?!!stripEl.checked:false;
+    var out=strip?stripAnsi(txt):txt;
+    box.textContent=(box.textContent||'')+out;
+    box.scrollTop=box.scrollHeight;
+  }
+  function termPoll(){
+    if(!termSid) return;
+    fetch('/api/term/read?sid='+encodeURIComponent(termSid)+'&pos='+termPos,{cache:'no-store'})
+      .then(function(r){ if(!r.ok) throw new Error('read '+r.status); return r.json(); })
+      .then(function(j){
+        termPos=j.pos||termPos;
+        if(j.out_b64){
+          var chunk=atobUtf8(j.out_b64);
+          if(chunk) termAppend(chunk);
+        }
+        if(j.alive===false){ termStop(false); termAppend("\\n[processo encerrado]\\n"); }
+      })
+      .catch(function(){});
+  }
+  function termStart(){
+    if(termSid) return;
+    fetch('/api/term/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cols:120,rows:30})})
+      .then(function(r){ return r.json(); })
+      .then(function(j){
+        termSid=j.sid; termPos=0;
+        var box=document.getElementById('termBox'); box.textContent='';
+        var id8=(termSid?String(termSid):'').slice(0,8);
+        termAppend('[shell '+id8+' iniciado]\\n');
+        termTimer=setInterval(termPoll,400);
+      })
+      .catch(function(e){ termAppend('Falha ao iniciar: '+e+'\\n'); });
+  }
+  function termStop(showMsg){
+    if(termTimer){ clearInterval(termTimer); termTimer=null; }
+    if(termSid){
+      fetch('/api/term/kill',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sid:termSid})});
+    }
+    if(showMsg) termAppend('\\n[shell encerrado]\\n');
+    termSid=null; termPos=0;
+  }
+  function termClear(){
+    var box=document.getElementById('termBox'); if(box) box.textContent='';
+  }
+  function termSendLine(){
+    var inp=document.getElementById('termInput');
+    var txt=inp?inp.value:'';
+    if(!termSid){ termStart(); }
+    fetch('/api/term/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sid:termSid,data:(txt||'')+"\\n"})});
+    if(inp) inp.value='';
+  }
+  function termSendRaw(bytes){
+    if(!termSid){ termStart(); }
+    var b64=btoa(bytes);
+    fetch('/api/term/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sid:termSid,data_b64:b64})});
+  }
+  function wireTerminalButtons(){
+    var b;
+    b=document.getElementById('termStart'); if(b) b.addEventListener('click',function(){termStart();});
+    b=document.getElementById('termStop');  if(b) b.addEventListener('click',function(){termStop(true);});
+    b=document.getElementById('termClear'); if(b) b.addEventListener('click',termClear);
+    b=document.getElementById('termSend');  if(b) b.addEventListener('click',termSendLine);
+    var inp=document.getElementById('termInput');
+    if(inp){ inp.addEventListener('keydown',function(e){ if(e.key==='Enter'){ e.preventDefault(); termSendLine(); } }); }
+    b=document.getElementById('termCtrlC'); if(b) b.addEventListener('click',function(){ termSendRaw(String.fromCharCode(3)); });
+    b=document.getElementById('termCtrlD'); if(b) b.addEventListener('click',function(){ termSendRaw(String.fromCharCode(4)); });
+  }
+  if(document.readyState==='loading'){ document.addEventListener('DOMContentLoaded',wireTerminalButtons); }
+  else{ wireTerminalButtons(); }
+})();
+</script>
+
+
+
+
+
+
+
 </body>
 </html>
 """
+
+
+
+
+# ------------------ Terminal (PTY) ------------------
+SESSIONS = {}
+SESSION_TTL = 1800  # 30min de inatividade
+
+class ShellSession:
+    def __init__(self, cols=120, rows=30):
+        self.sid = uuid.uuid4().hex
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            # filho: exec bash com TERM=xterm
+            env = os.environ.copy()
+            env["TERM"] = env.get("TERM","xterm")
+            os.execvpe("/bin/bash", ["bash","-l"], env)
+        # pai:
+        self.buf = bytearray()
+        self.lock = threading.Lock()
+        self.alive = True
+        self.last = time.time()
+        self.resize(cols, rows)
+        # opcional: prompt “limpo”, menos ruído
+        try: os.write(self.fd, b'export PS1="\\u@\\h:\\w\\$ ";\n')
+        except: pass
+
+        self.reader = threading.Thread(target=self._reader, daemon=True)
+        self.reader.start()
+
+    def _reader(self):
+        while self.alive:
+            r,_,_ = select.select([self.fd], [], [], 0.5)
+            if self.fd in r:
+                try:
+                    data = os.read(self.fd, 4096)
+                    if not data:
+                        break
+                    with self.lock:
+                        self.buf.extend(data)
+                        # limita a 1MB (mantém últimos 512KB)
+                        if len(self.buf) > 1024*1024:
+                            self.buf = self.buf[-512*1024:]
+                        self.last = time.time()
+                except OSError:
+                    break
+        self.alive = False
+
+    def write(self, data: bytes | str):
+        if not self.alive: return 0
+        self.last = time.time()
+        if isinstance(data, str): data = data.encode("utf-8", "ignore")
+        try:
+            return os.write(self.fd, data)
+        except OSError:
+            self.alive = False
+            return 0
+
+    def read_from(self, pos=0):
+        with self.lock:
+            total = len(self.buf)
+            if pos < 0: pos = 0
+            if pos > total: pos = total
+            chunk = bytes(self.buf[pos:])
+        return chunk, total
+
+    def resize(self, cols, rows):
+        try:
+            winsize = struct.pack("HHHH", int(rows), int(cols), 0, 0)
+            fcntl.ioctl(self.fd, termios.TIOCSWINSZ, winsize)
+        except Exception:
+            pass
+
+    def kill(self):
+        self.alive = False
+        try: os.close(self.fd)
+        except: pass
+        try: os.kill(self.pid, 15)
+        except: pass
+
+def _get_session(sid):
+    s = SESSIONS.get(sid)
+    if s and s.alive: return s
+    return None
+
+def _reap_sessions_loop():
+    while True:
+        now = time.time()
+        for sid, s in list(SESSIONS.items()):
+            if (not s.alive) or (now - s.last > SESSION_TTL):
+                try: s.kill()
+                except: pass
+                SESSIONS.pop(sid, None)
+        time.sleep(5)
+
+# inicia coletor em background (logo no import)
+threading.Thread(target=_reap_sessions_loop, daemon=True).start()
 
 class H(BaseHTTPRequestHandler):
     def _json_headers(self):
@@ -1437,6 +1684,20 @@ class H(BaseHTTPRequestHandler):
 
             elif self.path.startswith("/api/boot_mode"):
                 self._send_json(get_boot_mode()); return
+                
+            elif self.path.startswith("/api/term/read"):
+                qs = {}
+                if "?" in self.path:
+                    qs = urllib.parse.parse_qs(self.path.split("?",1)[1])
+                sid = (qs.get("sid",[""])[0] or "")
+                pos = int((qs.get("pos",["0"])[0] or "0"))
+                s = _get_session(sid)
+                if not s:
+                    self._send_json({"error":"no-session"}, status=404); return
+                out, total = s.read_from(pos)
+                # base64 para transmitir bytes/ANSI com segurança
+                self._send_json({"sid": sid, "pos": total, "out_b64": base64.b64encode(out).decode("ascii"), "alive": s.alive}); return
+
 
 
             else:
@@ -1473,6 +1734,45 @@ class H(BaseHTTPRequestHandler):
             elif self.path.startswith("/api/boot_mode"):
                 mode = (data.get("mode") or "")
                 self._send_json(set_boot_mode(mode)); return
+                
+            elif self.path.startswith("/api/term/start"):
+                cols = int((data.get("cols") or 120))
+                rows = int((data.get("rows") or 30))
+                s = ShellSession(cols=cols, rows=rows)
+                SESSIONS[s.sid] = s
+                self._send_json({"sid": s.sid}); return
+
+            elif self.path.startswith("/api/term/send"):
+                sid = (data.get("sid") or "")
+                s = _get_session(sid)
+                if not s:
+                    self._send_json({"error":"no-session"}, status=404); return
+                # aceita texto (data) e/ou base64 (data_b64)
+                txt = data.get("data") or ""
+                b64 = data.get("data_b64")
+                payload = (base64.b64decode(b64) if b64 else txt.encode("utf-8","ignore"))
+                s.write(payload)
+                self._send_json({"ok": True}); return
+
+            elif self.path.startswith("/api/term/resize"):
+                sid  = (data.get("sid") or "")
+                cols = int((data.get("cols") or 120))
+                rows = int((data.get("rows") or 30))
+                s = _get_session(sid)
+                if not s:
+                    self._send_json({"error":"no-session"}, status=404); return
+                s.resize(cols, rows)
+                self._send_json({"ok": True}); return
+
+            elif self.path.startswith("/api/term/kill"):
+                sid = (data.get("sid") or "")
+                s = _get_session(sid)
+                if not s:
+                    self._send_json({"ok": True, "msg":"already-gone"}); return
+                s.kill()
+                SESSIONS.pop(sid, None)
+                self._send_json({"ok": True}); return
+                
 
             else:
                 self._send_json({"error":"endpoint inválido"}, status=404)
