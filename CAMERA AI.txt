@@ -3,7 +3,7 @@
 
 
 
-pip install flask opencv-python
+pip install flask opencv-python --break-system-packages
 
 sudo usermod -aG video $USER
 
@@ -16,7 +16,7 @@ sudo usermod -aG video $USER
 while true
 do
   echo "=== Iniciando MirakoCAM ==="
-  python3 /home/santocyber/MirakoCAM/app.py
+  python3 /root/app.py
   echo ">>> Flask parou (exit code: $?) — reiniciando em 5s..."
   sleep 5
 done
@@ -31,51 +31,18 @@ chmod +x run_cam.sh
 
 
 
-pico /etc/systemd/system/mirakocam.service
-
-
-
-[Unit]
-Description=MirakoCAM Flask Service
-After=network.target
-
-[Service]
-Type=simple
-User=santocyber
-WorkingDirectory=/home/santocyber/MirakoCAM
-ExecStart=/usr/bin/python3 /home/santocyber/MirakoCAM/app.py
-Restart=always
-RestartSec=5
-Environment=PORT=5000
-
-[Install]
-WantedBy=multi-user.target
 
 
 
 
-
-
-
-
-sudo systemctl daemon-reload
-sudo systemctl enable mirakocam
-sudo systemctl start mirakocam
-
-
-
-
-
-sudo systemctl status mirakocam
-sudo journalctl -fu mirakocam
-
-
-pip uninstall -y opencv-python opencv-python-headless
+pip uninstall -y opencv-python opencv-python-headless --break-system-packages
 
 sudo apt update
 sudo apt install python3-opencv ffmpeg
 
 
+pip uninstall numpy
+pip install numpy==1.26.0
 
 ##BAIXAR MODELOS 
 
@@ -143,2242 +110,1897 @@ ls -lh "$PROTO" "$WEIGHTS"
 
 
 
+
+
+
+
+
+
+
+
+# Dependências básicas
+sudo apt-get update && sudo apt-get install -y curl ca-certificates xz-utils
+
+# Descobre a sua arquitetura e escolhe o asset certo
+ARCH=$(dpkg --print-architecture)               # armhf ou arm64
+case "$ARCH" in
+  arm64)  FILTER="linux_arm64" ;;
+  armhf)  FILTER="linux_armv7|linux_arm" ;;     # armv7 (fallback: arm genérico)
+  *)      echo "Arquitetura $ARCH não mapeada"; exit 1 ;;
+esac
+
+# Busca a URL do .deb (preferência) ou do .gz na última release
+URL=$(curl -s https://api.github.com/repos/jpillora/chisel/releases/latest \
+  | grep -oP '(?<="browser_download_url": ")[^"]+' \
+  | grep -E "chisel_.*_(${FILTER})\.(deb|gz)$" | head -n1)
+
+# Instala (.deb se houver; senão, extrai o .gz)
+if echo "$URL" | grep -q '\.deb$'; then
+  curl -L "$URL" -o /tmp/chisel.deb && sudo dpkg -i /tmp/chisel.deb || sudo apt -f install -y
+else
+  curl -L "$URL" -o /tmp/chisel.gz && gunzip -f /tmp/chisel.gz && \
+  chmod +x /tmp/chisel && sudo mv /tmp/chisel /usr/local/bin/chisel
+fi
+
+# Verifique
+chisel -v
+
+
+##PROXY REVERSO NGINX 
+
+# All server fields such as server | location can be set, such as:
+# location /web {
+#     try_files $uri $uri/ /index.php$is_args$args;
+# }
+# error_page 404 /diy_404.html;
+# If there is abnormal access to the reverse proxy website and the content has already been configured here, please prioritize checking if the configuration here is correct
+
+# --- Upstreams dinâmicos por Referer (um ponto de verdade) ---
+# Fallback (raiz)
+set $api_upstream http://127.0.0.1:6000;
+set $static_upstream http://127.0.0.1:6000;
+
+# Se a página de origem é /web1/, use 15000
+if ($http_referer ~* "/web1/") {
+    set $api_upstream http://127.0.0.1:15000;
+    set $static_upstream http://127.0.0.1:15000;
+}
+
+# Se a página de origem é /cam1/, use 15001
+if ($http_referer ~* "/cam1/") {
+    set $api_upstream http://127.0.0.1:15001;
+    set $static_upstream http://127.0.0.1:15001;
+}
+
+# --- OPCIONAL: se os endpoints de gravação forem SEMPRE do cam1 ---
+# Coloque ANTES do /api/ geral para ter prioridade
+location ^~ /api/record/ {
+    proxy_pass http://127.0.0.1:15001;  # cam1
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    proxy_http_version 1.1;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    client_max_body_size 100m;
+}
+
+# --- /api (ÚNICO bloco) ---
+location ^~ /api/ {
+    proxy_pass $api_upstream;  # mantém /api/... para o app selecionado pelo Referer
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    proxy_http_version 1.1;
+    proxy_buffering off;             # evita buffering de respostas longas/stream
+    proxy_request_buffering off;     # encaminha o body (POST/PUT) sem buffer
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    client_max_body_size 100m;
+    # Se usar WebSocket em /api/:
+    # proxy_set_header Upgrade $http_upgrade;
+    # proxy_set_header Connection "upgrade";
+}
+
+# --- Stream de vídeo ---
+location ^~ /video_feed {
+    proxy_pass $static_upstream;     # preserva query (?dev=/dev/videoX)
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    proxy_http_version 1.1;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_read_timeout 3600s;
+    add_header X-Accel-Buffering no;
+    # Se for WebSocket:
+    # proxy_set_header Upgrade $http_upgrade;
+    # proxy_set_header Connection "upgrade";
+}
+
+# --- Imagens/Thumbs ---
+location ^~ /media/ {
+    proxy_pass $static_upstream;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    proxy_buffering off;             # evita atraso em geração on-demand
+    expires -1;
+    add_header Cache-Control "no-store";
+}
+
+# --- Conveniências ---
+# Força barra final nas apps (resolve assets relativos)
+location = /web1 { return 301 /web1/; }
+location = /cam1 { return 301 /cam1/; }
+
+# Redireciona a raiz para /web1/ (ou troque para /cam1/ se preferir)
+location = / { return 302 /web1/; }
+
+
+
+
+
+
+tee /etc/systemd/system/chisel-client.service >/dev/null <<'EOF'
+[Unit]
+Description=Chisel client (reversos: 15000->127.0.0.1:80 e 15001->127.0.0.1:5000)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orangepi
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+ExecStart=/usr/bin/env chisel client \
+  --keepalive 10s \
+  --auth camai:qazwsx \
+  camai.mirako.org:6000 \
+  R:0.0.0.0:15000:127.0.0.1:80 \
+  R:0.0.0.0:15001:127.0.0.1:5000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+
+EOF
+
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now chisel-client
+sudo systemctl restart chisel-client
+journalctl -u chisel-client -f
+
+
+
+
+
+
+
+
+
 finalmente o codigo 
+
+
 
 
 //app.py
 
-
+tee /root/app.py >/dev/null <<'EOF'
 #!/usr/bin/env python3
-import os
-import re
-import cv2
-import glob
-import json
-import time
-import hashlib
-import threading
-import subprocess
-import mimetypes
-import urllib.request
-import urllib.error
+# -*- coding: utf-8 -*-
+import os, cv2, time, glob, threading, platform, subprocess, re, json, stat
 from datetime import datetime, date
-from flask import Flask, Response, render_template_string, request, jsonify, send_from_directory, abort
-import numpy as np
-from ssd_backend import SSDDetector, MOBILENETSSD_CLASSES  # novo import
+from flask import Flask, Response, jsonify, render_template_string, request, send_from_directory, abort
+from werkzeug.middleware.proxy_fix import ProxyFix
 
-
-# ----------------- Config padrão -----------------
-DEFAULT_DEVICE = os.environ.get("CAM_DEVICE", "/dev/video0")
-DEFAULT_W = int(os.environ.get("FRAME_WIDTH", "1280"))
-DEFAULT_H = int(os.environ.get("FRAME_HEIGHT", "720"))
-DEFAULT_FPS = float(os.environ.get("FPS", "30"))
-DEFAULT_JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "80"))
-DEFAULT_FOURCC = os.environ.get("FOURCC", "MJPG")  # 'MJPG' recomendado
-
-# === SSD MobileNet (Caffe) ===
-
-SSD_PROTO   = os.environ.get("SSD_PROTO",   "models/deploy.prototxt")
-SSD_WEIGHTS = os.environ.get("SSD_WEIGHTS", "models/mobilenet_iter_73000.caffemodel")
-
-
-
-# YOLO via env (opcional)
-YOLO_BACKEND = os.environ.get("YOLO_BACKEND", "darknet")  # 'darknet' | 'onnx'
-YOLO_CFG = os.environ.get("YOLO_CFG", "")
-YOLO_WEIGHTS = os.environ.get("YOLO_WEIGHTS", "")
-YOLO_NAMES = os.environ.get("YOLO_NAMES", "")
-YOLO_ONNX = os.environ.get("YOLO_ONNX", "")
-
-MOBILENETSSD_CLASSES = [
-    "background","aeroplane","bicycle","bird","boat","bottle","bus","car","cat","chair",
-    "cow","diningtable","dog","horse","motorbike","person","pottedplant","sheep","sofa","train","tvmonitor"
-]
-
-
-# === Evolution API (suas credenciais) ===
-EVO_API_URL      = os.environ.get("EVO_API_URL",      "https://evolution.mirako.org")
-EVO_API_INSTANCE = os.environ.get("EVO_API_INSTANCE", "Mirako")
-EVO_API_KEY      = os.environ.get("EVO_API_KEY",      "f2824a60ab1042f1144fd1e3c83ea5e3b8f8645884a035609782c287401bafbe")
-# Base pública opcional para montar URL da foto (ex.: https://meu.dominio:5000)
-EVO_PUBLIC_BASE  = os.environ.get("PUBLIC_BASE_URL", "")
-
-MEDIA_DIRS = {
-    "photos": "photos",
-    "videos": "videos",
-    "timelapse": "timelapse",
-    "thumbs": "thumbs"
-}
-for d in MEDIA_DIRS.values():
+# ----------------- Pastas -----------------
+MEDIA = {"photos": "photos", "videos": "videos", "thumbs": "thumbs"}
+for d in MEDIA.values():
     os.makedirs(d, exist_ok=True)
 
-EVENTS_FILE = "events.jsonl"  # linha do tempo persistente
-EVO_CFG_FILE = "evo_config.json"  # persistência do módulo Evolution
-
-app = Flask(__name__)
-
-# ----------------- HTML (UI principal: Timeline + filtros + seleção + lightbox + Evolution na sidebar) -----------------
-HTML = """
-<!doctype html>
-<html lang="pt-br">
-<head>
-<meta charset="utf-8">
-<title>MirakoCAM</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-:root{--bg:#111;--panel:#181818;--soft:#0e0e0e;--line:#222;--ink:#eee;--muted:#aaa;--link:#9ad}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,Segoe UI,Arial,sans-serif}
-header{padding:12px 16px;background:#181818;display:flex;gap:8px;align-items:center;position:sticky;top:0;z-index:5;border-bottom:1px solid var(--line)}
-select,input,button,textarea{background:#2b2b2b;color:var(--ink);border:1px solid var(--line);padding:6px 10px;border-radius:8px}
-button{cursor:pointer}
-button:hover{background:#383838}
-main{display:grid;grid-template-columns:360px 1fr;gap:16px;padding:16px}
-@media (max-width:1200px){ main{grid-template-columns:1fr} }
-.panel{background:#181818;border:1px solid var(--line);border-radius:12px;padding:12px;min-width:280px}
-label{display:block;margin:8px 0 4px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.card{background:#181818;border:1px solid var(--line);border-radius:12px;overflow:hidden}
-.card header{padding:10px 12px;border-bottom:1px solid var(--line);background:#1b1b1b}
-.card .content{padding:0}
-.viewer-wrap{position:relative}
-#stream{display:block;width:100%;height:auto}
-#roiCanvas{position:absolute;left:0;top:0;pointer-events:none}
-
-/* Timeline em grade */
-.timeline-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
-.thumb{position:relative;background:var(--soft);border:1px solid var(--line);border-radius:10px;padding:6px;display:flex;flex-direction:column;gap:6px}
-.thumb.selected{outline:2px solid #59a}
-.thumb img{width:100%;border-radius:6px;cursor:pointer}
-.thumb .meta{display:flex;justify-content:space-between;font-size:12px;color:var(--muted)}
-.selbox{position:absolute;top:6px;left:6px;background:#0007;border:1px solid var(--line);padding:4px 6px;border-radius:8px}
-.selbox input{transform:scale(1.2)}
-
-/* LIGHTBOX (imagem + vídeo) */
-#lightbox{position:fixed;inset:0;background:rgba(0,0,0,.92);display:none;align-items:center;justify-content:center;z-index:1000}
-#lightbox.show{display:flex}
-.lb-inner{position:relative;max-width:95vw;max-height:92vh;display:flex;flex-direction:column;align-items:center;gap:10px}
-.lb-toolbar{display:flex;gap:8px;align-items:center;justify-content:center}
-.lb-toolbar button, .lb-toolbar a{background:#2b2b2b;border:1px solid var(--line);color:var(--ink);padding:8px 10px;border-radius:10px;text-decoration:none}
-.lb-counter{font-size:13px;color:#ddd}
-.lb-stage{position:relative;overflow:hidden;border-radius:12px;border:1px solid var(--line);background:#000;max-width:95vw;max-height:80vh}
-.lb-img{max-width:none;max-height:none;transform-origin:center center;cursor:grab;user-select:none;-webkit-user-drag:none;display:none}
-.lb-vid{display:none;max-width:95vw;max-height:80vh;background:#000;border:0;outline:0}
-.lb-close{
-  position:absolute;top:10px;right:10px;
-  background:#0008;border:1px solid var(--line);color:#fff;
-  border-radius:999px;width:38px;height:38px;
-  display:flex;align-items:center;justify-content:center;
-  font-size:18px;
-  z-index: 1003;            /* <— adicione isto */
+# ----------------- Config persistente -----------------
+CONFIG_FILE = "config.json"
+CFG_LOCK = threading.Lock()
+CFG = {
+    "cameras": {},
+    "ui": {"preview_size": "medium", "library_view": "grid"}
 }
-.lb-stage { position:relative; z-index: 1000; } /* garante ordem */
-.lb-nav{position:absolute;top:0;bottom:0;display:flex;align-items:center;justify-content:center;width:25%;cursor:pointer;color:#fff;font-size:30px;text-shadow:0 2px 8px #000}
-.lb-prev{left:0}
-.lb-next{right:0}
-.lb-zoomtip{position:absolute;left:10px;bottom:10px;background:#0008;color:#fff;font-size:12px;padding:4px 8px;border-radius:8px}
-.badge{opacity:.8}
+
+def _cfg_load():
+    global CFG
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            with CFG_LOCK:
+                loaded = json.load(f)
+                loaded.setdefault("ui", {})
+                loaded["ui"].setdefault("preview_size", "medium")
+                loaded["ui"].setdefault("library_view", "grid")
+                loaded["ui"].setdefault("selected_devs", [])
+                loaded.setdefault("cameras", {})
+                for k, c in loaded["cameras"].items():
+                    c.setdefault("mic", "default")
+                    c.setdefault("timelapse", {"enable": False, "interval": 5})
+                    c.setdefault("motion", {
+                        "enable": False, "sensitivity": 50, "min_area_pct": 3,
+                        "action": "photo", "overlay": True, "cooldown": 10, "clip_len": 30
+                    })
+                CFG = loaded
+    except Exception:
+        pass
+
+def _cfg_save():
+    with CFG_LOCK:
+        tmp = CONFIG_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(CFG, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_FILE)
+
+def get_cam_cfg(dev):
+    dev = str(dev)
+    with CFG_LOCK:
+        c = CFG.setdefault("cameras", {}).setdefault(dev, {})
+        c.setdefault("mic", "default")
+        c.setdefault("timelapse", {"enable": False, "interval": 5})
+        c.setdefault("motion", {
+            "enable": False, "sensitivity": 50, "min_area_pct": 3,
+            "action": "photo", "overlay": True, "cooldown": 10, "clip_len": 30
+        })
+        return json.loads(json.dumps(c))  # cópia
+
+def set_cam_cfg(dev, updates: dict):
+    dev = str(dev)
+    with CFG_LOCK:
+        c = CFG.setdefault("cameras", {}).setdefault(dev, {})
+        for k, v in (updates or {}).items():
+            if k in ("timelapse", "motion") and isinstance(v, dict):
+                tgt = c.setdefault(k, {})
+                tgt.update(v)
+            else:
+                c[k] = v
+    _cfg_save()
+
+def set_ui_cfg(updates: dict):
+    with CFG_LOCK:
+        CFG.setdefault("ui", {}).update(updates or {})
+    _cfg_save()
+
+def sanitize_dev(dev: str) -> str:
+    return re.sub(r"[^0-9A-Za-z_\-\.]", "_", str(dev))
+
+# ----------------- HTML -----------------
+HTML = """<!doctype html>
+<html lang="pt-br"><head><meta charset="utf-8">
+<title>Mini MultiCam</title><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="x-basepath" content="{{ basepath|e }}">
+<style>
+:root{--bg:#111;--fg:#eee;--card:#1a1a1a;--line:#252525;--tile:320px}
+*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,Segoe UI,Arial}
+header{padding:10px 14px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#121212;z-index:2}
+main{display:grid;grid-template-columns:300px 1fr;gap:16px;padding:16px} @media(max-width:1000px){main{grid-template-columns:1fr}}
+.panel,.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--tile),1fr));gap:10px}
+.stream{background:#000;border-radius:8px;overflow:hidden;border:1px solid var(--line)}
+.stream header{display:flex;justify-content:space-between;align-items:center;background:#141414;padding:6px 8px}
+.stream img{width:100%;display:block}
+button,select,input{background:#222;color:var(--fg);border:1px solid var(--line);padding:6px 8px;border-radius:8px}
+button{cursor:pointer} button:hover{background:#2b2b2b}
+.thumb{display:flex;gap:8px;align-items:center}
+.thumb img{width:96px;height:64px;object-fit:cover;border-radius:6px;border:1px solid var(--line)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+small.muted{color:#aaa}
+
+/* Biblioteca agrupada por câmera + origem */
+.cam-block{border:1px solid var(--line); border-radius:10px; padding:10px; margin-bottom:14px; background:#151515}
+.cam-block h4{margin:4px 0 10px 0}
+.cam-section{margin-top:10px}
+.cam-items.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}
+.cam-items.list{display:block}
+.cam-items.list .thumb{padding:8px 0;border-bottom:1px solid var(--line)}
+.cam-items.grid .thumb{position:relative; display:block;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.cam-items.grid .thumb img{width:100%;height:auto;display:block}
+.cam-items.grid .thumb div{padding:8px}
+.selbox{position:absolute;top:6px;left:6px;background:#0009;border:1px solid var(--line);padding:4px 6px;border-radius:8px}
+.selcount{margin-left:8px;color:#aaa}
 </style>
+
+
+
+
+
 </head>
 <body>
-<header>
-  <strong>MirakoCAM</strong>
-  <small id="status"></small>
-</header>
+<header><strong>Mini MultiCam</strong> <small id="status"></small></header>
 <main>
-  <!-- SIDEBAR -->
   <section class="panel">
-    <h3>Dispositivo e Formatos</h3>
-    <div class="grid">
-      <label for="device">Câmera</label>
-      <div style="display:flex;gap:8px">
-        <select id="device"></select>
-        <button id="refresh">↻</button>
-      </div>
-      <label for="fourcc">FourCC</label>
-      <select id="fourcc"><option>MJPG</option><option>YUYV</option><option>H264</option></select>
-      <label for="width">Largura</label><input id="width" type="number" value="1280" min="160" step="2">
-      <label for="height">Altura</label><input id="height" type="number" value="720" min="120" step="2">
-      <label for="fps">FPS</label><input id="fps" type="number" value="30" min="1" max="120">
-    </div>
-    <div class="row" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-      <button id="apply">Aplicar</button>
-      <button id="listFormats">Listar formatos</button>
-      <button id="snapshot">📸 Snapshot</button>
-    </div>
-    <pre id="formats" style="margin-top:10px;max-height:160px;overflow:auto;background:#0e0e0e;border:1px solid #222;padding:8px;border-radius:6px"></pre>
-
-    <h3 style="margin-top:16px">Ações</h3>
-    <div class="row" style="gap:6px;flex-wrap:wrap">
-      <button id="photo">📷 Foto</button>
-      <button id="recStart">⏺️ Iniciar Vídeo</button>
-      <button id="recStop">⏹️ Parar Vídeo</button>
-      <small id="recInfo" class="badge"></small>
-    </div>
-    <div class="row" style="margin-top:8px;gap:6px;align-items:center">
-      <label>Timelapse (s)</label>
-      <input id="tlInterval" type="number" min="1" value="5" style="width:80px">
-      <button id="tlStart">⏱️ Iniciar</button>
-      <button id="tlStop">⏹️ Parar</button>
-      <small id="tlInfo" class="badge"></small>
+    <h3>Câmeras</h3>
+    <div id="devs" class="row"></div>
+    <div class="row" style="margin-top:8px">
+      <button id="refresh">↻ Atualizar</button>
+      <small class="muted">Marque para abrir o preview</small>
     </div>
 
-    <h3 style="margin-top:16px">Controles de Imagem</h3>
-    <div class="grid">
-      <label>Qualidade JPG</label><input type="range" id="jpegq" min="40" max="95" value="80">
-      <label>Brilho</label><input type="range" id="brightness" min="0" max="255" value="128">
-      <label>Contraste</label><input type="range" id="contrast" min="0" max="255" value="128">
-      <label>Exposição</label><input type="range" id="exposure" min="5" max="1000" value="100">
+    <h3 style="margin-top:12px">Layout</h3>
+    <div class="row">
+      <label>Tamanho do preview</label>
+      <select id="previewSize">
+        <option value="small">Pequeno</option>
+        <option value="medium" selected>Médio</option>
+        <option value="large">Grande</option>
+        <option value="xlarge">Muito grande</option>
+        <option value="xxlarge">Muito MUITO grande</option>
+      </select>
+      <button id="applyUi">Aplicar</button>
+    </div>
+
+    <h3 style="margin-top:12px">Biblioteca</h3>
+    <div class="row">
+      <label>Visualização</label>
+      <select id="libMode">
+        <option value="grid">Grid</option>
+        <option value="list">Lista</option>
+      </select>
+      <label>De</label><input type="date" id="dateFrom">
+      <label>Até</label><input type="date" id="dateTo">
+      <button id="applyLib">Aplicar</button>
     </div>
     <div class="row" style="margin-top:8px">
-      <button id="applyControls">Aplicar controles</button>
-      <button id="autoExposure">Auto Exposição</button>
+      <button id="selAll">Selecionar tudo</button>
+      <button id="selNone">Limpar</button>
+      <button id="delSel">Apagar selecionados</button>
+      <span class="selcount" id="selCount">0 selecionado(s)</span>
     </div>
-
-    <h3 style="margin-top:16px">Giro da Câmera</h3>
-    <div class="row" style="gap:6px;align-items:center">
-      <input type="range" id="rotate" min="-180" max="180" value="0" style="flex:1">
-      <button id="rotLeft">↺ -15°</button>
-      <button id="rotRight">↻ +15°</button>
-    </div>
-
-    <h3 style="margin-top:16px">Detecção de Movimento + YOLO</h3>
-    <div class="row">
-      <label><input id="mdEnable" type="checkbox"> Ativar</label>
-      <label><input id="mdOverlay" type="checkbox" checked> Overlays no preview</label>
-    </div>
-    <div class="grid">
-      <label>Ação</label><select id="mdAction"><option value="photo">Foto</option><option value="clip">Mini-gravação</option></select>
-      <label>Duração (s)</label><input id="mdDuration" type="number" min="1" max="60" value="10">
-      <label>Sensibilidade</label><input id="mdSensitivity" type="number" min="1" max="100" value="50">
-      <label>Área mínima (%)</label><input id="mdMinArea" type="number" min="1" max="50" value="3">
-      <label>Cooldown (s)</label><input id="mdCooldown" type="number" min="0" max="600" value="10">
-    </div>
-    <div class="row" style="margin-top:8px">
-      <button id="saveMdCfg">Salvar Detecção</button>
-      <button id="roiSet">Definir área (arraste no preview)</button>
-      <button id="roiClear">Limpar ROI</button>
-    </div>
-
-    <h4 style="margin-top:12px">YOLO (IA)</h4>
-    <div class="row">
-      <label><input id="yoloEnable" type="checkbox"> Ativar YOLO</label>
-      <label><input id="yoloGate" type="checkbox"> Requer YOLO p/ disparar</label>
-    </div>
-    <div class="grid">
-      <label>Conf. mínima</label><input id="yoloConf" type="number" min="10" max="95" value="50">
-      <label>NMS (%)</label><input id="yoloNms" type="number" min="10" max="95" value="45">
-      <label>Classes (CSV)</label><input id="yoloTargets" type="text" placeholder="person,car">
-      <label>Backend</label><select id="yoloBackend"><option value="ssd">ssd</option></select>
-    </div>
-    <input type="hidden" id="yoloPaths" >
-    <div class="row" style="margin-top:8px"><button id="saveYolo">Salvar YOLO</button></div>
-
-    <h3 style="margin-top:16px">Evolution API (WhatsApp)</h3>
-    <div class="row">
-      <label><input id="evoEnable" type="checkbox"> Enviar no Motion (Evolution)</label>
-    </div>
-    <label>Telefones (um por linha ou separados por vírgula)</label>
-    <textarea id="evoPhones" rows="4" placeholder="+5599999999999
-+5581999999999"></textarea>
-
-
-<input id="evoBase" type="hidden" style="width:100%">
-
-
-    <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap">
-      <button id="evoSave">Salvar Evolution</button>
-      <button id="evoTest">Enviar teste (foto atual)</button>
-      <small class="badge">Instância: {{evo_instance}}</small>
-    </div>
-
   </section>
 
-  <!-- ÁREA PRINCIPAL -->
   <section style="display:grid;gap:16px">
     <div class="card">
-      <header><strong>Preview</strong></header>
-      <div class="content viewer-wrap">
-        <img id="stream" src="/video_feed?overlay=1" alt="camera">
-        <canvas id="roiCanvas"></canvas>
-      </div>
+      <h3>Pré-visualizações</h3>
+      <div id="streams" class="grid"></div>
     </div>
-
-    <div class="panel">
-      <h3>Linha do tempo</h3>
-      <div class="row" style="gap:8px;flex-wrap:wrap;margin-bottom:6px">
-        <label>De</label><input type="date" id="dateFrom">
-        <label>Até</label><input type="date" id="dateTo">
-        <label>Tipo</label>
-        <select id="tlFilter">
-          <option value="">Todos</option>
-          <option value="photo">Foto</option>
-          <option value="clip">Clip</option>
-          <option value="motion">Motion</option>
-          <option value="yolo">YOLO</option>
-          <option value="timelapse">Timelapse</option>
-        </select>
-        <button id="applyTLFilters">Aplicar</button>
-        <button id="quickToday">Hoje</button>
-        <button id="clearTLFilters">Limpar</button>
-        <button id="refreshTL">Atualizar</button>
+    <div class="card">
+      <h3>Biblioteca</h3>
+      <div class="row">
+        <button onclick="loadMedia()">Atualizar</button>
       </div>
-
-      <div class="row" style="gap:8px;flex-wrap:wrap;margin-bottom:6px">
-        <button id="selAll">Selecionar tudo</button>
-        <button id="selInvert">Inverter</button>
-        <button id="selNone">Limpar seleção</button>
-        <button id="deleteSel">🗑️ Apagar selecionados</button>
-        <span id="selCount" class="badge">0 selecionado(s)</span>
-      </div>
-
-      <div id="timeline" class="timeline-grid"></div>
+      <div id="libWrap"><!-- blocos por câmera --></div>
     </div>
   </section>
 </main>
 
-<!-- LIGHTBOX -->
-<div id="lightbox" aria-hidden="true">
-  <div class="lb-inner">
-    <button class="lb-close" id="lbClose" aria-label="Fechar">✕</button>
-    <div class="lb-stage" id="lbStage">
-      <img id="lbImg" class="lb-img" draggable="false" alt="">
-      <video id="lbVid" class="lb-vid" controls playsinline></video>
-      <div class="lb-nav lb-prev" id="lbPrev" title="Anterior">❮</div>
-      <div class="lb-nav lb-next" id="lbNext" title="Próxima">❯</div>
-      <div class="lb-zoomtip">Scroll para zoom (imagem). Vídeo navega com ← →.</div>
-    </div>
-    <div class="lb-toolbar">
-      <button id="lbZoomOut">–</button>
-      <button id="lbReset">100%</button>
-      <button id="lbZoomIn">+</button>
-      <span class="lb-counter" id="lbCounter">0/0</span>
-      <a id="lbDownload" href="#" download>⬇️ Baixar</a>
-    </div>
-  </div>
-</div>
-
 <script>
-const $ = (s)=>document.querySelector(s);
-const statusEl = $('#status');
-function setStatus(t){ statusEl.textContent = t; if(t){ setTimeout(()=>statusEl.textContent='', 3500); } }
-
-/* --------- Dispositivo / Config --------- */
-async function loadDevices(){
-  const r = await fetch('/api/devices'); const j = await r.json();
-  const sel = $('#device'); sel.innerHTML='';
-  (j.devices||[]).forEach(d=>{ const o=document.createElement('option'); o.value=d; o.textContent=d; sel.appendChild(o); });
-  if (j.current) sel.value = j.current;
-  $('#width').value = j.width; $('#height').value = j.height; $('#fps').value = j.fps; $('#fourcc').value = j.fourcc || 'MJPG';
-
-  try{
-    const mcfg = await (await fetch('/api/motion/config')).json();
-    $('#mdEnable').checked = !!mcfg.enable; $('#mdAction').value = mcfg.action || 'photo';
-    $('#mdDuration').value = mcfg.duration || 10; $('#mdSensitivity').value = mcfg.sensitivity || 50;
-    $('#mdMinArea').value = mcfg.min_area || 3; $('#mdCooldown').value = mcfg.cooldown || 10;
-    $('#mdOverlay').checked = !!mcfg.overlays;
-  }catch(e){}
-
-  try{
-    const ycfg = await (await fetch('/api/motion/yolo/config')).json();
-    $('#yoloEnable').checked = !!ycfg.enable; $('#yoloGate').checked = !!ycfg.gate;
-    $('#yoloConf').value = Math.round((ycfg.conf||0.5)*100); $('#yoloNms').value = Math.round((ycfg.nms||0.45)*100);
-    $('#yoloTargets').value = (ycfg.targets||[]).join(','); $('#yoloBackend').value = ycfg.backend || 'darknet';
-  }catch(e){}
-
-  // Evolution
-  try{
-    const ecfg = await (await fetch('/api/evo/config')).json();
-    $('#evoEnable').checked = !!ecfg.enable;
-    $('#evoPhones').value = (ecfg.phones||[]).join('\\n');
-    const body = { enable: $('#evoEnable').checked, phones, public_base: publicBase };
-    const evoBaseEl = $('#evoBase');
-    const publicBase = evoBaseEl ? evoBaseEl.value.trim() : '';
-
-  }catch(e){}
+// Helpers de basepath/URL/fetch
+function _basepath(){
+  const m = document.querySelector('meta[name="x-basepath"]');
+  const b = (m && m.content) ? m.content : "";
+  return (b || "").replace(/\/+$/,''); // remove barra no fim
 }
-$('#refresh').onclick = loadDevices;
-
-$('#apply').onclick = async ()=>{
-  const body = { device: $('#device').value, width: +$('#width').value, height: +$('#height').value, fps: +$('#fps').value, fourcc: $('#fourcc').value };
-  setStatus('Abrindo câmera...');
-  const r = await fetch('/api/open',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j = await r.json();
-  if(j.ok){
-    const url = new URL('/video_feed', window.location.href);
-    url.searchParams.set('overlay', $('#mdOverlay').checked?'1':'0');
-    $('#stream').src = url.toString();
-    setStatus('Câmera aberta');
-  } else setStatus('Erro: '+j.error);
-};
-$('#listFormats').onclick = async ()=>{
-  const dev = $('#device').value;
-  const r = await fetch('/api/formats?device='+encodeURIComponent(dev));
-  $('#formats').textContent = await r.text();
-};
-$('#snapshot').onclick = async ()=>{
-  const r = await fetch('/snapshot',{method:'POST'}); const j = await r.json();
-  if(j.ok){ setStatus('OK: '+j.path); refreshTL(); } else setStatus('Erro: '+j.error);
-};
-
-/* --------- Controles --------- */
-$('#applyControls').onclick = async ()=>{
-  const body = { jpeg_quality:+$('#jpegq').value, brightness:+$('#brightness').value, contrast:+$('#contrast').value, exposure:+$('#exposure').value, auto_exposure:false };
-  const r = await fetch('/api/controls',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j = await r.json(); setStatus(j.ok?'Controles aplicados':('Aviso: '+j.error));
-};
-$('#autoExposure').onclick = async ()=>{
-  const r = await fetch('/api/controls',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auto_exposure:true})});
-  const j = await r.json(); setStatus(j.ok?'Auto exposição ligada':('Aviso: '+j.error));
-};
-
-/* --------- Rotação --------- */
-$('#rotate').oninput = async ()=>{
-  const deg = parseInt($('#rotate').value,10);
-  const r = await fetch('/api/rotate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({deg})});
-  if(!(await r.json()).ok) setStatus('Falha ao girar');
-};
-$('#rotLeft').onclick = ()=>{ $('#rotate').value = Math.max(-180, +$('#rotate').value-15); $('#rotate').dispatchEvent(new Event('input')); };
-$('#rotRight').onclick = ()=>{ $('#rotate').value = Math.min(180, +$('#rotate').value+15); $('#rotate').dispatchEvent(new Event('input')); };
-
-/* --------- Gravação --------- */
-$('#recStart').onclick = async ()=>{
-  const r = await fetch('/api/record/start',{method:'POST'}); const j=await r.json();
-  if(j.ok){ $('#recInfo').textContent=j.file; setStatus('Gravando...'); refreshTL(); } else setStatus('Erro: '+j.error);
-};
-$('#recStop').onclick = async ()=>{
-  const r = await fetch('/api/record/stop',{method:'POST'}); const j=await r.json();
-  if(j.ok){ setStatus('Vídeo salvo: '+j.file); $('#recInfo').textContent=''; refreshTL(); } else setStatus('Erro: '+j.error);
-};
-$('#photo').onclick = async ()=>{
-  const r = await fetch('/api/photo',{method:'POST'}); const j=await r.json();
-  if(j.ok){ setStatus('Foto: '+j.file); refreshTL(); } else setStatus('Erro: '+j.error);
-};
-
-/* --------- Timelapse (fotos soltas) --------- */
-$('#tlStart').onclick = async ()=>{
-  const interval = parseInt($('#tlInterval').value,10)||5;
-  const r = await fetch('/api/timelapse/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({interval})});
-  const j = await r.json(); if(j.ok){ setStatus('Timelapse iniciado'); $('#tlInfo').textContent = 'intervalo: '+interval+'s'; } else setStatus('Erro: '+j.error);
-};
-$('#tlStop').onclick = async ()=>{
-  const r = await fetch('/api/timelapse/stop',{method:'POST'}); const j=await r.json();
-  if(j.ok){ setStatus('Timelapse parado'); $('#tlInfo').textContent=''; refreshTL(); } else setStatus('Erro: '+j.error);
-};
-
-/* --------- Overlays toggle --------- */
-$('#mdOverlay').onchange = async ()=>{
-  const on = $('#mdOverlay').checked;
-  await fetch('/api/motion/overlay',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({show:on})});
-  const url = new URL($('#stream').src, window.location.href);
-  url.searchParams.set('overlay', on ? '1' : '0');
-  $('#stream').src = url.toString();
-};
-
-/* --------- ROI --------- */
-let roiMode=false, roiStart=null;
-const c = $('#roiCanvas');
-function resizeCanvas(){
-  const img = $('#stream'); if(!img) return;
-  c.width = img.clientWidth; c.height = img.clientHeight; c.style.left='0px'; c.style.top='0px';
+function url(p){
+  p = String(p||'');
+  if(/^https?:\/\//i.test(p)) return p;
+  p = p.replace(/^\/+/, ''); // remove barras iniciais
+  const b = _basepath();
+  return (b ? (b + '/') : '/') + p;
 }
-window.addEventListener('resize', resizeCanvas);
-setInterval(resizeCanvas, 1000);
-$('#roiSet').onclick = ()=>{ roiMode = true; $('#stream').style.cursor='crosshair'; setStatus('Modo ROI: arraste no preview'); };
-$('#roiClear').onclick = async ()=>{ await fetch('/api/motion/roi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})}); setStatus('ROI limpa'); };
-function imgRect(){ const r=$('#stream').getBoundingClientRect(); return {x:r.left+window.scrollX,y:r.top+window.scrollY,w:r.width,h:r.height}; }
-document.addEventListener('mousedown',(ev)=>{ if(!roiMode) return; const r=imgRect(); const x=ev.pageX-r.x, y=ev.pageY-r.y; if(x<0||y<0||x>r.w||y>r.h) return; roiStart={x,y}; resizeCanvas(); });
-document.addEventListener('mousemove',(ev)=>{ if(!roiMode||!roiStart) return; const r=imgRect(); const x=Math.min(r.w,Math.max(0,ev.pageX-r.x)), y=Math.min(r.h,Math.max(0,ev.pageY-r.y)); const ctx=c.getContext('2d'); ctx.clearRect(0,0,c.width,c.height); ctx.strokeStyle='lime'; ctx.lineWidth=2; ctx.strokeRect(Math.min(roiStart.x,x),Math.min(roiStart.y,y),Math.abs(x-roiStart.x),Math.abs(y-roiStart.y)); });
-document.addEventListener('mouseup', async (ev)=>{
-  if(!roiMode||!roiStart) return;
-  const r=imgRect(); const x=Math.min(r.w,Math.max(0,ev.pageX-r.x)), y=Math.min(r.h,Math.max(0,ev.pageY-r.y));
-  const nx=Math.min(roiStart.x,x)/r.w, ny=Math.min(roiStart.y,y)/r.h, nw=Math.abs(x-roiStart.x)/r.w, nh=Math.abs(y-roiStart.y)/r.h;
-  roiMode=false; roiStart=null; $('#stream').style.cursor='default'; c.getContext('2d').clearRect(0,0,c.width,c.height);
-  if(nw<0.02||nh<0.02){ setStatus('ROI muito pequena'); return; }
-  await fetch('/api/motion/roi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:nx,y:ny,w:nw,h:nh})});
-  setStatus('ROI definida');
+function jfetch(p, init){
+  return fetch(url(p), init);
+}
+
+window.addEventListener('error', (e)=>{
+  try { console.error('JS Error:', e.message, e.error); } catch(_) {}
+  const msg = 'Erro JS: ' + (e.message || 'desconhecido');
+  const el = document.querySelector('#status');
+  if (el) { el.textContent = ' ' + msg; setTimeout(()=>{ el.textContent=''; }, 5000); }
 });
 
-/* --------- Detecção + YOLO --------- */
-$('#saveMdCfg').onclick = async ()=>{
-  const body = { enable: $('#mdEnable').checked, action: $('#mdAction').value, duration:+$('#mdDuration').value, sensitivity:+$('#mdSensitivity').value, min_area:+$('#mdMinArea').value, cooldown:+$('#mdCooldown').value };
-  const r = await fetch('/api/motion/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j = await r.json(); setStatus(j.ok ? 'Detecção configurada' : ('Erro: '+j.error));
-};
-$('#saveYolo').onclick = async ()=>{
-  const envlines = ($('#yoloPaths').value||'').split('\\n').map(s=>s.trim()).filter(Boolean);
-  const env = {}; envlines.forEach(l=>{ const i=l.indexOf('='); if(i>0) env[l.slice(0,i).trim()]=l.slice(i+1).trim(); });
-  const body = { enable: $('#yoloEnable').checked, gate: $('#yoloGate').checked, conf: (+$('#yoloConf').value)/100, nms: (+$('#yoloNms').value)/100, targets: ($('#yoloTargets').value||'').split(',').map(s=>s.trim()).filter(Boolean), backend: $('#yoloBackend').value, paths: env };
-  const r = await fetch('/api/motion/yolo/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j = await r.json(); setStatus(j.ok ? 'YOLO configurado' : ('Erro: '+j.error));
-};
+const $ = s => document.querySelector(s);
+function setStatus(t){ $('#status').textContent = ' '+t; setTimeout(()=>$('#status').textContent='', 3000); }
 
-/* --------- Evolution (WhatsApp) --------- */
-$('#evoSave').onclick = async ()=>{
-  const phones = $('#evoPhones').value.split(/\\n|,|;|\\s+/).map(s=>s.trim()).filter(Boolean);
-  const body = { enable: $('#evoEnable').checked, phones, public_base: $('#evoBase').value.trim() };
-  const r = await fetch('/api/evo/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j = await r.json();
-  setStatus(j.ok ? 'Evolution salvo' : ('Erro: '+(j.error||'')));
-};
-$('#evoTest').onclick = async ()=>{
-  setStatus('Enviando teste...');
-  const r = await fetch('/api/evo/test',{method:'POST'});
-  const j = await r.json();
-  setStatus(j.ok ? ('Teste enviado: '+(j.sent||0)+' número(s)') : ('Erro: '+(j.error||'')));
-};
+// Helpers
+const sanitize = dev => dev.replaceAll('/','_');
+const selected = new Set();
 
-/* --------- Lightbox (imagem + vídeo) --------- */
-const LB = {
-  el: $('#lightbox'), img: $('#lbImg'), vid: $('#lbVid'), stage: $('#lbStage'),
-  btnClose: $('#lbClose'), btnPrev: $('#lbPrev'), btnNext: $('#lbNext'),
-  btnZoomIn: $('#lbZoomIn'), btnZoomOut: $('#lbZoomOut'), btnReset: $('#lbReset'),
-  aDownload: $('#lbDownload'), counter: $('#lbCounter'),
-  list: [], idx: 0, scale: 1, pos:{x:0,y:0}, dragging:false, dragStart:{x:0,y:0}, posStart:{x:0,y:0},
-  open(list, startIdx=0){ this.list=list||[]; this.idx=Math.max(0,Math.min(startIdx,this.list.length-1)); this.el.classList.add('show'); this.el.setAttribute('aria-hidden','false'); this.scale=1; this.pos={x:0,y:0}; this.render(); },
-  close(){ this.pauseVideo(); this.el.classList.remove('show'); this.el.setAttribute('aria-hidden','true'); this.img.src=''; this.vid.removeAttribute('src'); this.vid.load(); },
-  current(){ return this.list[this.idx]; },
-  render(){
-    if(!this.list.length) return;
-    const it=this.current();
-    this.counter.textContent=(this.idx+1)+' / '+this.list.length;
-    if(it.kind==='video'){
-      this.img.style.display='none';
-      this.vid.style.display='block';
-      this.vid.src = it.src;
-      this.aDownload.href = it.src;
-      this.resetView(true);
-      this.vid.play().catch(()=>{});
-    } else {
-      this.pauseVideo();
-      this.vid.style.display='none';
-      this.img.style.display='block';
-      this.img.src = it.src;
-      this.aDownload.href = it.src;
-      this.applyTransform();
-    }
-  },
-  pauseVideo(){ try{ this.vid.pause(); }catch(e){} },
-  next(){ if(!this.list.length) return; this.pauseVideo(); this.idx=(this.idx+1)%this.list.length; this.resetView(true); this.render(); },
-  prev(){ if(!this.list.length) return; this.pauseVideo(); this.idx=(this.idx-1+this.list.length)%this.list.length; this.resetView(true); this.render(); },
-  zoom(delta, fine=false){ const step=fine?0.05:0.15; const ns=Math.max(0.1,Math.min(6,this.scale+(delta>0?step:-step))); this.scale=ns; this.applyTransform(); },
-  zoomTo(v){ this.scale=Math.max(0.1,Math.min(6,v)); this.applyTransform(); },
-  resetView(skipImage=false){ this.scale=1; this.pos={x:0,y:0}; if(!skipImage) this.applyTransform(); },
-  applyTransform(){ this.img.style.transform=`translate(${this.pos.x}px, ${this.pos.y}px) scale(${this.scale})`; },
-};
-$('#lbClose').onclick = ()=>LB.close();
-$('#lbNext').onclick = ()=>LB.next();
-$('#lbPrev').onclick = ()=>LB.prev();
-$('#lbZoomIn').onclick = ()=>LB.zoom(+1);
-$('#lbZoomOut').onclick = ()=>LB.zoom(-1);
-$('#lbReset').onclick = ()=>LB.resetView();
-document.addEventListener('keydown', (e)=>{ if(!LB.el.classList.contains('show')) return; if(e.key==='Escape') LB.close(); if(e.key==='ArrowRight') LB.next(); if(e.key==='ArrowLeft') LB.prev(); if(e.key==='+'||e.key==='=') LB.zoom(+1,e.ctrlKey); if(e.key==='-') LB.zoom(-1,e.ctrlKey); if(e.key==='0') LB.resetView(); });
-$('#lbStage').addEventListener('wheel',(e)=>{ if(!LB.el.classList.contains('show')) return; const it = LB.current(); if(!it || it.kind==='video') return; e.preventDefault(); LB.zoom(e.deltaY>0?-1:+1,e.ctrlKey); },{passive:false});
-LB.img.addEventListener('mousedown',(e)=>{ if(LB.scale<=1) return; LB.dragging=true; LB.img.style.cursor='grabbing'; LB.dragStart={x:e.clientX,y:e.clientY}; LB.posStart={x:LB.pos.x,y:LB.pos.y}; });
-window.addEventListener('mousemove',(e)=>{ if(!LB.dragging) return; const dx=e.clientX-LB.dragStart.x, dy=e.clientY-LB.dragStart.y; LB.pos={x:LB.posStart.x+dx,y:LB.posStart.y+dy}; LB.applyTransform(); });
-window.addEventListener('mouseup',()=>{ LB.dragging=false; LB.img.style.cursor='grab'; });
-
-
-  (function () {
-    const overlay = document.getElementById('lightbox');
-    const inner   = document.querySelector('#lightbox .lb-inner');
-    overlay.addEventListener('click', (e) => {
-      // fecha só se o clique foi no fundo (fora da .lb-inner)
-      if (!inner.contains(e.target)) {
-        LB.close();
-      }
+async function persistSelected(){
+  const arr = [...selected];
+  // backup local (segue funcionando offline/sem backend)
+  localStorage.setItem('selectedDevs', JSON.stringify(arr));
+  try{
+    await jfetch('api/config', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ ui: { selected_devs: arr } })
     });
-  })();
+  }catch(e){ /* silencioso */ }
+}
 
-  // Garante que o botão X fecha (redundante, mas seguro)
-  document.getElementById('lbClose').onclick = ()=>LB.close();
-  
+function applySelectedFromConfig(){
+  const fromServer = GLOBAL_CFG?.ui?.selected_devs;
+  const fromLocal  = JSON.parse(localStorage.getItem('selectedDevs') || '[]');
+  const src = Array.isArray(fromServer) ? fromServer : fromLocal;
+  selected.clear();
+  src.forEach(d => selected.add(d));
+}
 
-/* --------- Timeline (grade com filtros + seleção + delete) --------- */
-let selectedIds = new Set();
-let currentItems = []; // itens visíveis (para select all)
-function updateSelCount(){ $('#selCount').textContent = selectedIds.size + ' selecionado(s)'; }
+let AUDIO_OPTIONS = [];  // /api/audio
+let GLOBAL_CFG = null;   // /api/config
 
-function buildTLQuery(){
-  const type = $('#tlFilter').value;
+// Biblioteca seleção
+const SEL = new Set();  // "photos|name.jpg" ou "videos|name.mp4"
+function selKey(kind, name){ return kind+'|'+name; }
+function updateSelCount(){ $('#selCount').textContent = SEL.size + ' selecionado(s)'; }
+$('#selAll').onclick = ()=>{ document.querySelectorAll('[data-kind][data-name]').forEach(e=>{ e.checked=true; SEL.add(selKey(e.dataset.kind, e.dataset.name)); }); updateSelCount(); };
+$('#selNone').onclick = ()=>{ document.querySelectorAll('[data-kind][data-name]').forEach(e=>{ e.checked=false; }); SEL.clear(); updateSelCount(); };
+$('#delSel').onclick = async ()=>{
+  if(SEL.size===0){ setStatus('Nada selecionado'); return; }
+  if(!confirm('Apagar definitivamente '+SEL.size+' item(ns)?')) return;
+  const items = [...SEL].map(k=>{ const [kind,name]=k.split('|'); return {kind,name}; });
+  const r = await jfetch('api/media/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({items})});
+  const j = await r.json();
+  if(j.ok){ setStatus('Apagados: '+j.deleted); SEL.clear(); updateSelCount(); loadMedia(); }
+  else setStatus('Erro: '+(j.error||''));
+};
+
+function micOptionsHtml(selected){
+  const opts = (AUDIO_OPTIONS.length? AUDIO_OPTIONS : ["default","none"]);
+  return opts.map(v=>{
+    const sel = (v===selected) ? ' selected' : '';
+    return `<option value="${v}"${sel}>${v}</option>`;
+  }).join("");
+}
+function applyPreviewSize(sz){
+  let px = 320;
+  if(sz==='small') px = 260;
+  if(sz==='large') px = 480;
+  if(sz==='xlarge') px = 720;
+  if(sz==='xxlarge') px = 1100; // “Muito MUITO grande”
+  document.documentElement.style.setProperty('--tile', px+'px');
+}
+function libMode(){ return $('#libMode').value === 'list' ? 'list' : 'grid'; }
+
+// Dispositivos
+async function listDevices(){
+  const j = await (await jfetch('api/devices',{cache:'no-store'})).json();
+  const wrap = $('#devs'); wrap.innerHTML='';
+  const devs = j.devices || [];
+  if(devs.length === 0){
+    wrap.innerHTML = '<small>Nenhuma câmera.</small>';
+    return;
+  }
+  devs.forEach(dev=>{
+    const row = document.createElement('label');
+    row.className = 'row'; row.style.gap = '6px';
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = selected.has(dev);
+    cb.onchange = (e)=>{
+      if(e.target.checked){ selected.add(dev); addStream(dev); }
+      else{ selected.delete(dev); removeStream(dev); }
+      persistSelected();
+    };
+
+    const span = document.createElement('span');
+    span.textContent = dev;
+    row.appendChild(cb); row.appendChild(span);
+    $('#devs').appendChild(row);
+    if(cb.checked) addStream(dev);
+  });
+}
+$('#refresh').onclick = listDevices;
+
+// Pré-visualizações
+function addStream(dev){
+  const id = 'stream-'+sanitize(dev);
+  if(document.getElementById(id)) return;
+
+  const ccfg   = (GLOBAL_CFG && GLOBAL_CFG.cameras && GLOBAL_CFG.cameras[dev]) || {};
+  const micSel = ccfg.mic || 'default';
+  const tlCfg  = (ccfg.timelapse || {});
+  const tlOn   = !!tlCfg.enable;
+  const tlInt  = tlCfg.interval || 5;
+  const mdCfg  = (ccfg.motion || {});
+  const mdOn   = !!mdCfg.enable;
+  const mdSens = mdCfg.sensitivity || 50;
+  const mdAct  = mdCfg.action || 'photo';
+  const mdOv   = (mdCfg.overlay!==false);
+  const mdCd   = mdCfg.cooldown || 10;
+  const mdLen  = mdCfg.clip_len || 30;
+
+  const box = document.createElement('div');
+  box.className = 'stream';
+  box.id = id;
+
+  const h = document.createElement('header');
+  h.innerHTML = `<span>${dev}</span>
+    <span class="row">
+      <button onclick="photo('${dev}')">📷 Foto</button>
+      <button onclick="recStart('${dev}')">⏺️ Gravar</button>
+      <button onclick="recStop('${dev}')">⏹️ Parar</button>
+    </span>`;
+
+  const controls = document.createElement('div');
+  controls.className = 'row';
+  controls.style.padding = '6px 8px';
+  controls.innerHTML = `
+    <label>Mic</label>
+    <select class="micSel">${micOptionsHtml(micSel)}</select>
+
+    <label><input type="checkbox" class="tlToggle"${tlOn?' checked':''}> Timelapse</label>
+    <input type="number" class="tlInt" min="1" value="${tlInt}" style="width:90px">
+
+    <label><input type="checkbox" class="mdToggle"${mdOn?' checked':''}> Movimento</label>
+    <label>Sens</label>
+    <input type="range" class="mdSens" min="1" max="100" value="${mdSens}" style="width:140px">
+
+    <label>Ação</label>
+    <select class="mdAction">
+      <option value="photo"${mdAct==='photo'?' selected':''}>Foto</option>
+      <option value="video"${mdAct==='video'?' selected':''}>Vídeo</option>
+    </select>
+
+    <label>Cooldown (s)</label>
+    <input type="number" class="mdCooldown" min="0" value="${mdCd}" style="width:80px">
+
+    <label>Clip (s)</label>
+    <input type="number" class="mdClip" min="5" value="${mdLen}" style="width:80px">
+
+    <label><input type="checkbox" class="mdOverlay"${mdOv?' checked':''}> Overlays</label>
+
+    <button class="applyCam">Aplicar</button>
+  `;
+
+['.micSel','.tlToggle','.tlInt','.mdToggle','.mdSens','.mdAction','.mdCooldown','.mdClip','.mdOverlay']
+.forEach(sel=>{
+  const el = controls.querySelector(sel);
+  if(el){
+    el.addEventListener('change', ()=> autosaveCam(dev, controls));
+    el.addEventListener('input',  ()=> autosaveCam(dev, controls)); // sliders/number
+  }
+});
+
+
+  const img = document.createElement('img');
+  img.src = url('video_feed?dev='+encodeURIComponent(dev));
+
+  box.appendChild(h);
+  box.appendChild(controls);
+  box.appendChild(img);
+  $('#streams').appendChild(box);
+
+
+  controls.querySelector('.applyCam').onclick = async ()=>{
+    try{
+      const micEl = controls.querySelector('.micSel');
+      const mic = micEl ? micEl.value.trim() : (GLOBAL_CFG?.cameras?.[dev]?.mic || 'default');
+      const tlE = !!controls.querySelector('.tlToggle')?.checked;
+      const tlI = parseInt(controls.querySelector('.tlInt')?.value,10)||5;
+      const mdE = !!controls.querySelector('.mdToggle')?.checked;
+      const mdS = parseInt(controls.querySelector('.mdSens')?.value,10)||50;
+      const mdA = controls.querySelector('.mdAction')?.value || 'photo';
+      const mdO = !!controls.querySelector('.mdOverlay')?.checked;
+      const mdC = Math.max(0, parseInt(controls.querySelector('.mdCooldown')?.value,10)||0);
+      const mdL = Math.max(5, parseInt(controls.querySelector('.mdClip')?.value,10)||30);
+
+      console.log('applyCam()', {dev, mic, tlE, tlI, mdE, mdS, mdA, mdO, mdC, mdL});
+
+      const r = await jfetch('api/config', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          dev, mic,
+          timelapse:{enable: tlE, interval: tlI},
+          motion:{enable: mdE, sensitivity: mdS, action: mdA, overlay: mdO, cooldown: mdC, clip_len: mdL}
+        })
+      });
+      const j = await r.json();
+      setStatus(j.ok? 'config salva' : ('Erro ao salvar: '+(j.error||'')));
+    }catch(err){
+      console.error('applyCam error', err);
+      setStatus('Erro JS ao aplicar: '+err);
+    }
+  };
+
+}
+
+function gatherCamConfig(dev, controls){
+  const mic = controls.querySelector('.micSel')?.value?.trim() || (GLOBAL_CFG?.cameras?.[dev]?.mic || 'default');
+  const tlE = !!controls.querySelector('.tlToggle')?.checked;
+  const tlI = parseInt(controls.querySelector('.tlInt')?.value,10)||5;
+  const mdE = !!controls.querySelector('.mdToggle')?.checked;
+  const mdS = parseInt(controls.querySelector('.mdSens')?.value,10)||50;
+  const mdA = controls.querySelector('.mdAction')?.value || 'photo';
+  const mdO = !!controls.querySelector('.mdOverlay')?.checked;
+  const mdC = Math.max(0, parseInt(controls.querySelector('.mdCooldown')?.value,10)||0);
+  const mdL = Math.max(5, parseInt(controls.querySelector('.mdClip')?.value,10)||30);
+  return {dev, mic, tlE, tlI, mdE, mdS, mdA, mdO, mdC, mdL};
+}
+
+let saveTimer = null;
+async function autosaveCam(dev, controls){
+  const p = gatherCamConfig(dev, controls);
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async ()=>{
+    try{
+      const r = await jfetch('api/config', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          dev: p.dev, mic: p.mic,
+          timelapse:{enable: p.tlE, interval: p.tlI},
+          motion:{enable: p.mdE, sensitivity: p.mdS, action: p.mdA, overlay: p.mdO, cooldown: p.mdC, clip_len: p.mdL}
+        })
+      });
+      const j = await r.json();
+      if(!j.ok) setStatus('Erro ao salvar: '+(j.error||''));
+    }catch(e){
+      console.error('autosaveCam', e);
+    }
+  }, 300); // debounce
+}
+
+
+
+function removeStream(dev){
+  const id = 'stream-'+sanitize(dev);
+  const el = document.getElementById(id);
+  if(el) el.remove();
+}
+
+// Ações
+async function photo(dev){
+  try{
+    const r = await jfetch('api/photo', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({dev})
+    });
+    const j = await r.json();
+    setStatus(j.ok?('Foto: '+j.file):('Erro: '+j.error));
+    loadMedia();
+  }catch(err){
+    console.error('photo error', err);
+    setStatus('Erro JS em Foto: '+err);
+  }
+}
+
+async function recStart(dev){
+  try{
+    // feedback imediato para ver que o clique funcionou
+    setStatus('Iniciando gravação…');
+    const card = document.getElementById('stream-'+sanitize(dev));
+    const micEl = card ? card.querySelector('.micSel') : null;
+    const mic = (micEl && typeof micEl.value === 'string')
+      ? micEl.value.trim()
+      : ((GLOBAL_CFG && GLOBAL_CFG.cameras && GLOBAL_CFG.cameras[dev] && GLOBAL_CFG.cameras[dev].mic) || 'default');
+
+    console.log('recStart()', { dev, mic });
+
+    const r = await jfetch('api/record/start', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({dev, mic})
+    });
+    const j = await r.json();
+    setStatus(j.ok?('Gravando: '+j.file):('Erro: '+j.error));
+    loadMedia();
+  }catch(err){
+    console.error('recStart error', err);
+    setStatus('Erro JS em Gravar: '+err);
+  }
+}
+
+async function recStop(dev){
+  try{
+    console.log('recStop()', { dev });
+    const r = await jfetch('api/record/stop', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({dev})
+    });
+    const j = await r.json();
+    setStatus(j.ok?('Salvo: '+j.file):('Erro: '+j.error));
+    loadMedia();
+  }catch(err){
+    console.error('recStop error', err);
+    setStatus('Erro JS em Parar: '+err);
+  }
+}
+
+
+// Biblioteca
+function buildMediaQuery(){
   const df = $('#dateFrom').value;
   const dt = $('#dateTo').value;
-  const params = new URLSearchParams();
-  params.set('limit','500');
-  if(type) params.set('type', type);
-  if(df) params.set('start', df);
-  if(dt) params.set('end', dt);
-  return '/api/timeline?' + params.toString();
+  const p = new URLSearchParams();
+  if(df) p.set('start', df);
+  if(dt) p.set('end', dt);
+  return 'api/media?'+p.toString();
 }
+async function loadMedia(){
+  const j = await (await jfetch(buildMediaQuery(),{cache:'no-store'})).json();
+  const wrap = $('#libWrap'); wrap.innerHTML = '';
+  const mode = libMode();
 
-function toMediaUrl(ev){
-  if(ev.type === 'clip' && ev.link && ev.link.startsWith('/viewer/video/')){
-    return ev.link.replace('/viewer/video/','/media/videos/');
+  const cams = j.cameras || [];
+  if(cams.length===0){
+    wrap.innerHTML = '<small class="muted">Sem arquivos.</small>';
+    return;
   }
-  return ev.link || '#';
+
+  cams.forEach(cam=>{
+    const blk = document.createElement('div');
+    blk.className = 'cam-block';
+
+    const h = document.createElement('h4');
+    h.textContent = 'Câmera: '+cam;
+    blk.appendChild(h);
+
+    function section(title, arr, kind){
+      if(!arr || !arr.length) return;
+      const sec = document.createElement('div');
+      sec.className = 'cam-section';
+      sec.innerHTML = '<div><strong>'+title+'</strong></div>';
+      const list = document.createElement('div');
+      list.className = 'cam-items '+mode;
+      arr.forEach(it=>{
+        const d = document.createElement('div'); d.className='thumb';
+        const ck = document.createElement('input'); ck.type='checkbox'; ck.className='selbox';
+        ck.dataset.kind=kind; ck.dataset.name=it.name;
+        ck.onchange = ()=>{ if(ck.checked) SEL.add(selKey(kind, it.name)); else SEL.delete(selKey(kind, it.name)); updateSelCount(); };
+        if(mode==='grid'){ const wrapSel = document.createElement('label'); wrapSel.className='selbox'; wrapSel.appendChild(ck); d.appendChild(wrapSel); }
+        else { d.prepend(ck); }
+        d.innerHTML += `<img src="${url(it.thumb)}"><div>
+          <div>${it.name}</div>
+          <div><a href="${url(it.url)}" target="_blank">abrir</a></div></div>`;
+        list.appendChild(d);
+      });
+      sec.appendChild(list);
+      blk.appendChild(sec);
+    }
+
+    const bc = j.by_camera[cam] || {};
+    section('Vídeos (manuais)',  bc.videos_user,   'videos');
+    section('Vídeos (movimento)',bc.videos_motion, 'videos');
+    section('Fotos (manuais)',   bc.photos_user,   'photos');
+    section('Fotos (movimento)', bc.photos_motion, 'photos');
+    section('Timelapse',         bc.timelapse,     'photos');
+
+    wrap.appendChild(blk);
+  });
 }
 
-async function refreshTL(){
-  const r = await fetch(buildTLQuery());
-  const j = await r.json();
-  const t = $('#timeline'); t.innerHTML='';
-  const evs = (j.items||[]);
-  currentItems = evs
-    .filter(ev => (ev.thumb || ev.preview))
-    .map(ev=>{
-      const name = ev.title || ev.type;
-      const thumb = ev.thumb || ev.preview || '';
-      let kind = 'photo';
-      if(ev.type === 'clip') kind = 'video';
-      if(ev.type === 'photo' || ev.type === 'timelapse') kind = 'photo';
-      const media = toMediaUrl(ev);
-      const viewer = (ev.type==='clip' && ev.link) ? ev.link : (ev.link || '#');
-      return { id: ev.id, type: ev.type, name, thumb, kind, media, viewer };
-    });
+// UI global
+$('#applyUi').onclick = async ()=>{
+  const sz = $('#previewSize').value;
+  applyPreviewSize(sz);
+  await jfetch('api/config', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ui:{preview_size: sz}})});
+  setStatus('layout atualizado');
+};
+$('#applyLib').onclick = async ()=>{
+  const mode = $('#libMode').value;
+  await jfetch('api/config', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ui:{library_view: mode}})});
+  loadMedia();
+};
 
-  const lbList = currentItems.map(it=>({src: it.media, name: it.name, kind: it.kind}));
-
-  currentItems.forEach((it, idx)=>{
-    const div = document.createElement('div'); div.className='thumb';
-    const img = document.createElement('img'); img.src = it.thumb; img.alt = it.name;
-
-    const sel = document.createElement('label'); sel.className='selbox';
-    const cb = document.createElement('input'); cb.type='checkbox'; cb.checked = selectedIds.has(it.id||'');
-    cb.onchange = ()=>{
-      if(cb.checked){ selectedIds.add(it.id); div.classList.add('selected'); }
-      else{ selectedIds.delete(it.id); div.classList.remove('selected'); }
-      updateSelCount();
-    };
-    sel.appendChild(cb);
-    div.appendChild(sel);
-    if(cb.checked) div.classList.add('selected');
-
-    img.onclick = ()=>{ LB.open(lbList, idx); };
-
-    const meta = document.createElement('div'); meta.className='meta';
-    meta.innerHTML = `<span>${it.type}</span><span>${it.name.replace(/^(photo-|rec-|tl-)/,'')}</span>`;
-    div.appendChild(img); div.appendChild(meta); t.appendChild(div);
-  });
-
-  updateSelCount();
+// Init
+function applyLibModeToSelect(){
+  const mode = GLOBAL_CFG?.ui?.library_view || 'grid';
+  $('#libMode').value = mode;
 }
-
-$('#selAll').onclick = ()=>{
-  selectedIds = new Set(currentItems.map(it=>it.id));
-  document.querySelectorAll('#timeline .thumb').forEach(th=>{
-    th.classList.add('selected');
-    const cb = th.querySelector('input[type=checkbox]'); if(cb) cb.checked = true;
-  });
-  updateSelCount();
-};
-$('#selNone').onclick = ()=>{
-  selectedIds.clear();
-  document.querySelectorAll('#timeline .thumb').forEach(th=>{
-    th.classList.remove('selected');
-    const cb = th.querySelector('input[type=checkbox]'); if(cb) cb.checked = false;
-  });
-  updateSelCount();
-};
-$('#selInvert').onclick = ()=>{
-  const newSel = new Set();
-  document.querySelectorAll('#timeline .thumb').forEach((th, i)=>{
-    const cb = th.querySelector('input[type=checkbox]');
-    const id = currentItems[i]?.id;
-    if(!cb || !id) return;
-    const checked = !cb.checked;
-    cb.checked = checked;
-    th.classList.toggle('selected', checked);
-    if(checked) newSel.add(id);
-  });
-  selectedIds = newSel;
-  updateSelCount();
-};
-
-$('#deleteSel').onclick = async ()=>{
-  const ids = Array.from(selectedIds);
-  if(ids.length === 0){ setStatus('Nada selecionado'); return; }
-  if(!confirm('Apagar definitivamente ' + ids.length + ' item(ns)?')) return;
-  const r = await fetch('/api/timeline/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ids, delete_files:true})});
-  const j = await r.json();
-  if(j.ok){
-    setStatus('Itens apagados: '+(j.deleted||[]).length);
-    selectedIds.clear();
-    await refreshTL();
-  } else {
-    setStatus('Erro ao apagar: '+(j.error||''));
+async function loadAudioOptions(){
+  try{
+    const j = await (await jfetch('api/audio',{cache:'no-store'})).json();
+    AUDIO_OPTIONS = [...(j.pulse||[]), ...(j.alsa||[]), 'none'];
+  }catch(e){
+    AUDIO_OPTIONS = ['default','none'];
   }
-};
+}
+async function loadConfig(){
+  try{
+    GLOBAL_CFG = await (await jfetch('api/config',{cache:'no-store'})).json();
+    const sz = GLOBAL_CFG?.ui?.preview_size || 'medium';
+    $('#previewSize').value = sz;
+    applyPreviewSize(sz);
+    applySelectedFromConfig();
+    applyLibModeToSelect();
+  }catch(e){}
+}
+async function init(){
+  await loadAudioOptions();
+  await loadConfig();
+  await listDevices();
 
-$('#applyTLFilters').onclick = refreshTL;
-$('#refreshTL').onclick = refreshTL;
-$('#clearTLFilters').onclick = ()=>{ $('#tlFilter').value=''; $('#dateFrom').value=''; $('#dateTo').value=''; refreshTL(); };
-$('#quickToday').onclick = ()=>{
-  const today = new Date(); const yyyy = today.getFullYear(); const mm = String(today.getMonth()+1).padStart(2,'0'); const dd = String(today.getDate()).padStart(2,'0');
-  const v = `${yyyy}-${mm}-${dd}`; $('#dateFrom').value = v; $('#dateTo').value = v; refreshTL();
-};
-
-// refresh periódico
-setInterval(refreshTL, 10000);
-
-/* --------- Init --------- */
-(async function init(){ await loadDevices(); await refreshTL(); resizeCanvas(); })();
+  loadMedia();
+}
+init();
 </script>
-</body>
-</html>
+
+</body></html>
 """
 
-# ----------------- Evolution config & envio -----------------
-_evo_lock = threading.Lock()
-_evo_cfg = {
-    "enable": False,
-    "phones": [],
-    "public_base": EVO_PUBLIC_BASE.strip()
-}
-
-def _evo_load():
-    global _evo_cfg
+# ----------------- Utils de mídia -----------------
+def make_thumb_image(src, max_w=240):
     try:
-        if os.path.isfile(EVO_CFG_FILE):
-            with open(EVO_CFG_FILE, "r", encoding="utf-8") as f:
-                dat = json.load(f)
-            if isinstance(dat, dict):
-                with _evo_lock:
-                    _evo_cfg.update(dat)
-    except Exception:
-        pass
-
-def _evo_save():
-    with _evo_lock:
-        try:
-            with open(EVO_CFG_FILE, "w", encoding="utf-8") as f:
-                json.dump(_evo_cfg, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-def evo_get_cfg():
-    with _evo_lock:
-        return {
-            "enable": bool(_evo_cfg.get("enable", False)),
-            "phones": list(_evo_cfg.get("phones", [])),
-            "public_base": (_evo_cfg.get("public_base") or "").strip()
-        }
-
-def _normalize_phone(s: str) -> str:
-    s = s.strip()
-    if not s: return ""
-    if s.startswith("+"):
-        digits = "+" + re.sub(r"\D", "", s)
-    else:
-        digits = re.sub(r"\D", "", s)
-    return digits
-
-def _http_post_json(url, payload, headers):
-    try:
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, method="POST")
-        for k,v in (headers or {}).items():
-            req.add_header(k, v)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = resp.read().decode("utf-8", "ignore")
-            return resp.status, body
-    except urllib.error.HTTPError as e:
-        try:
-            body = e.read().decode("utf-8","ignore")
-        except Exception:
-            body = str(e)
-        return e.code, body
-    except Exception as e:
-        return 0, str(e)
-
-def _guess_base_url_for_background():
-    base = evo_get_cfg().get("public_base") or EVO_PUBLIC_BASE
-    if base:
-        return base.rstrip("/")
-    # fallback local (pode não ser acessível pela Evolution)
-    port = int(os.environ.get("PORT", "5000"))
-    return f"http://127.0.0.1:{port}"
-
-import base64
-
-def evo_send_media_base64(number: str, photo_path: str, caption: str = "") -> bool:
-    """Usa a Evolution API v2 com envio via Base64 (sem URL pública)."""
-    headers = {
-        "Content-Type": "application/json",
-        "apikey": EVO_API_KEY
-    }
-    try:
-        with open(photo_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("ascii")
-    except Exception as e:
-        print("Erro ao ler imagem:", e)
-        return False
-
-    payload = {
-        "number": number,
-        "mediatype": "image",
-        "mimetype": "image/jpeg",
-        "caption": caption,
-        "media": b64,
-        "fileName": os.path.basename(photo_path),
-        "delay": 0
-    }
-
-    base = EVO_API_URL.rstrip("/")
-    url = f"{base}/message/sendMedia/{EVO_API_INSTANCE}"
-    code, body = _http_post_json(url, payload, headers)
-    if code in (200, 201, 202):
-        print(f"[Evolution] Enviado com sucesso para {number}")
-        return True
-    else:
-        print(f"[Evolution] Falha {code}: {body[:200]}")
-        return False
-
-
-def evo_send_photo_to_many(photo_path: str, caption: str = "") -> int:
-    """Envia a foto (em Base64) para todos os números configurados."""
-    cfg = evo_get_cfg()
-    if not cfg.get("enable"):
-        return 0
-    phones = [_normalize_phone(p) for p in cfg.get("phones", []) if p.strip()]
-    if not phones:
-        return 0
-
-    sent = 0
-    for num in phones:
-        if evo_send_media_base64(num, photo_path, caption or f"Detecção de movimento {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"):
-            sent += 1
-    return sent
-
-
-def evo_async_send(photo_path: str, caption: str = ""):
-    def _run():
-        try:
-            evo_send_photo_to_many(photo_path, caption)
-        except Exception:
-            pass
-    threading.Thread(target=_run, daemon=True).start()
-
-# ----------------- Util: timeline -----------------
-_timeline_lock = threading.Lock()
-
-def _now_iso():
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-
-def _ts_local_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-def event_id(ev: dict) -> str:
-    base = f"{ev.get('ts','')}|{ev.get('type','')}|{ev.get('title','')}|{ev.get('link','')}"
-    return hashlib.sha1(base.encode("utf-8", "ignore")).hexdigest()[:12]
-
-def timeline_add(event_type, title="", link="", thumb="", preview="", extra=None):
-    ev = {
-        "ts": _now_iso(),
-        "ts_local": _ts_local_str(),
-        "type": event_type,
-        "title": title,
-        "link": link,
-        "thumb": thumb,
-        "preview": preview,
-        "extra": extra or {}
-    }
-    with _timeline_lock:
-        with open(EVENTS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-
-def _parse_date_yyyy_mm_dd(s):
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
+        img = cv2.imread(src)
+        if img is None: return None
+        h, w = img.shape[:2]
+        if w > max_w:
+            s = max_w / float(w)
+            img = cv2.resize(img, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
+        name = os.path.basename(src)
+        tname = name if name.lower().endswith(".jpg") else os.path.splitext(name)[0]+".jpg"
+        tpath = os.path.join(MEDIA["thumbs"], tname)
+        cv2.imwrite(tpath, img)
+        return tpath
     except Exception:
         return None
 
-def timeline_list(limit=100, type_filter=None, start_date=None, end_date=None):
-    items = []
-    if not os.path.isfile(EVENTS_FILE):
-        return []
-    with _timeline_lock:
-        with open(EVENTS_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    ev = json.loads(line)
-                except Exception:
-                    continue
-                if type_filter and ev.get("type") != type_filter:
-                    continue
-                if start_date or end_date:
-                    ts = ev.get("ts") or ""
-                    try:
-                        d_utc = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").date()
-                    except Exception:
-                        try:
-                            d_utc = datetime.strptime(ev.get("ts_local","")[:10], "%Y-%m-%d").date()
-                        except Exception:
-                            d_utc = None
-                    if d_utc:
-                        if start_date and d_utc < start_date: continue
-                        if end_date and d_utc > end_date: continue
-                ev["id"] = ev.get("id") or event_id(ev)
-                items.append(ev)
-    items.sort(key=lambda x: x.get("ts",""), reverse=True)
-    return items[:limit]
+def make_thumb_from_frame(frame, video_path):
+    if frame is None: return
+    name = os.path.splitext(os.path.basename(video_path))[0] + ".jpg"
+    tpath = os.path.join(MEDIA["thumbs"], name)
+    h, w = frame.shape[:2]
+    if w > 240:
+        s = 240/float(w)
+        frame = cv2.resize(frame, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
+    cv2.imwrite(tpath, frame)
 
-# ----------------- Câmera -----------------
-class Camera:
-    def __init__(self, device, width, height, fps, fourcc, jpeg_quality):
+# ----------------- Scanner de câmeras -----------------
+def scan_linux_cams():
+    devs = []
+    for p in sorted(glob.glob("/dev/video*")):
+        try:
+            st = os.stat(p)
+            if not stat.S_ISCHR(st.st_mode):
+                continue
+        except Exception:
+            continue
+        devs.append(p)
+    return devs
+
+# ----------------- Motion detector (boxes) -----------------
+class MotionDetector:
+    def __init__(self):
+        self.bg = None
+        self.last_boxes = []
         self.lock = threading.Lock()
-        self.frame = None
-        self.running = False
-        self.jpeg_quality = int(jpeg_quality)
-        self.rotate_deg = 0
-        self.hw_rotate_hook = None
-        self.open(device, width, height, fps, fourcc)
 
-    def open(self, device, width, height, fps, fourcc):
-        self.stop()
-        dev = int(device) if str(device).isdigit() else device
-        cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
-        if fourcc:
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  int(width))
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
-        cap.set(cv2.CAP_PROP_FPS, float(fps))
-        if not cap.isOpened():
-            raise RuntimeError(f"Não abriu {device}")
-        self.cap = cap
-        self.period = 1.0 / max(float(fps), 1.0)
-        self.running = True
-        self.thread = threading.Thread(target=self._reader, daemon=True)
-        self.thread.start()
-
-    def _reader(self):
-        next_time = time.time()
-        while self.running:
-            ok, img = self.cap.read()
-            if ok:
-                with self.lock:
-                    self.frame = img
-            next_time += self.period
-            delay = next_time - time.time()
-            if delay > 0:
-                time.sleep(delay)
+    def process(self, frame, sensitivity=50, min_area_pct=3):
+        try:
+            h, w = frame.shape[:2]
+            new_w = 320 if w > 320 else w
+            if w > new_w:
+                scale = new_w / float(w)
+                small = cv2.resize(frame, (new_w, int(h*scale)), interpolation=cv2.INTER_AREA)
             else:
-                next_time = time.time()
+                small = frame
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (9,9), 0)
 
-    def stop(self):
-        if getattr(self, "running", False):
-            self.running = False
-            try: self.thread.join(timeout=1)
-            except: pass
-        if getattr(self, "cap", None) is not None:
-            self.cap.release()
-            self.cap = None
+            if self.bg is None:
+                self.bg = gray.astype("float32")
+                with self.lock:
+                    self.last_boxes = []
+                return []
 
-    def _apply_rotation(self, img):
-        deg = self.rotate_deg % 360
-        if deg == 0:
-            return img
-        h, w = img.shape[:2]
-        M = cv2.getRotationMatrix2D((w/2, h/2), deg, 1.0)
-        return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+            cv2.accumulateWeighted(gray, self.bg, 0.05)
+            bg_u8 = cv2.convertScaleAbs(self.bg)
+            delta = cv2.absdiff(bg_u8, gray)
 
-    def get_frame(self):
+            thr_val = max(5, int(90 - float(sensitivity)*0.8))
+            _, th = cv2.threshold(delta, thr_val, 255, cv2.THRESH_BINARY)
+            th = cv2.dilate(th, None, iterations=2)
+            contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            total = th.shape[0]*th.shape[1]
+            area = sum(cv2.contourArea(c) for c in contours)
+            area_pct = (area/max(1,total))*100.0
+            boxes=[]
+            if area_pct >= float(min_area_pct):
+                gh, gw = th.shape[:2]
+                sx = frame.shape[1]/float(gw)
+                sy = frame.shape[0]/float(gh)
+                for c in contours:
+                    x,y,w0,h0 = cv2.boundingRect(c)
+                    X = int(x*sx); Y = int(y*sy)
+                    W = int(w0*sx); H = int(h0*sy)
+                    if W>0 and H>0:
+                        boxes.append((X,Y,W,H))
+
+            with self.lock:
+                self.last_boxes = boxes[:]
+            return boxes
+        except Exception:
+            return []
+
+    def get_boxes(self):
         with self.lock:
-            f = None if self.frame is None else self.frame.copy()
-        if f is None: return None
-        return self._apply_rotation(f)
+            return self.last_boxes[:]
 
-    def get_jpeg(self, with_overlay=False):
-        f = self.get_frame()
-        if f is None: return None
-        if with_overlay:
-            f = draw_overlays(f)
-        ok, buf = cv2.imencode(".jpg", f, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)])
-        if not ok: return None
-        return buf.tobytes()
+# ----------------- Recorder (stdin + áudio com owner) -----------------
 
-    def set_basic_props(self, brightness=None, contrast=None, exposure=None, auto_exposure=None):
-        err = []
-        if brightness is not None:
-            if not self.cap.set(cv2.CAP_PROP_BRIGHTNESS, float(brightness)): err.append("brightness(OCV)")
-        if contrast is not None:
-            if not self.cap.set(cv2.CAP_PROP_CONTRAST, float(contrast)): err.append("contrast(OCV)")
-        if exposure is not None:
-            if not self.cap.set(cv2.CAP_PROP_EXPOSURE, float(exposure)): err.append("exposure(OCV)")
-        return err
+def list_alsa_capture_devices():
+    try:
+        r = subprocess.run(["arecord","-l"], capture_output=True, text=True)
+    except Exception:
+        return []
+    devs=[]; card=None
+    for ln in (r.stdout or "").splitlines():
+        mcard = re.search(r"card\s+(\d+):\s*([^\s,]+)", ln)
+        if mcard: card = mcard.group(2)
+        mdev  = re.search(r"device\s+(\d+):", ln)
+        if card and mdev:
+            d = mdev.group(1)
+            devs += [f"hw:CARD={card},DEV={d}", f"plughw:CARD={card},DEV={d}"]
+    try:
+        r2 = subprocess.run(["arecord","-L"], capture_output=True, text=True)
+        for ln in (r2.stdout or "").splitlines():
+            s = ln.strip()
+            if s.startswith(("default:CARD=","sysdefault:CARD=","front:CARD=")):
+                devs.append(s)
+    except Exception:
+        pass
+    out=[]; seen=set()
+    for d in devs:
+        if d not in seen:
+            seen.add(d); out.append(d)
+    return out
 
-    def set_rotate(self, deg):
-        self.rotate_deg = int(deg)
-        if self.hw_rotate_hook:
-            try: self.hw_rotate_hook(self.rotate_deg)
-            except: pass
+def list_pulse_sources():
+    try:
+        r = subprocess.run(["pactl","list","short","sources"], capture_output=True, text=True)
+    except Exception:
+        return []
+    out=["pulse"]
+    for ln in (r.stdout or "").splitlines():
+        cols = ln.split("\t")
+        if len(cols)>=2:
+            out.append("pulse:"+cols[1])
+    return out
 
-# ----------------- Recorder e Timelapse -----------------
-def _even(x):
-    x = int(x)
-    return x if x % 2 == 0 else x-1 if x>1 else 2
-class FFmpegWriter:
-    """Wrapper que escreve frames BGR24 em um processo ffmpeg gerando MP4 H.264 (avc1)."""
-    def __init__(self, path, fps, size):
-        self.path = path
-        self.w, self.h = size
-        ffmpeg_bin = os.environ.get("FFMPEG_BIN", "ffmpeg")
-        preset = os.environ.get("X264_PRESET", "veryfast")
-        crf = os.environ.get("X264_CRF", "23")
-        gop = str(max(2, int(fps) * 2))  # keyint ~ 2s
-
-        self.proc = subprocess.Popen(
-            [
-                ffmpeg_bin,
-                "-loglevel", "error",
-                "-y",
-                "-f", "rawvideo",
-                "-pix_fmt", "bgr24",
-                "-s", f"{self.w}x{self.h}",
-                "-r", str(fps),
-                "-i", "-",                 # stdin
-                "-an",
-                "-c:v", "libx264",
-                "-preset", preset,
-                "-crf", crf,
-                "-g", gop,
-                "-movflags", "+faststart",
-                "-pix_fmt", "yuv420p",
-                self.path,
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            bufsize=0,
-        )
-
-    def write(self, frame):
-        # frame deve ser BGR numpy array do tamanho exato (w,h)
-        self.proc.stdin.write(frame.tobytes())
-
-    def release(self):
-        try:
-            if self.proc and self.proc.stdin:
-                self.proc.stdin.flush()
-                self.proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            if self.proc:
-                self.proc.wait(timeout=10)
-        except Exception:
-            try:
-                self.proc.kill()
-            except Exception:
-                pass
-
-    def isOpened(self):
-        # Mantém compatibilidade com checagens do OpenCV
-        return self.proc and (self.proc.poll() is None)
-
+# ----------------- Recorder (stdin + áudio com owner, robusto) -----------------
+def have_cmd(cmd):
+    try:
+        subprocess.run([cmd, "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
 
 class Recorder:
-    def __init__(self, cam: Camera):
-        self.cam = cam
+    def __init__(self):
+        self.proc_by_dev   = {}
+        self.file_by_dev   = {}
+        self.thread_by_dev = {}
+        self.run_by_dev    = {}
+        self.owner_by_dev  = {}
+        self.stderr_buf    = {}   # dev -> str com cauda dos logs do ffmpeg
         self.lock = threading.Lock()
-        self.running = False
-        self.writer = None
-        self.filepath = None
-        self.thread = None
-        self.codec = "avc1"   # mantém padrão desejado
-        self.rec_fps = 30
-        self.scale = 100
-        self.realtime = True
-        self._last_write_ts = 0.0
-        self._stop_at = None
-        self.out_size = None
 
-    def config(self, codec=None, fps=None, scale=None, realtime=None):
-        with self.lock:
-            if codec: self.codec = codec
-            if fps: self.rec_fps = max(1, int(fps))
-            if scale: self.scale = min(100, max(10, int(scale)))
-            if realtime is not None: self.realtime = bool(realtime)
+    def _stderr_tail(self, dev, limit=4000):
+        try:
+            buf = self.stderr_buf.get(dev, "")
+            return buf[-limit:]
+        except Exception:
+            return ""
 
-    def get_config(self):
-        with self.lock:
-            return {"codec": self.codec, "fps": self.rec_fps, "scale": self.scale, "realtime": self.realtime}
+    def _spawn_stderr_drain(self, dev, proc):
+        """Drena stderr do ffmpeg para evitar bloqueio de PIPE cheio."""
+        from collections import deque
+        dq = deque(maxlen=4000)
+        self.stderr_buf[dev] = ""
 
-    def _select_fourcc_and_path(self):
-        c = (self.codec or "").upper()
-        if c in ("XVID", "MJPG"):
-            return cv2.VideoWriter_fourcc(*c), ".avi"
-        if c in ("AVC1", "H264"):
-            return cv2.VideoWriter_fourcc(*'avc1'), ".mp4"
-        return cv2.VideoWriter_fourcc(*'mp4v'), ".mp4"
-
-    def _make_writer(self, base_dir="videos"):
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        in_w = int(self.cam.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        in_h = int(self.cam.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        out_w = _even(in_w * self.scale // 100)
-        out_h = _even(in_h * self.scale // 100)
-        fourcc, ext = self._select_fourcc_and_path()
-        path = os.path.join(base_dir, f"rec-{ts}{ext}")
-
-        # 1) tentar OpenCV direto
-        vw = cv2.VideoWriter(path, fourcc, float(self.rec_fps), (out_w, out_h))
-        if vw.isOpened():
-            return vw, path, (out_w, out_h)
-
-        # 2) tentar FourCC alternativo 'H264' (algumas builds aceitam)
-        if self.codec.lower() in ("avc1", "h264"):
-            try_alt = cv2.VideoWriter_fourcc(*'H264')
-            vw2 = cv2.VideoWriter(path, try_alt, float(self.rec_fps), (out_w, out_h))
-            if vw2.isOpened():
-                return vw2, path, (out_w, out_h)
-
-            # 3) fallback: ffmpeg pipeline (libx264) → avc1 no MP4
-            ff = FFmpegWriter(path, self.rec_fps, (out_w, out_h))
-            if ff.isOpened():
-                return ff, path, (out_w, out_h)
-
-        # Se chegou aqui, falhou tudo
-        raise RuntimeError(
-            "Falha ao iniciar VideoWriter com H.264 (avc1). "
-            "Instale o ffmpeg (`sudo apt install ffmpeg`) ou mude o codec para XVID/MJPG."
-        )
-
-    def start(self):
-        with self.lock:
-            if self.running:
-                return self.filepath
-            self.writer, self.filepath, self.out_size = self._make_writer()
-            self.running = True
-            self._last_write_ts = 0.0
-            self._stop_at = None
-            self.thread = threading.Thread(target=self._run, daemon=True)
-            self.thread.start()
-            return self.filepath
-
-    def start_clip_until(self, stop_ts):
-        with self.lock:
-            running = self.running
-        if not running:
-            self.start()
-        with self.lock:
-            self._stop_at = max(self._stop_at or 0.0, float(stop_ts))
-        return self.filepath
-
-    def stop(self):
-        current = threading.current_thread()
-        is_self = (self.thread is current)
-
-        with self.lock:
-            if not self.running:
-                return None
-            self.running = False
-
-        if self.thread and not is_self:
-            self.thread.join(timeout=1.0)
-
-        if self.writer:
+        def _drain():
             try:
-                self.writer.release()
+                while True:
+                    if proc.poll() is not None and not proc.stderr:
+                        break
+                    chunk = proc.stderr.readline()
+                    if not chunk:
+                        if proc.poll() is not None:
+                            break
+                        time.sleep(0.05)
+                        continue
+                    try:
+                        s = chunk.decode("utf-8", "ignore")
+                    except Exception:
+                        s = repr(chunk)
+                    dq.extend(s)
+                    self.stderr_buf[dev] = "".join(dq)
             except Exception:
                 pass
 
-        path = self.filepath
-        self.writer = None
-        self.filepath = None
-        self._stop_at = None
+        th = threading.Thread(target=_drain, daemon=True)
+        th.start()
 
-        if path:
+    def _probe_cam_dims(self, cam):
+        w = int(cam.cap.get(cv2.CAP_PROP_FRAME_WIDTH)  or 0)
+        h = int(cam.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        fps = float(cam.cap.get(cv2.CAP_PROP_FPS) or 0) or 30.0
+        if not w or not h:
+            frm = None
+            for _ in range(15):
+                frm = cam.last_frame()
+                if frm is not None: break
+                time.sleep(0.1)
+            if frm is None:
+                return 1280, 720, fps
+            h, w = frm.shape[:2]
+        return int(w), int(h), float(fps)
+
+    def _ffmpeg_cmd(self, w, h, fps, mic, out_path, audio_backend):
+        # sem -shortest: evita encerrar se o áudio oscilar
+        base = [
+            "ffmpeg","-loglevel","error","-y",
+            "-f","rawvideo","-pix_fmt","bgr24","-s",f"{w}x{h}","-r",str(fps),"-i","-",
+        ]
+        if audio_backend == "none":
+            base += ["-an"]
+        else:
+            base += ["-f", audio_backend, "-thread_queue_size", "1024", "-i", mic]
+        base += ["-c:v","libx264","-preset","veryfast","-crf","23","-pix_fmt","yuv420p"]
+        if audio_backend != "none":
+            base += ["-c:a","aac","-b:a","128k"]
+        base += ["-movflags","+faststart", out_path]
+        return base
+
+    def _writer_loop(self, dev, cam, proc, fps):
+        period = 1.0 / max(1.0, float(fps))
+        next_t = time.time()
+        try:
+            while self.run_by_dev.get(dev, False):
+                if proc.poll() is not None:
+                    break
+                frm = cam.last_frame()
+                if frm is not None:
+                    try:
+                        proc.stdin.write(frm.tobytes())
+                    except (BrokenPipeError, ValueError, OSError):
+                        break
+                next_t += period
+                delay = next_t - time.time()
+                if delay > 0: time.sleep(delay)
+                else: next_t = time.time()
+        finally:
             try:
-                make_thumb_from_last_frame(get_cam(), path)
+                if proc.stdin:
+                    proc.stdin.flush()
+                    proc.stdin.close()
             except Exception:
                 pass
-            timeline_add(
-                "clip",
-                title=os.path.basename(path),
-                link=f"/viewer/video/{os.path.basename(path)}",
-                thumb=os.path.join(
-                    "/media/thumbs",
-                    os.path.splitext(os.path.basename(path))[0] + ".jpg"
-                )
+
+    def _start_ffmpeg(self, dev, w, h, fps, mic, out_path):
+        if not have_cmd("ffmpeg"):
+            raise RuntimeError("ffmpeg não encontrado. Instale o pacote ffmpeg.")
+        mic = (mic or "").strip()
+
+        # ordem dos backends
+        if not mic or mic.lower() == "none":
+            backends = [("none", mic)]
+        elif mic.lower().startswith("pulse"):
+            backends = [("pulse", mic), ("alsa", mic), ("none", mic)]
+        else:
+            backends = [("alsa", mic), ("none", mic)]
+
+        tried = []
+        for backend, micname in backends:
+            cmd = self._ffmpeg_cmd(w, h, fps, micname, out_path, backend)
+            p = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                bufsize=0
             )
-        return path
+            self._spawn_stderr_drain(dev, p)
+            time.sleep(0.6)
+            if p.poll() is None:
+                return p, backend
+            tried.append(f"[{backend}] {self._stderr_tail(dev)}")
 
-    def _run(self):
-        period = 1.0 / float(self.rec_fps)
-        while self.running:
-            frame = self.cam.get_frame()
-            if frame is None:
-                time.sleep(0.003)
-                continue
+        raise RuntimeError("ffmpeg não iniciou.\n" + "\n".join(tried))
 
-            if self.scale != 100:
-                frame = cv2.resize(frame, self.out_size, interpolation=cv2.INTER_AREA)
-
-            now = time.time()
-            if self.realtime:
-                if self._last_write_ts == 0.0 or (now - self._last_write_ts) >= period:
-                    self.writer.write(frame)
-                    self._last_write_ts = now
-            else:
-                self.writer.write(frame)
-                time.sleep(0.001)
-
-            if self._stop_at is not None and now >= self._stop_at:
-                self.stop()
-                break
-
-
-
-class Timelapse:
-    """Salva fotos SOLTAS (sem pasta) no diretório timelapse/ em intervalos configurados."""
-    def __init__(self, cam: Camera):
-        self.cam = cam
-        self.lock = threading.Lock()
-        self.running = False
-        self.interval = 5
-        self.thread = None
-
-    def start(self, interval_s=5):
+    def is_recording(self, dev):
+        dev = str(dev)
         with self.lock:
-            if self.running: return True
-            self.interval = max(1, int(interval_s))
+            p = self.proc_by_dev.get(dev)
+        return p is not None and (p.poll() is None)
+
+    def start(self, dev, mic="default", owner="user"):
+        """INCLUIR ESTE MÉTODO — ele que faltava."""
+        dev = str(dev)
+        cam = get_cam(dev)
+
+        # se já está gravando, devolve o arquivo atual
+        if self.is_recording(dev):
+            with self.lock:
+                return os.path.basename(self.file_by_dev.get(dev) or "")
+
+        w, h, fps = self._probe_cam_dims(cam)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        prefix = "video-user" if owner == "user" else "video-motion"
+        out_path = os.path.join(MEDIA["videos"], f"{prefix}-{sanitize_dev(dev)}-{ts}.mp4")
+
+        p, backend = self._start_ffmpeg(dev, w, h, fps, mic, out_path)
+
+        with self.lock:
+            self.proc_by_dev[dev] = p
+            self.file_by_dev[dev] = out_path
+            self.run_by_dev[dev]  = True
+            self.owner_by_dev[dev]= owner
+
+        th = threading.Thread(target=self._writer_loop, args=(dev, cam, p, fps), daemon=True)
+        th.start()
+        with self.lock:
+            self.thread_by_dev[dev] = th
+
+        if backend == "none":
+            print(f"[Recorder] {dev}: gravando SEM ÁUDIO (fallback).")
+        return os.path.basename(out_path)
+
+    def stop(self, dev, owner=None, force=False):
+        dev = str(dev)
+        with self.lock:
+            p  = self.proc_by_dev.get(dev)
+            out = self.file_by_dev.get(dev)
+            th = self.thread_by_dev.get(dev)
+            cur_owner = self.owner_by_dev.get(dev)
+            if (owner is not None) and (cur_owner is not None) and (cur_owner != owner) and (not force):
+                raise RuntimeError(f"em uso por {cur_owner}")
+            self.run_by_dev[dev] = False
+
+        if not p:
+            raise RuntimeError("não está gravando")
+
+        if th:
+            th.join(timeout=3.5)
+
+        try:
+            p.wait(timeout=6)
+        except subprocess.TimeoutExpired:
+            try:
+                p.terminate(); p.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                try: p.wait(timeout=2)
+                except Exception: pass
+
+        with self.lock:
+            self.proc_by_dev.pop(dev, None)
+            self.thread_by_dev.pop(dev, None)
+            self.run_by_dev.pop(dev, None)
+            self.owner_by_dev.pop(dev, None)
+
+        if out:
+            for _ in range(15):
+                if os.path.isfile(out) and os.path.getsize(out) > 0:
+                    return os.path.basename(out)
+                time.sleep(0.1)
+        err = self._stderr_tail(dev)
+        raise RuntimeError(f"gravação não gerou arquivo.\n{err}")
+
+
+REC = Recorder()
+
+# ----------------- Timelapse -----------------
+class Timelapser:
+    def __init__(self, dev, interval=5):
+        self.dev = str(dev)
+        self.interval = max(1, int(interval))
+        self.running = False
+        self.lock = threading.Lock()
+        self.th = None
+
+    def start(self, interval=None):
+        with self.lock:
+            if interval is not None:
+                self.interval = max(1, int(interval))
+            if self.running:
+                return True
             self.running = True
-            self.thread = threading.Thread(target=self._run, daemon=True)
-            self.thread.start()
+            self.th = threading.Thread(target=self._loop, daemon=True)
+            self.th.start()
             return True
 
-    def _run(self):
+    def stop(self):
+        with self.lock:
+            self.running = False
+        if self.th:
+            self.th.join(timeout=1.0)
+
+    def _loop(self):
+        cam = get_cam(self.dev)
         while True:
             with self.lock:
                 if not self.running: break
                 interval = self.interval
-            frame = self.cam.get_frame()
+            frame = cam.last_frame()
             if frame is not None:
                 ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-                path = os.path.join(MEDIA_DIRS["timelapse"], f"tl-{ts}.jpg")
+                name = f"tl-{sanitize_dev(self.dev)}-{ts}.jpg"
+                path = os.path.join(MEDIA["photos"], name)
                 cv2.imwrite(path, frame)
-                make_thumb(path)
-                base = os.path.basename(path)
-                timeline_add("timelapse", title=base,
-                             link=f"/media/timelapse/{base}",
-                             thumb=f"/media/thumbs/{base}",
-                             extra={"interval_s": interval})
+                make_thumb_image(path)
             total = interval; step = 0.1; loops = int(total/step)
             for _ in range(max(1,loops)):
                 with self.lock:
                     if not self.running: break
                 time.sleep(step)
 
-    def stop(self):
-        with self.lock:
-            running_before = self.running
-            self.running = False
-        if self.thread: self.thread.join(timeout=1.0)
-        return running_before
+TIMERS = {}  # dev -> Timelapser
+def get_timer(dev):
+    dev=str(dev)
+    if dev not in TIMERS:
+        tcfg = get_cam_cfg(dev).get("timelapse", {})
+        TIMERS[dev] = Timelapser(dev, interval=tcfg.get("interval",5))
+    return TIMERS[dev]
 
-# ----------------- Detector (SSD-only mantendo a interface YOLO) -----------------
-# ----------------- YOLO (shim SSD-only) -----------------
-class YOLO:
-    """
-    Mantém a API esperada pelo código (enable/gate/targets/detect),
-    mas usa APENAS SSD MobileNet (Caffe).
-    """
-    def __init__(self):
+# ----------------- Motion Controller -----------------
+class MotionController:
+    def __init__(self, dev):
+        self.dev = str(dev)
         self.lock = threading.Lock()
-        self.enable = False
-        self.gate = False
-        self.conf = 0.5
-        self.nms = 0.45
-        self.targets = []
-        self.backend = "ssd"
-        self.paths = {"SSD_PROTO": SSD_PROTO, "SSD_WEIGHTS": SSD_WEIGHTS}
-        self._ssd = None
+        cfg = get_cam_cfg(self.dev).get("motion", {})
+        self.enable = bool(cfg.get("enable", False))
+        self.sens = int(cfg.get("sensitivity", 50))
+        self.min_area = int(cfg.get("min_area_pct", 3))
+        self.action = cfg.get("action", "photo")  # photo|video
+        self.overlay = bool(cfg.get("overlay", True))
+        self.cooldown = int(cfg.get("cooldown", 10))
+        self.clip_len = int(cfg.get("clip_len", 30))
+        self.last_photo_ts = 0.0
+        self.stop_at = 0.0
+        self.owned_record = False
+        self.monitor_th = threading.Thread(target=self._monitor, daemon=True)
+        self._running = True
+        self.monitor_th.start()
 
-    def _ensure(self):
-        if self._ssd is None:
-            self._ssd = SSDDetector(
-                proto_path=self.paths["SSD_PROTO"],
-                weights_path=self.paths["SSD_WEIGHTS"],
-                conf=self.conf, nms=self.nms, targets=self.targets
-            )
-            self._ssd.load()
-        else:
-            self._ssd.set_params(conf=self.conf, nms=self.nms, targets=self.targets)
-
-    def configure(self, enable=None, gate=None, conf=None, nms=None, targets=None, backend=None, paths=None):
+    def update_cfg(self):
+        cfg = get_cam_cfg(self.dev).get("motion", {})
         with self.lock:
-            if enable is not None: self.enable = bool(enable)
-            if gate is not None:   self.gate   = bool(gate)
-            if conf is not None:   self.conf   = max(0.05, min(0.99, float(conf)))
-            if nms is not None:    self.nms    = max(0.05, min(0.99, float(nms)))
-            if targets is not None: self.targets = [t.strip() for t in targets if t.strip()]
-            # ignoramos "backend" (sempre ssd)
-            if paths:
-                # permite override por env/POST (opcional)
-                p_proto = paths.get("SSD_PROTO"); p_w = paths.get("SSD_WEIGHTS")
-                if p_proto: self.paths["SSD_PROTO"] = p_proto
-                if p_w:     self.paths["SSD_WEIGHTS"] = p_w
-            self._ensure()
+            self.enable = bool(cfg.get("enable", False))
+            self.sens = int(cfg.get("sensitivity", 50))
+            self.min_area = int(cfg.get("min_area_pct", 3))
+            self.action = cfg.get("action", "photo")
+            self.overlay = bool(cfg.get("overlay", True))
+            self.cooldown = int(cfg.get("cooldown", 10))
+            self.clip_len = int(cfg.get("clip_len", 30))
 
-    def get_config(self):
-        with self.lock:
-            return {
-                "enable": self.enable,
-                "gate": self.gate,
-                "conf": self.conf,
-                "nms": self.nms,
-                "targets": self.targets,
-                "backend": self.backend,
-                "paths": self.paths,
-            }
-
-    def detect(self, frame):
-        with self.lock:
-            if not self.enable:
-                return []
-            self._ensure()
-            return self._ssd.detect(frame)
-
-
-
-# ----------------- Motion Detector (ROI + Overlays + Evolution no motion) -----------------
-class SSDDetector:
-    """
-    Detector usando MobileNetSSD (Caffe) via cv2.dnn_DetectionModel.
-    Retorno: [(x,y,w,h, score, name), ...]
-    """
-    def __init__(self, proto_path, weights_path, conf=0.5, nms=0.45, targets=None):
-        self.proto = proto_path
-        self.weights = weights_path
-        self.conf = float(conf)
-        self.nms  = float(nms)
-        self.targets = set(t.strip().lower() for t in (targets or []) if t.strip())
-        self.model = None
-        self.classes = MOBILENETSSD_CLASSES[:]
-        self.input_size = (300, 300)
-
-    def _check_files(self):
-        if not os.path.isfile(self.proto):
-            raise FileNotFoundError(f"Prototxt não encontrado: {self.proto}")
-        if not os.path.isfile(self.weights):
-            raise FileNotFoundError(f"Caffemodel não encontrado: {self.weights}")
-
-    def load(self):
-        if self.model is not None:
+    def on_boxes(self, boxes):
+        if not self.enable:
             return
-        self._check_files()
-        model = cv2.dnn.DetectionModel(self.proto, self.weights)
-        # Parâmetros do MobileNetSSD padrão:
-        model.setInputSize(*self.input_size)
-        model.setInputScale(0.007843)  # 1/127.5
-        model.setInputMean((127.5,127.5,127.5))
-        model.setInputSwapRB(False)
-        self.model = model
+        active = bool(boxes)
+        now = time.time()
+        if not active:
+            return
+        if self.action == "photo":
+            if now - self.last_photo_ts >= max(1, self.cooldown):
+                self._take_photo()
+                self.last_photo_ts = now
+        else:  # video
+            with self.lock:
+                if not REC.is_recording(self.dev):
+                    try:
+                        mic = get_cam_cfg(self.dev).get("mic","default")
+                        REC.start(self.dev, mic=mic, owner="motion")
+                        self.owned_record = True
+                    except Exception as e:
+                        print(f"[Motion] start rec failed: {e}")
+                        self.owned_record = False
+                self.stop_at = max(self.stop_at, now + float(self.clip_len))
 
-    def set_params(self, conf=None, nms=None, targets=None):
-        if conf is not None: self.conf = float(conf)
-        if nms is not None:  self.nms  = float(nms)
-        if targets is not None:
-            self.targets = set(t.strip().lower() for t in targets if t.strip())
+    def _monitor(self):
+        while self._running:
+            time.sleep(0.25)
+            with self.lock:
+                if self.owned_record and self.stop_at>0 and time.time() >= self.stop_at:
+                    try:
+                        fname = REC.stop(self.dev, owner="motion")
+                        if fname:
+                            frame = get_cam(self.dev).last_frame()
+                            make_thumb_from_frame(frame, os.path.join(MEDIA["videos"], fname))
+                    except Exception as e:
+                        print(f"[Motion] stop rec failed: {e}")
+                    finally:
+                        self.owned_record = False
+                        self.stop_at = 0.0
 
-    def detect(self, frame):
-        if self.model is None:
-            self.load()
-        classIds, confidences, boxes = self.model.detect(
-            frame,
-            confThreshold=self.conf,
-            nmsThreshold=self.nms
-        )
-        dets = []
-        if classIds is None or len(classIds) == 0:
-            return dets
-        classIds = np.array(classIds).flatten()
-        confidences = np.array(confidences).flatten()
-        for cid, score, box in zip(classIds, confidences, boxes):
-            name = self.classes[cid] if 0 <= cid < len(self.classes) else str(cid)
-            if self.targets and (name.lower() not in self.targets):
-                continue
-            x, y, w, h = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-            dets.append((x, y, w, h, float(score), name))
-        return dets
+    def _take_photo(self):
+        cam = get_cam(self.dev)
+        frame = cam.last_frame()
+        if frame is None:
+            return
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        name = f"photo-motion-{sanitize_dev(self.dev)}-{ts}.jpg"
+        path = os.path.join(MEDIA["photos"], name)
+        cv2.imwrite(path, frame)
+        make_thumb_image(path)
 
+    def stop(self):
+        self._running = False
 
+MOTIONS = {}  # dev -> MotionController
+MOTION_LOCK = threading.Lock()
+def get_motion_ctrl(dev):
+    dev=str(dev)
+    with MOTION_LOCK:
+        if dev not in MOTIONS:
+            MOTIONS[dev] = MotionController(dev)
+        return MOTIONS[dev]
 
+# ----------------- Captura em thread (preview) -----------------
+CAMS = {}            # dev -> CameraStream
+CAM_LOCK = threading.Lock()
 
-class MotionDetector:
-    def __init__(self, cam: Camera, recorder: Recorder, yolo: YOLO):
-        self.cam = cam; self.recorder = recorder; self.yolo = yolo
+class CameraStream:
+    def __init__(self, device, width=1280, height=720, fps=30, jpeg_quality=80):
+        self.device = device
+        self.q = int(jpeg_quality)
         self.lock = threading.Lock()
-        self.enable = False; self.action="photo"; self.duration=10; self.sensitivity=50
-        self.min_area_pct=3; self.cooldown=10; self.last_fire=0.0
-        self.roi=None; self.show_overlays=True
-        self.last_motion_boxes=[]; self.last_ai_boxes=[]
-        self.running=True; self.bg=None
-        self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
+        self.frame = None
+        self.running = True
+        self.cap = self._open(device, width, height, fps)
+        self.mdet = MotionDetector()
+        self.th = threading.Thread(target=self._loop, daemon=True)
+        self.th.start()
 
-    def set_config(self, enable=None, action=None, duration=None, sensitivity=None, min_area=None, cooldown=None):
-        with self.lock:
-            if enable is not None: self.enable=bool(enable)
-            if action in ("photo","clip"): self.action=action
-            if duration is not None: self.duration=max(1,min(60,int(duration)))
-            if sensitivity is not None: self.sensitivity=max(1,min(100,int(sensitivity)))
-            if min_area is not None: self.min_area_pct=max(1,min(50,int(min_area)))
-            if cooldown is not None: self.cooldown=max(0,int(cooldown))
+    def _open(self, dev, w, h, fps):
+        sys = platform.system().lower()
+        backend = cv2.CAP_V4L2 if 'linux' in sys else 0
+        dev_arg = dev if not str(dev).isdigit() else int(dev)
+        cap = cv2.VideoCapture(dev_arg, backend)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        cap.set(cv2.CAP_PROP_FPS, float(fps))
+        if not cap.isOpened():
+            raise RuntimeError(f"Não abriu câmera: {dev}")
+        return cap
 
-    def set_roi(self, roi_norm):
-        with self.lock:
-            if roi_norm is None: self.roi=None
+    def _loop(self):
+        ctrl = get_motion_ctrl(self.device)
+        while self.running:
+            ok, img = self.cap.read()
+            if ok:
+                with self.lock:
+                    self.frame = img
+                cfg = get_cam_cfg(self.device).get("motion", {})
+                do_proc = bool(cfg.get("enable")) or bool(cfg.get("overlay"))
+                boxes = []
+                if do_proc:
+                    boxes = self.mdet.process(
+                        img,
+                        sensitivity=int(cfg.get("sensitivity", 50)),
+                        min_area_pct=int(cfg.get("min_area_pct", 3))
+                    )
+                ctrl.update_cfg()
+                if cfg.get("enable"):
+                    ctrl.on_boxes(boxes)  # só dispara ação quando detecção ligada
             else:
-                x=max(0.0,min(1.0,float(roi_norm.get("x",0)))); y=max(0.0,min(1.0,float(roi_norm.get("y",0))))
-                w=max(0.0,min(1.0-x,float(roi_norm.get("w",1)))); h=max(0.0,min(1.0-y,float(roi_norm.get("h",1))))
-                self.roi=(x,y,w,h)
+                time.sleep(0.02)
 
-    def get_roi(self):
+
+    def _draw_motion(self, f):
+        boxes = self.mdet.get_boxes()
+        if not boxes: return f
+        for (x,y,w,h) in boxes:
+            cv2.rectangle(f, (x,y), (x+w, y+h), (0,0,255), 2)
+        cv2.putText(f, f"motion:{len(boxes)}", (10,22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2, cv2.LINE_AA)
+        return f
+
+    def get_jpeg(self):
         with self.lock:
-            return None if self.roi is None else {"x": self.roi[0], "y": self.roi[1], "w": self.roi[2], "h": self.roi[3]}
+            f = None if self.frame is None else self.frame.copy()
+        if f is None:
+            return None
+        mcfg = get_cam_cfg(self.device).get("motion", {})
+        if mcfg.get("overlay", False):
+            f = self._draw_motion(f)
+        ok, buf = cv2.imencode(".jpg", f, [int(cv2.IMWRITE_JPEG_QUALITY), self.q])
+        return buf.tobytes() if ok else None
 
-    def set_overlays(self, show=None):
-        if show is None: return
-        with self.lock: self.show_overlays=bool(show)
 
-    def get_config(self):
+    def last_frame(self):
         with self.lock:
-            return {"enable": self.enable,"action": self.action,"duration": self.duration,"sensitivity": self.sensitivity,"min_area": self.min_area_pct,"cooldown": self.cooldown,"roi": None if self.roi is None else {"x": self.roi[0], "y": self.roi[1], "w": self.roi[2], "h": self.roi[3]},"overlays": self.show_overlays}
-
-    def get_overlays(self):
-        with self.lock:
-            return (self.last_motion_boxes[:], self.last_ai_boxes[:], self.roi, self.show_overlays)
+            return None if self.frame is None else self.frame.copy()
 
     def stop(self):
         self.running = False
-        try: self.thread.join(timeout=1.0)
+        try: self.th.join(timeout=1)
+        except: pass
+        try: self.cap.release()
         except: pass
 
-    def _prep(self, frame_full):
-        h, w = frame_full.shape[:2]
-        roi_abs = None
-        with self.lock:
-            roi = self.roi
-        if roi is not None:
-            rx,ry,rw,rh = roi
-            x0 = int(rx*w); y0 = int(ry*h)
-            x1 = int((rx+rw)*w); y1 = int((ry+rh)*h)
-            x0,x1 = max(0,min(w-1,x0)), max(1,min(w,x1))
-            y0,y1 = max(0,min(h-1,y0)), max(1,min(h,y1))
-            roi_abs = (x0,y0,x1,y1)
-            frame = frame_full[y0:y1, x0:x1]
-        else:
-            frame = frame_full
-        h2, w2 = frame.shape[:2]
-        new_w = 320 if w2 > 320 else w2
-        if w2 > new_w:
-            scale = new_w / float(w2)
-            frame = cv2.resize(frame, (new_w, int(h2*scale)), interpolation=cv2.INTER_AREA)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (9,9), 0)
-        return gray, roi_abs
+def get_cam(dev):
+    with CAM_LOCK:
+        if dev not in CAMS:
+            CAMS[dev] = CameraStream(dev)
+        return CAMS[dev]
 
-    def _motion(self, gray, bg):
-        delta = cv2.absdiff(bg, gray)
-        thresh_val = max(5, int(90 - self.sensitivity*0.8))
-        _, th = cv2.threshold(delta, thresh_val, 255, cv2.THRESH_BINARY)
-        th = cv2.dilate(th, None, iterations=2)
-        contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        area = sum(cv2.contourArea(c) for c in contours)
-        total = th.shape[0] * th.shape[1]
-        area_pct = (area / max(1,total)) * 100.0
-        return contours, area_pct
+# ----------------- Biblioteca Helpers -----------------
+def parse_info_from_name(name: str):
+    """
+    Retorna (origin, cam) a partir do nome:
+      video-user-<cam>-YYYYMMDD-HHMMSS.mp4
+      video-motion-<cam>-YYYYMMDD-HHMMSS.mp4
+      rec-user-<cam>-YYYYMMDD-HHMMSS.mp4      (legado)
+      rec-motion-<cam>-YYYYMMDD-HHMMSS.mp4    (legado)
+      photo-user-<cam>-YYYYMMDD-HHMMSS.jpg
+      photo-motion-<cam>-YYYYMMDD-HHMMSS.jpg
+      tl-<cam>-YYYYMMDD-HHMMSS.jpg            => origin='timelapse'
+    """
+    base = os.path.basename(name)
 
-    def _ai_ok_and_boxes(self, frame_full):
-        dets = get_yolo().detect(frame_full) if get_yolo().enable else []
-        boxes=[]
-        ok = True
-        if dets:
-            if get_yolo().targets:
-                ok = any( (d[5] in get_yolo().targets) for d in dets )
-            boxes = [ (int(x),int(y),int(w),int(h), f"{name}:{score:.2f}") for (x,y,w,h,score,name) in dets ]
-        else:
-            ok = not get_yolo().gate
-        return ok, boxes
+    # vídeos (novo + legado)
+    m = re.match(r"^(?:video|rec)-(user|motion)-(.+?)-\d{8}-\d{6}\.(?:mp4|mkv|mov)$", base, re.IGNORECASE)
+    if m:
+        origin = m.group(1).lower()   # 'user' | 'motion'
+        cam = m.group(2)
+        return origin, cam
 
-    def _should_fire(self, area_pct, ai_ok):
-        now = time.time()
-        with self.lock:
-            if not self.enable: return False
-            if (now - self.last_fire) < self.cooldown: return False
-            if area_pct < self.min_area_pct: return False
-            if get_yolo().gate and not ai_ok: return False
-            self.last_fire = now
-            return True
+    # fotos (movimento ou manual)
+    m = re.match(r"^photo-(user|motion)-(.+?)-\d{8}-\d{6}\.jpg$", base, re.IGNORECASE)
+    if m:
+        origin = m.group(1).lower()
+        cam = m.group(2)
+        return origin, cam
 
-    def _do_fire(self):
-        if self.action == "photo":
-            frame = get_cam().get_frame()
-            if frame is not None:
-                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-                path = os.path.join(MEDIA_DIRS["photos"], f"motion-{ts}.jpg")
-                cv2.imwrite(path, frame)
-                make_thumb(path)
-                timeline_add(
-                    "photo",
-                    title=os.path.basename(path),
-                    link=f"/media/photos/{os.path.basename(path)}",
-                    thumb=f"/media/thumbs/{os.path.basename(path)}"
-                )
-                # Evolution: envia foto do motion se habilitado
-                evo_async_send(path, caption=f"Detecção de movimento {ts}")
-                print(f"[MOTION] FOTO disparada e salva: {path}")
-        else:
-            # Mini-gravação (clip)
-            try:
-                stop_at = time.time() + float(self.duration)
-                # use sempre a instância do recorder associada a este MotionDetector
-                self.recorder.start_clip_until(stop_at)
-                print(f"[MOTION] CLIP disparado: dura até {datetime.fromtimestamp(stop_at)}; "
-                      f"config={self.recorder.get_config()}")
+    # timelapse
+    m = re.match(r"^tl-(.+?)-\d{8}-\d{6}\.jpg$", base, re.IGNORECASE)
+    if m:
+        return "timelapse", m.group(1)
 
-                # ===== NOVO: snapshot e envio via Evolution, igual à foto =====
-                try:
-                    frame = get_cam().get_frame()
-                    if frame is not None:
-                        ts2 = datetime.now().strftime("%Y%m%d-%H%M%S")
-                        snap_path = os.path.join(MEDIA_DIRS["photos"], f"motionclip-{ts2}.jpg")
-                        cv2.imwrite(snap_path, frame)
-                        # opcional: gerar thumb localmente (não adiciona na timeline)
-                        # make_thumb(snap_path)
-                        evo_async_send(snap_path, caption=f"Detecção de movimento (clip) {ts2}")
-                        print(f"[MOTION] SNAP enviado via Evolution: {snap_path}")
-                except Exception as e_snap:
-                    print(f"[MOTION] Falha no snapshot/enviar Evolution: {e_snap}")
-                # ===== FIM DO BLOCO NOVO =====
+    # super-legado: rec-<cam>-..., photo-<cam>-..., tl-<cam>-...
+    m = re.match(r"^(rec|photo|tl)-(.+?)-\d{8}-\d{6}\.(mp4|jpg)$", base, re.IGNORECASE)
+    if m:
+        kind, cam = m.group(1).lower(), m.group(2)
+        origin = "timelapse" if kind == "tl" else "user"
+        return origin, cam
 
-            except Exception as e:
-                # Não deixe o loop morrer silenciosamente
-                print(f"[MOTION] ERRO ao iniciar mini-gravação: {e}")
+    return "_unknown", "_unknown"
 
 
-    def _run(self):
-        alpha = 0.05
-        while self.running:
-            frame_full = get_cam().get_frame()
-            if frame_full is None:
-                time.sleep(0.03); continue
-
-            ai_ok, ai_boxes = self._ai_ok_and_boxes(frame_full)
-            gray, roi_abs = self._prep(frame_full)
-            if self.bg is None:
-                self.bg = gray.copy().astype("float32")
-                with self.lock:
-                    self.last_motion_boxes = []
-                    self.last_ai_boxes = ai_boxes[:]
-                time.sleep(0.05)
-                continue
-
-            cv2.accumulateWeighted(gray, self.bg, alpha)
-            bg_u8 = cv2.convertScaleAbs(self.bg)
-            contours, area_pct = self._motion(gray, bg_u8)
-
-            boxes=[]
-            gh, gw = gray.shape[:2]
-            fh, fw = frame_full.shape[:2]
-            if roi_abs:
-                rx0, ry0, rx1, ry1 = roi_abs
-                scale_x = (rx1 - rx0) / max(1, gw)
-                scale_y = (ry1 - ry0) / max(1, gh)
-            else:
-                rx0, ry0 = 0, 0
-                scale_x = fw / max(1, gw)
-                scale_y = fh / max(1, gh)
-
-            for c in contours:
-                x,y,w,h = cv2.boundingRect(c)
-                X = int(rx0 + x*scale_x); Y = int(ry0 + y*scale_y)
-                W = int(w*scale_x); H = int(h*scale_y)
-                if W>0 and H>0:
-                    boxes.append((X,Y,W,H))
-
-            if self._should_fire(area_pct, ai_ok):
-                self._do_fire()
-                timeline_add("motion", title=f"area={area_pct:.1f}%", extra={"area_pct": round(area_pct,1)})
-
-            with self.lock:
-                self.last_motion_boxes = boxes
-                self.last_ai_boxes = ai_boxes[:]
-
-            time.sleep(0.05)
-
-# ----------------- Helpers de mídia -----------------
-def make_thumb(src_path, max_w=240):
+def in_date_range(path, start_d: date=None, end_d: date=None):
     try:
-        img = cv2.imread(src_path)
-        if img is None: return None
-        h, w = img.shape[:2]
-        if w > max_w:
-            scale = max_w / float(w)
-            img = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
-        base = os.path.basename(src_path)
-        tpath = os.path.join(MEDIA_DIRS["thumbs"], base if base.lower().endswith(".jpg") else base + ".jpg")
-        cv2.imwrite(tpath, img)
-        return tpath
+        ts = os.path.getmtime(path)
     except Exception:
-        return None
-
-def make_thumb_from_last_frame(cam: Camera, video_path):
-    frame = cam.get_frame()
-    if frame is None: return None
-    base = os.path.splitext(os.path.basename(video_path))[0] + ".jpg"
-    tpath = os.path.join(MEDIA_DIRS["thumbs"], base)
-    img = frame
-    h, w = img.shape[:2]
-    if w > 240:
-        scale = 240 / float(w)
-        img = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
-    cv2.imwrite(tpath, img)
-    return tpath
-
-def safe_unlink(p):
-    try:
-        if p and os.path.isfile(p):
-            os.remove(p)
-    except Exception:
-        pass
-
-def remove_files_for_event(ev):
-    et = ev.get("type","")
-    link = ev.get("link","") or ""
-    thumb = ev.get("thumb","") or ""
-    try:
-        if et == "photo":
-            name = os.path.basename(link)
-            safe_unlink(os.path.join(MEDIA_DIRS["photos"], name))
-            tname = os.path.basename(thumb) if thumb else (name if name.endswith(".jpg") else name + ".jpg")
-            safe_unlink(os.path.join(MEDIA_DIRS["thumbs"], tname))
-        elif et == "timelapse":
-            name = os.path.basename(link)
-            safe_unlink(os.path.join(MEDIA_DIRS["timelapse"], name))
-            tname = os.path.basename(thumb) if thumb else name
-            safe_unlink(os.path.join(MEDIA_DIRS["thumbs"], tname))
-        elif et == "clip":
-            name = os.path.basename(link)
-            safe_unlink(os.path.join(MEDIA_DIRS["videos"], name))
-            basejpg = os.path.splitext(name)[0] + ".jpg"
-            safe_unlink(os.path.join(MEDIA_DIRS["thumbs"], basejpg))
-        else:
-            if thumb:
-                safe_unlink(os.path.join(MEDIA_DIRS["thumbs"], os.path.basename(thumb)))
-    except Exception:
-        pass
-
-# ----------------- Singletones -----------------
-_cam = None
-_cam_lock = threading.Lock()
-_recorder = None
-_timelapse = None
-_yolo = None
-_motion = None
-
-def get_cam():
-    global _cam, _recorder, _timelapse, _yolo, _motion
-    if _cam is None:
-        with _cam_lock:
-            if _cam is None:
-                _cam = Camera(DEFAULT_DEVICE, DEFAULT_W, DEFAULT_H, DEFAULT_FPS, DEFAULT_FOURCC, DEFAULT_JPEG_QUALITY)
-                _recorder = Recorder(_cam)
-                _timelapse = Timelapse(_cam)
-                _yolo = YOLO()
-                _motion = MotionDetector(_cam, _recorder, _yolo)
-    return _cam
-
-def get_motion(): get_cam(); return _motion
-def get_yolo(): get_cam(); return _yolo
-
-def reopen_cam(device, width, height, fps, fourcc):
-    global _cam, _recorder, _timelapse, _yolo, _motion
-    with _cam_lock:
-        if _cam is None:
-            _cam = Camera(device, width, height, fps, fourcc, DEFAULT_JPEG_QUALITY)
-        else:
-            _cam.open(device, width, height, fps, fourcc)
-        if _recorder is None: _recorder = Recorder(_cam)
-        if _timelapse is None: _timelapse = Timelapse(_cam)
-        if _yolo is None: _yolo = YOLO()
-        if _motion is None: _motion = MotionDetector(_cam, _recorder, _yolo)
-    return _cam
-
-# ----------------- v4l2 utils -----------------
-def have_v4l2ctl():
-    try:
-        subprocess.run(["v4l2-ctl", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         return True
-    except Exception:
-        return False
+    d = datetime.fromtimestamp(ts).date()
+    if start_d and d < start_d: return False
+    if end_d and d > end_d: return False
+    return True
 
-def list_formats(device):
-    if not have_v4l2ctl():
-        return "v4l2-ctl não encontrado. Instale: sudo apt install v4l-utils"
-    try:
-        out = subprocess.check_output(["v4l2-ctl", f"--device={device}", "--list-formats-ext"], stderr=subprocess.STDOUT)
-        return out.decode(errors="ignore")
-    except subprocess.CalledProcessError as e:
-        return e.output.decode(errors="ignore") or str(e)
+# ----------------- Flask -----------------
 
-def set_v4l2_exposure(device, auto=None, absolute=None):
-    if not have_v4l2ctl():
-        return ["v4l2-ctl indisponível"]
-    errs = []
-    if auto is True:
-        r = subprocess.run(["v4l2-ctl", f"--device={device}", "--set-ctrl=exposure_auto=3"], capture_output=True, text=True)
-        if r.returncode != 0: errs.append(r.stderr.strip() or r.stdout.strip())
-    if auto is False:
-        r = subprocess.run(["v4l2-ctl", f"--device={device}", "--set-ctrl=exposure_auto=1"], capture_output=True, text=True)
-        if r.returncode != 0: errs.append(r.stderr.strip() or r.stdout.strip())
-    if absolute is not None:
-        r = subprocess.run(["v4l2-ctl", f"--device={device}", f"--set-ctrl=exposure_absolute={int(absolute)}"], capture_output=True, text=True)
-        if r.returncode != 0: errs.append(r.stderr.strip() or r.stdout.strip())
-    return errs
-
-def set_v4l2_scalar(device, name, value):
-    if not have_v4l2ctl():
-        return ["v4l2-ctl indisponível"]
-    r = subprocess.run(["v4l2-ctl", f"--device={device}", f"--set-ctrl={name}={int(value)}"], capture_output=True, text=True)
-    if r.returncode != 0:
-        return [r.stderr.strip() or r.stdout.strip()]
-    return []
-
-# ----------------- Overlays no preview -----------------
-def draw_overlays(img):
-    md = get_motion()
-    motion_boxes, ai_boxes, roi, show = md.get_overlays()
-    if not show:
-        return img
-    if roi is not None:
-        h, w = img.shape[:2]
-        x = int(roi[0]*w); y = int(roi[1]*h)
-        rw = int(roi[2]*w); rh = int(roi[3]*h)
-        cv2.rectangle(img, (x,y), (x+rw,y+rh), (0,255,0), 2)
-        cv2.putText(img, "ROI", (x, max(0,y-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1, cv2.LINE_AA)
-    for (x,y,w0,h0) in motion_boxes:
-        cv2.rectangle(img, (x,y), (x+w0,y+h0), (0,0,255), 2)
-    if motion_boxes:
-        cv2.putText(img, f"motion:{len(motion_boxes)}", (10,20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2, cv2.LINE_AA)
-    for (x,y,w0,h0,label) in ai_boxes:
-        cv2.rectangle(img, (x,y), (x+w0,y+h0), (255,128,0), 2)
-        cv2.putText(img, label, (x, max(0,y-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,128,0), 1, cv2.LINE_AA)
-    return img
-
-# ----------------- Viewers -----------------
-VIEWER_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>{{ title }}</title>
-<style>
-body {
-  margin: 0;
-  background: rgba(0,0,0,0.95);
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  height: 100vh;
-  overflow: hidden;
-  cursor: zoom-out;
-}
-#closeBtn {
-  position: fixed;
-  top: 20px;
-  right: 25px;
-  background: rgba(0,0,0,0.6);
-  color: white;
-  border: none;
-  border-radius: 50%;
-  width: 40px;
-  height: 40px;
-  font-size: 26px;
-  line-height: 40px;
-  cursor: pointer;
-  z-index: 9999;
-}
-#closeBtn:hover {
-  background: rgba(255,0,0,0.8);
-}
-#viewer {
-  max-width: 95vw;
-  max-height: 90vh;
-  border-radius: 6px;
-  box-shadow: 0 0 25px rgba(255,255,255,0.1);
-  cursor: default;
-}
-.overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0,0,0,0.95);
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  z-index: 1000;
-}
-</style>
-</head>
-<body>
-<div class="overlay" id="overlay">
-  <button id="closeBtn" title="Fechar">×</button>
-  {% if kind == 'video' %}
-    <video id="viewer" src="{{ src }}" controls autoplay playsinline preload="metadata" type="{{ mimetype }}"></video>
-  {% else %}
-    <img id="viewer" src="{{ src }}">
-  {% endif %}
-</div>
-<script>
-const overlay = document.getElementById('overlay');
-const closeBtn = document.getElementById('closeBtn');
-const viewer = document.getElementById('viewer');
-
-function closeViewer() {
-  window.close(); // se estiver em janela separada
-  try {
-    if (window.opener) window.opener.focus();
-  } catch(e) {}
-}
-
-closeBtn.onclick = closeViewer;
-
-// Fechar com tecla ESC
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeViewer(); });
-
-// Fechar ao clicar fora da imagem/vídeo
-overlay.addEventListener('click', e => {
-  if (!viewer.contains(e.target) && e.target !== closeBtn) closeViewer();
-});
-</script>
-</body>
-</html>
-"""
+app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
 
 
-
-# ----------------- Rotas principais -----------------
-@app.route("/")
+@app.get("/")
 def index():
-    return render_template_string(HTML, evo_instance=EVO_API_INSTANCE)
+    basepath = request.headers.get("X-Forwarded-Prefix") or (request.script_root or "")
+    return render_template_string(HTML, basepath=basepath)
 
-@app.route("/video_feed")
+
+@app.get("/api/devices")
+def api_devices():
+    if "linux" in platform.system().lower():
+        devs = scan_linux_cams()
+    else:
+        devs = []
+        for i in range(6):
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                devs.append(str(i))
+                cap.release()
+    return jsonify(devices=devs)
+
+@app.get("/api/audio")
+def api_audio():
+    alsa = list_alsa_capture_devices()
+    pulse = list_pulse_sources()
+    return jsonify(alsa=alsa, pulse=pulse)
+
+@app.get("/video_feed")
 def video_feed():
-    cam = get_cam()
-    overlay = request.args.get("overlay") == "1"
-    q = request.args.get("q")
-    if q and q.isdigit():
-        cam.jpeg_quality = int(q)
+    dev = request.args.get("dev")
+    if not dev: return Response("falta dev", status=400)
+    try:
+        cam = get_cam(dev)
+    except Exception as e:
+        return Response(str(e), status=503)
+
     boundary = "frame"
     def gen():
         while True:
-            jpeg = cam.get_jpeg(with_overlay=overlay)
-            if jpeg is None:
-                time.sleep(0.01); continue
-            yield (b"--" + boundary.encode() + b"\r\n"
+            jpg = cam.get_jpeg()
+            if jpg is None:
+                time.sleep(0.03); continue
+            yield (b"--"+boundary.encode()+b"\r\n"
                    b"Content-Type: image/jpeg\r\n"
-                   b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n" +
-                   jpeg + b"\r\n")
+                   b"Content-Length: "+str(len(jpg)).encode()+b"\r\n\r\n"+jpg+b"\r\n")
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
-@app.route("/snapshot", methods=["POST"])
-def snapshot():
-    cam = get_cam()
-    img = cam.get_frame()
-    if img is None:
-        return jsonify(ok=False, error="Sem frame")
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    path = os.path.join(MEDIA_DIRS["photos"], f"photo-{ts}.jpg")
-    cv2.imwrite(path, img)
-    make_thumb(path)
-    timeline_add("photo", title=os.path.basename(path), link=f"/media/photos/{os.path.basename(path)}", thumb=f"/media/thumbs/{os.path.basename(path)}")
-    return jsonify(ok=True, path=path)
-
-# ----------- Dispositivo/formatos -----------
-@app.route("/api/devices")
-def api_devices():
-    devs = sorted(glob.glob("/dev/video*"))
-    cam = None; w=h=fps=None; fourcc=None
-    try:
-        cam = get_cam()
-        w = int(cam.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cam.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = int(cam.cap.get(cv2.CAP_PROP_FPS) or DEFAULT_FPS)
-        fc = int(cam.cap.get(cv2.CAP_PROP_FOURCC))
-        fourcc = "".join([chr((fc >> 8*i) & 0xFF) for i in range(4)])
-    except Exception:
-        pass
-    return jsonify(devices=devs or ["0"], current=DEFAULT_DEVICE if cam is None else DEFAULT_DEVICE, width=w or DEFAULT_W, height=h or DEFAULT_H, fps=fps or int(DEFAULT_FPS), fourcc=fourcc or DEFAULT_FOURCC)
-
-@app.route("/api/formats")
-def api_formats():
-    device = request.args.get("device", DEFAULT_DEVICE)
-    return list_formats(device)
-
-@app.route("/api/open", methods=["POST"])
-def api_open():
-    data = request.get_json(force=True, silent=True) or {}
-    device = data.get("device", DEFAULT_DEVICE)
-    width = int(data.get("width", DEFAULT_W))
-    height = int(data.get("height", DEFAULT_H))
-    fps = float(data.get("fps", DEFAULT_FPS))
-    fourcc = data.get("fourcc", DEFAULT_FOURCC) or DEFAULT_FOURCC
-    try:
-        reopen_cam(device, width, height, fps, fourcc)
-        return jsonify(ok=True)
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
-
-# ----------- Controles de imagem -----------
-@app.route("/api/controls", methods=["POST"])
-def api_controls():
-    data = request.get_json(force=True, silent=True) or {}
-    cam = get_cam()
-    if "jpeg_quality" in data: cam.jpeg_quality = int(data["jpeg_quality"])
-    brightness = data.get("brightness"); contrast = data.get("contrast"); exposure = data.get("exposure"); auto_exposure = data.get("auto_exposure")
-    errs = cam.set_basic_props(brightness=brightness, contrast=contrast, exposure=exposure, auto_exposure=auto_exposure)
-    dev_field = os.environ.get("CAM_DEVICE", DEFAULT_DEVICE)
-    if auto_exposure is True: errs += set_v4l2_exposure(dev_field, auto=True)
-    if auto_exposure is False: errs += set_v4l2_exposure(dev_field, auto=False)
-    if exposure is not None and (auto_exposure is False or auto_exposure is None): errs += set_v4l2_exposure(dev_field, absolute=exposure)
-    if brightness is not None: errs += set_v4l2_scalar(dev_field, "brightness", brightness)
-    if contrast is not None: errs += set_v4l2_scalar(dev_field, "contrast", contrast)
-    if errs: return jsonify(ok=False, error="; ".join([e for e in errs if e])), 200
-    return jsonify(ok=True)
-
-@app.route("/api/rotate", methods=["POST"])
-def api_rotate():
-    data = request.get_json(force=True, silent=True) or {}
-    deg = int(data.get("deg", 0))
-    get_cam().set_rotate(deg)
-    return jsonify(ok=True, deg=deg)
-
-# ----------- Gravação (config + start/stop) -----------
-@app.route("/api/record/config", methods=["GET", "POST"])
-def api_record_config():
-    global _recorder
-    get_cam()
-    if request.method == "GET":
-        return jsonify(_recorder.get_config())
-    data = request.get_json(force=True, silent=True) or {}
-    try:
-        _recorder.config(codec=data.get("codec"), fps=data.get("fps"), scale=data.get("scale"), realtime=data.get("realtime"))
-        return jsonify(ok=True)
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 400
-
-@app.route("/api/record/start", methods=["POST"])
-def api_record_start():
-    global _recorder
-    get_cam()
-    try:
-        path = _recorder.start()
-        return jsonify(ok=True, file=os.path.basename(path))
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
-
-@app.route("/api/record/stop", methods=["POST"])
-def api_record_stop():
-    global _recorder
-    try:
-        path = _recorder.stop()
-        if not path: return jsonify(ok=False, error="Não estava gravando"), 400
-        return jsonify(ok=True, file=os.path.basename(path))
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
-
-# ----------- Foto direta -----------
-@app.route("/api/photo", methods=["POST"])
+@app.post("/api/photo")
 def api_photo():
-    cam = get_cam()
-    img = cam.get_frame()
-    if img is None: return jsonify(ok=False, error="Sem frame")
+    data = request.get_json(silent=True) or {}
+    dev = data.get("dev") or request.args.get("dev")
+    if not dev: return jsonify(ok=False, error="falta dev"), 400
+    cam = get_cam(dev)
+    frame = cam.last_frame()
+    if frame is None: return jsonify(ok=False, error="sem frame"), 503
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = os.path.join(MEDIA_DIRS["photos"], f"photo-{ts}.jpg")
-    cv2.imwrite(path, img)
-    make_thumb(path)
-    timeline_add("photo", title=os.path.basename(path), link=f"/media/photos/{os.path.basename(path)}", thumb=f"/media/thumbs/{os.path.basename(path)}")
-    return jsonify(ok=True, file=os.path.basename(path))
+    name = f"photo-user-{sanitize_dev(dev)}-{ts}.jpg"
+    path = os.path.join(MEDIA["photos"], name)
+    cv2.imwrite(path, frame)
+    make_thumb_image(path)
+    return jsonify(ok=True, file=name)
 
-# ----------- Timelapse (sem pasta) -----------
-@app.route("/api/timelapse/start", methods=["POST"])
-def api_timelapse_start():
-    global _timelapse
-    data = request.get_json(force=True, silent=True) or {}
-    interval = int(data.get("interval", 5))
+@app.post("/api/record/start")
+def api_rec_start():
+    data = request.get_json(silent=True) or {}
+    dev = data.get("dev")
+    mic = data.get("mic")
+    if not dev: return jsonify(ok=False, error="falta dev"), 400
+    _ = get_cam(dev)
+    if not mic:
+        mic = get_cam_cfg(dev).get("mic","default")
     try:
-        ok = _timelapse.start(interval)
-        return jsonify(ok=bool(ok))
+        fname = REC.start(dev, mic=mic, owner="user")
+        return jsonify(ok=True, file=fname)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
 
-@app.route("/api/timelapse/stop", methods=["POST"])
-def api_timelapse_stop():
-    global _timelapse
+@app.post("/api/record/stop")
+def api_rec_stop():
+    data = request.get_json(silent=True) or {}
+    dev = data.get("dev")
+    if not dev: return jsonify(ok=False, error="falta dev"), 400
     try:
-        was_running = _timelapse.stop()
-        if not was_running:
-            return jsonify(ok=False, error="Timelapse não estava ativo"), 400
-        return jsonify(ok=True)
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
-
-# ----------- YOLO config -----------
-@app.route("/api/motion/yolo/config", methods=["GET","POST"])
-def api_motion_yolo_config():
-    y = get_yolo()
-    if request.method == "GET":
-        return jsonify(y.get_config())
-    data = request.get_json(force=True, silent=True) or {}
-    try:
-        y.configure(enable=data.get("enable"), gate=data.get("gate"), conf=data.get("conf"), nms=data.get("nms"),
-                    targets=data.get("targets"), backend=data.get("backend"), paths=data.get("paths"))
-        return jsonify(ok=True)
+        # force=True para sempre parar, mesmo se iniciou por movimento
+        fname = REC.stop(dev, owner="user", force=True)
+        if fname:
+            frame = get_cam(dev).last_frame()
+            make_thumb_from_frame(frame, os.path.join(MEDIA["videos"], fname))
+        return jsonify(ok=True, file=fname)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 400
 
-# ----------- Motion config/ROI/overlay -----------
-@app.route("/api/motion/config", methods=["GET","POST"])
-def api_motion_config():
-    md = get_motion()
-    if request.method == "GET":
-        return jsonify(md.get_config())
-    data = request.get_json(force=True, silent=True) or {}
-    try:
-        md.set_config(enable=data.get("enable"), action=data.get("action"), duration=data.get("duration"),
-                      sensitivity=data.get("sensitivity"), min_area=data.get("min_area"), cooldown=data.get("cooldown"))
-        return jsonify(ok=True)
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 400
+@app.get("/api/media")
+def api_media():
+    def _parse_d(s):
+        try: return datetime.strptime(s, "%Y-%m-%d").date()
+        except Exception: return None
+    start_d = _parse_d(request.args.get("start", "") or "")
+    end_d   = _parse_d(request.args.get("end", "") or "")
 
-@app.route("/api/motion/roi", methods=["GET","POST"])
-def api_motion_roi():
-    md = get_motion()
-    if request.method == "GET":
-        return jsonify(md.get_roi() or {})
-    data = request.get_json(force=True, silent=True) or {}
-    if not data:
-        md.set_roi(None); return jsonify(ok=True)
-    md.set_roi(data); return jsonify(ok=True)
+    by_cam = {}
 
-@app.route("/api/motion/overlay", methods=["POST"])
-def api_motion_overlay():
-    md = get_motion()
-    data = request.get_json(force=True, silent=True) or {}
-    md.set_overlays(data.get("show"))
-    return jsonify(ok=True)
+    for p in sorted(glob.glob(os.path.join(MEDIA["videos"], "*.mp4")), reverse=True):
+        if not in_date_range(p, start_d, end_d): continue
+        name = os.path.basename(p)
+        origin, cam = parse_info_from_name(name)
+        t = os.path.join(MEDIA["thumbs"], os.path.splitext(name)[0]+".jpg")
+        bc = by_cam.setdefault(cam, {"videos_user": [], "videos_motion": [], "photos_user": [], "photos_motion": [], "timelapse": []})
+        item = {"name": name, "url": f"/media/videos/{name}", "thumb": f"/media/thumbs/{os.path.basename(t)}" if os.path.isfile(t) else ""}
+        if origin == "motion": bc["videos_motion"].append(item)
+        else: bc["videos_user"].append(item)
 
-# ----------- Evolution API endpoints -----------
-@app.route("/api/evo/config", methods=["GET","POST"])
-def api_evo_config():
-    if request.method == "GET":
-        return jsonify(evo_get_cfg())
-    data = request.get_json(force=True, silent=True) or {}
-    enable = bool(data.get("enable", False))
-    phones = data.get("phones", [])
-    if isinstance(phones, str):
-        phones = [p.strip() for p in phones.split(",")]
-    phones = [ _normalize_phone(p) for p in phones if p ]
-    public_base = (data.get("public_base") or "").strip()
-    with _evo_lock:
-        _evo_cfg["enable"] = enable
-        _evo_cfg["phones"] = phones
-        _evo_cfg["public_base"] = public_base
-    _evo_save()
-    return jsonify(ok=True)
+    for p in sorted(glob.glob(os.path.join(MEDIA["photos"], "*.jpg")), reverse=True):
+        if not in_date_range(p, start_d, end_d): continue
+        name = os.path.basename(p)
+        origin, cam = parse_info_from_name(name)
+        t = os.path.join(MEDIA["thumbs"], name)
+        if not os.path.isfile(t):
+            make_thumb_image(p)
+        bc = by_cam.setdefault(cam, {"videos_user": [], "videos_motion": [], "photos_user": [], "photos_motion": [], "timelapse": []})
+        item = {"name": name, "url": f"/media/photos/{name}", "thumb": f"/media/thumbs/{name}"}
+        if origin == "motion": bc["photos_motion"].append(item)
+        elif origin == "timelapse": bc["timelapse"].append(item)
+        else: bc["photos_user"].append(item)
 
-@app.route("/api/evo/test", methods=["POST"])
-def api_evo_test():
-    # tira uma foto atual e envia
-    cam = get_cam()
-    img = cam.get_frame()
-    if img is None:
-        return jsonify(ok=False, error="Sem frame")
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = os.path.join(MEDIA_DIRS["photos"], f"evo-test-{ts}.jpg")
-    cv2.imwrite(path, img)
-    make_thumb(path)
-    # não adiciono na timeline para não poluir; se quiser, pode adicionar
-    sent = evo_send_photo_to_many(path, caption=f"Teste Evolution {ts}")
-    return jsonify(ok=True, sent=sent, file=os.path.basename(path))
+    cams = sorted(by_cam.keys())
+    return jsonify(by_camera=by_cam, cameras=cams)
 
-# ----------- API de Timeline: listagem, exclusão -----------
-@app.route("/api/timeline")
-def api_timeline():
-    limit = int(request.args.get("limit", 100))
-    tf = request.args.get("type", "").strip() or None
-    start_s = request.args.get("start", "").strip() or None  # YYYY-MM-DD
-    end_s = request.args.get("end", "").strip() or None
-    start_d = _parse_date_yyyy_mm_dd(start_s) if start_s else None
-    end_d = _parse_date_yyyy_mm_dd(end_s) if end_s else None
-    items = timeline_list(limit=limit, type_filter=tf, start_date=start_d, end_date=end_d)
-    return jsonify(items=items)
-
-@app.route("/api/timeline/delete", methods=["POST"])
-def api_timeline_delete():
-    data = request.get_json(force=True, silent=True) or {}
-    ids = set(data.get("ids", []))
-    delete_files = bool(data.get("delete_files", True))
-    if not ids:
-        return jsonify(ok=False, error="ids vazios"), 400
-
-    with _timeline_lock:
-        if not os.path.isfile(EVENTS_FILE):
-            return jsonify(ok=True, deleted=[])
-        events = []
-        deleted = []
-        with open(EVENTS_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line: continue
-                try:
-                    ev = json.loads(line)
-                    ev_id = ev.get("id") or event_id(ev)
-                    if ev_id in ids:
-                        if delete_files:
-                            remove_files_for_event(ev)
-                        deleted.append(ev_id)
-                        continue
-                    else:
-                        events.append(ev)
-                except Exception:
-                    events.append(line)
-
-        with open(EVENTS_FILE, "w", encoding="utf-8") as f:
-            for ev in events:
-                if isinstance(ev, dict):
-                    f.write(json.dumps(ev, ensure_ascii=False) + "\\n")
+@app.post("/api/media/delete")
+def api_media_delete():
+    data = request.get_json(silent=True) or {}
+    items = data.get("items") or []
+    if not isinstance(items, list) or not items:
+        return jsonify(ok=False, error="items vazios"), 400
+    deleted = 0
+    for it in items:
+        kind = (it.get("kind") or "").strip()
+        name = (it.get("name") or "").strip()
+        if kind not in ("photos","videos"): continue
+        if "/" in name or "\\" in name: continue
+        base_dir = MEDIA[kind]
+        path = os.path.join(base_dir, name)
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                deleted += 1
+                # apagar thumb
+                if kind == "photos":
+                    t = os.path.join(MEDIA["thumbs"], name if name.lower().endswith(".jpg") else os.path.splitext(name)[0]+".jpg")
+                    if os.path.isfile(t): os.remove(t)
                 else:
-                    f.write(str(ev) + "\\n")
+                    t = os.path.join(MEDIA["thumbs"], os.path.splitext(name)[0]+".jpg")
+                    if os.path.isfile(t): os.remove(t)
+        except Exception:
+            pass
+    return jsonify(ok=True, deleted=deleted)
 
-    return jsonify(ok=True, deleted=deleted, kept=len(events))
-
-# ----------- Servir vídeo com suporte a Range -----------
-def _guess_mime(name):
-    mime, _ = mimetypes.guess_type(name)
-    if not mime:
-        ext = os.path.splitext(name)[1].lower()
-        if ext == ".avi": return "video/x-msvideo"
-        if ext == ".mkv": return "video/x-matroska"
-        if ext == ".mov": return "video/quicktime"
-        return "application/octet-stream"
-    return mime
-
-@app.route("/media/videos/<path:name>")
-def media_video(name):
-    path = os.path.join(MEDIA_DIRS["videos"], name)
-    if not os.path.isfile(path):
-        abort(404)
-
-    file_size = os.path.getsize(path)
-    mime = _guess_mime(name)
-    range_header = request.headers.get("Range")
-
-    # Sem Range → envia o arquivo inteiro
-    if not range_header:
-        with open(path, "rb") as f:
-            data = f.read()
-        resp = Response(data, status=200, mimetype=mime)
-        resp.headers["Accept-Ranges"] = "bytes"
-        resp.headers["Content-Length"] = str(file_size)
-        return resp
-
-    # Com Range → parse robusto (inclui sufixo bytes=-N)
-    try:
-        units, rng = range_header.split("=", 1)
-        if units.strip().lower() != "bytes":
-            raise ValueError("unidades inválidas")
-
-        start_str, end_str = rng.split("-", 1)
-        if start_str == "":  # sufixo: bytes=-N (últimos N bytes)
-            suffix = int(end_str)
-            if suffix <= 0:
-                raise ValueError("sufixo inválido")
-            start = max(0, file_size - suffix)
-            end = file_size - 1
-        else:
-            start = int(start_str)
-            end = int(end_str) if end_str else (file_size - 1)
-
-        # Normalizações e validações
-        if start < 0 or end < 0:
-            raise ValueError("range negativo")
-        if start >= file_size:
-            # Fora do arquivo: 416 com Content-Range indicando tamanho
-            rv = Response(status=416)
-            rv.headers["Content-Range"] = f"bytes */{file_size}"
-            rv.headers["Accept-Ranges"] = "bytes"
-            return rv
-        end = min(end, file_size - 1)
-        if end < start:
-            rv = Response(status=416)
-            rv.headers["Content-Range"] = f"bytes */{file_size}"
-            rv.headers["Accept-Ranges"] = "bytes"
-            return rv
-
-        length = end - start + 1
-
-        def generate():
-            with open(path, "rb") as f:
-                f.seek(start)
-                remaining = length
-                chunk = 1024 * 1024
-                while remaining > 0:
-                    read_len = chunk if remaining > chunk else remaining
-                    data = f.read(read_len)
-                    if not data:
-                        break
-                    yield data
-                    remaining -= len(data)
-
-        rv = Response(generate(), status=206, mimetype=mime, direct_passthrough=True)
-        rv.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-        rv.headers["Accept-Ranges"] = "bytes"
-        rv.headers["Content-Length"] = str(length)
-        return rv
-
-    except Exception:
-        # Range malformado → 416 com tamanho total
-        rv = Response(status=416)
-        rv.headers["Content-Range"] = f"bytes */{file_size}"
-        rv.headers["Accept-Ranges"] = "bytes"
-        return rv
-
-
-# ----------- Servir outras mídias -----------
-@app.route("/media/<path:kind>/<path:name>")
-def media_serve(kind, name):
-    base = MEDIA_DIRS.get(kind)
-    if not base:
-        return "Not found", 404
+@app.get("/media/<path:kind>/<path:name>")
+def media(kind, name):
+    base = MEDIA.get(kind)
+    if not base: abort(404)
     return send_from_directory(base, name)
 
-# ----------- Viewer -----------
-@app.route("/viewer/video/<path:name>")
-def viewer_video(name):
-    path = os.path.join(MEDIA_DIRS["videos"], name)
-    if not os.path.isfile(path): abort(404)
-    return render_template_string(VIEWER_HTML, title=f"Vídeo - {name}", kind="video", src=f"/media/videos/{name}")
+# -------- Config/Timelapse/UI/Motion --------
+@app.get("/api/config")
+def api_config_get():
+    with CFG_LOCK:
+        return jsonify(CFG)
 
-# Encerramento limpo
+@app.post("/api/config")
+def api_config_post():
+    data = request.get_json(silent=True) or {}
+    dev = data.get("dev")
+    if dev:
+        updates = {}
+        if "mic" in data: updates["mic"] = data["mic"]
+        if "timelapse" in data and isinstance(data["timelapse"], dict):
+            t = {}
+            if "enable" in data["timelapse"]: t["enable"] = bool(data["timelapse"]["enable"])
+            if "interval" in data["timelapse"]: t["interval"] = int(data["timelapse"]["interval"])
+            updates["timelapse"] = t
+        if "motion" in data and isinstance(data["motion"], dict):
+            m = {}
+            if "enable" in data["motion"]: m["enable"] = bool(data["motion"]["enable"])
+            if "sensitivity" in data["motion"]: m["sensitivity"] = int(data["motion"]["sensitivity"])
+            if "min_area_pct" in data["motion"]: m["min_area_pct"] = int(data["motion"]["min_area_pct"])
+            if "action" in data["motion"]: m["action"] = data["motion"]["action"] if data["motion"]["action"] in ("photo","video") else "photo"
+            if "overlay" in data["motion"]: m["overlay"] = bool(data["motion"]["overlay"])
+            if "cooldown" in data["motion"]: m["cooldown"] = int(data["motion"]["cooldown"])
+            if "clip_len" in data["motion"]: m["clip_len"] = int(data["motion"]["clip_len"])
+            updates["motion"] = m
+
+        set_cam_cfg(dev, updates)
+
+        # timelapse apply
+        tl = get_timer(dev)
+        tcfg = get_cam_cfg(dev).get("timelapse", {})
+        if tcfg.get("enable"):
+            tl.start(tcfg.get("interval",5))
+        else:
+            tl.stop()
+
+        # motion controller update
+        get_motion_ctrl(dev).update_cfg()
+        return jsonify(ok=True)
+
+    ui = data.get("ui")
+    if isinstance(ui, dict):
+        updates = {}
+        if "preview_size" in ui:
+            sz = str(ui["preview_size"]).lower()
+            if sz not in ("small","medium","large","xlarge","xxlarge"):
+                return jsonify(ok=False, error="preview_size inválido"), 400
+            updates["preview_size"] = sz
+        if "library_view" in ui:
+            lv = str(ui["library_view"]).lower()
+            if lv not in ("grid","list"):
+                return jsonify(ok=False, error="library_view inválido"), 400
+            updates["library_view"] = lv
+
+        if "selected_devs" in ui:
+            sd = ui["selected_devs"]
+            if not isinstance(sd, (list, tuple)):
+                return jsonify(ok=False, error="selected_devs inválido"), 400
+        # normaliza para strings
+            updates["selected_devs"] = [str(s) for s in sd]
+
+        if updates:
+            set_ui_cfg(updates)
+            return jsonify(ok=True)
+    return jsonify(ok=False, error="payload inválido"), 400
+
+
+@app.post("/api/timelapse/start")
+def api_tl_start():
+    data = request.get_json(silent=True) or {}
+    dev = data.get("dev"); interval = int(data.get("interval",5))
+    if not dev: return jsonify(ok=False, error="falta dev"), 400
+    set_cam_cfg(dev, {"timelapse":{"enable": True, "interval": interval}})
+    get_timer(dev).start(interval)
+    return jsonify(ok=True)
+
+@app.post("/api/timelapse/stop")
+def api_tl_stop():
+    data = request.get_json(silent=True) or {}
+    dev = data.get("dev")
+    if not dev: return jsonify(ok=False, error="falta dev"), 400
+    set_cam_cfg(dev, {"timelapse":{"enable": False}})
+    get_timer(dev).stop()
+    return jsonify(ok=True)
+
 def _cleanup():
-    global _cam, _motion
-    try:
-        if _motion: _motion.stop()
-    except:
-        pass
-    try:
-        if _cam: _cam.stop()
-    except:
-        pass
+    for c in list(CAMS.values()):
+        try: c.stop()
+        except: pass
+    for t in list(TIMERS.values()):
+        try: t.stop()
+        except: pass
+    for m in list(MOTIONS.values()):
+        try: m.stop()
+        except: pass
 
-import atexit
-atexit.register(_cleanup)
+import atexit; atexit.register(_cleanup)
 
 if __name__ == "__main__":
-    _evo_load()  # carrega config Evolution
-    get_cam()    # garante inicialização do stream
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), threaded=True)
+    _cfg_load()
+    # timelapse auto-start
+    for dev, dat in list(CFG.get("cameras", {}).items()):
+        tl = dat.get("timelapse", {})
+        if tl.get("enable"):
+            get_timer(dev).start(tl.get("interval",5))
+    app.run("0.0.0.0", 5000, threaded=True)
+EOF
+
+
+
+
+
+
+tee /etc/systemd/system/mirakocam.service >/dev/null <<'EOF'
+[Unit]
+Description=MirakoCAM Flask Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/
+ExecStart=/usr/bin/python3 /root/app.py
+Restart=always
+RestartSec=5
+Environment=PORT=5000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+
+
+
+
+
+sudo systemctl daemon-reload
+sudo systemctl enable mirakocam
+sudo systemctl start mirakocam
+sudo systemctl restart mirakocam
+
+
+
+
+
+sudo systemctl status mirakocam
+sudo journalctl -fu mirakocam
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

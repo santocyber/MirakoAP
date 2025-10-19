@@ -1,0 +1,33 @@
+
+services:
+  ocr:
+    image: paddlepaddle/paddle:3.1.0
+    container_name: paddleocr-hubserving
+    working_dir: /opt/PaddleOCR
+    ports:
+      - "8868:8868"
+    shm_size: "1g"
+    volumes:
+      - ./PaddleOCR:/opt/PaddleOCR           # clone do repo oficial aqui
+      - paddlehub-cache:/root/.paddlehub     # cache do Hub (evita reinstalar)
+    command: >
+      bash -lc "
+        apt-get update && apt-get install -y --no-install-recommends wget ca-certificates && rm -rf /var/lib/apt/lists/* &&
+        python -m pip install --no-cache-dir --upgrade pip &&
+        pip install --no-cache-dir paddlehub==2.1.0 paddleocr &&
+        mkdir -p inference && cd inference &&
+        wget -q https://paddleocr.bj.bcebos.com/PP-OCRv3/chinese/ch_PP-OCRv3_det_infer.tar && tar xf ch_PP-OCRv3_det_infer.tar &&
+        wget -q https://paddleocr.bj.bcebos.com/PP-OCRv3/chinese/ch_PP-OCRv3_rec_infer.tar && tar xf ch_PP-OCRv3_rec_infer.tar &&
+        wget -q https://paddleocr.bj.bcebos.com/dygraph_v2.0/ch/ch_ppocr_mobile_v2.0_cls_infer.tar && tar xf ch_ppocr_mobile_v2.0_cls_infer.tar &&
+        cd /opt/PaddleOCR &&
+        hub install deploy/hubserving/ocr_system/ &&
+        hub serving start -m ocr_system --port 8868 --use_multiprocess --workers 2
+      "
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "curl -sf http://127.0.0.1:8868/predict/ocr_system >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  paddlehub-cache:

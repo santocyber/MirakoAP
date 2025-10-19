@@ -1,0 +1,22 @@
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    ports:
+      - "8888:8080"
+    env_file:
+      - .env
+    volumes:
+      - ./settings.yml:/etc/searxng/settings.yml:ro   # monta só o settings
+      - searxng-data:/var/lib/searxng
+    restart: unless-stopped
+    networks:
+      - searxng-net
+
+networks:
+  searxng-net:
+    driver: bridge
+
+volumes:
+  searxng-data:

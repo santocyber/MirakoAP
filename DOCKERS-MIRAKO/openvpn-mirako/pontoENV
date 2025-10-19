@@ -1,0 +1,7 @@
+VERSION=latest
+CONTAINER_NAME=CONTAINER_NAME
+HOST_IP=0.0.0.0
+OPENVPN_UDP_PORT=1194
+CPUS=2
+MEMORY_LIMIT=2000MB
+APP_PATH=/www/dk_project/dk_app/openvpn/openvpn_mirako

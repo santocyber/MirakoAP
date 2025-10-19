@@ -1,0 +1,17 @@
+
+services:
+  whisper-asr:
+    image: onerahmet/openai-whisper-asr-webservice:latest
+    environment:
+      # Modelo Whisper a usar: tiny, base, small, medium ou large
+      ASR_MODEL: base  
+      # Motor de transcrição: openai_whisper ou faster_whisper
+      ASR_ENGINE: openai_whisper  
+    ports:
+      - "9000:9000"      # expõe a API na porta 9000
+    volumes:
+      # persiste o cache do modelo para não baixar a cada inicialização
+      - whisper-cache:/root/.cache
+
+volumes:
+  whisper-cache:

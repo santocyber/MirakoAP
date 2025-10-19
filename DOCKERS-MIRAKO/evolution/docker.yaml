@@ -1,0 +1,65 @@
+services:
+  api:
+    container_name: evolution_api
+    image: evoapicloud/evolution-api:latest
+    restart: always
+    depends_on:
+      - postgres
+    env_file:
+      - .env
+    ports:
+      - "9090:9090"
+    volumes:
+      - evolution_instances:/evolution/instances
+    networks:
+      - evolution-net
+
+  postgres:
+    container_name: postgres
+    image: postgres:15
+    restart: always
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=1000"
+      - "-c"
+      - "listen_addresses=*"
+      - "-c"
+      - "port=5433"
+    environment:
+      POSTGRES_USER: evolution
+      POSTGRES_PASSWORD: securepassword
+      POSTGRES_DB: evolution
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5433:5433"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - evolution-net
+
+volumes:
+  evolution_instances:
+  postgres_data:
+
+networks:
+  evolution-net:
+    driver: bridge
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+

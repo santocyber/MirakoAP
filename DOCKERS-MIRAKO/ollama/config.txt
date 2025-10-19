@@ -1,0 +1,8 @@
+curl -sS -N -X POST http://jesus2.mirako.org:11434/api/pull \
+  -H "Content-Type: application/json" \
+  -d '{"name":"qwen2.5vl:latest"}'
+
+
+
+
+curl -sS http://jesus2.mirako.org:11434/api/tags | jq

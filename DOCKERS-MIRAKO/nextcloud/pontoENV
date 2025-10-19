@@ -1,0 +1,20 @@
+# Versão do Nextcloud
+VERSION=29.0.4
+
+# Configurações do MySQL
+MYSQL_ROOT_PASSWORD=3PiZb6F2dw64N6kB
+MYSQL_DATABASE=3DWzjz338aN7Wi8p
+MYSQL_USER=TEhbs2Z8sSabfPwe
+MYSQL_PASSWORD=3PiZb6F2dw64N6kB
+
+# Configurações de Rede e Portas
+HOST_IP=0.0.0.0
+NEXTCLOUD_PORT=15382
+MYSQL_PORT=3306
+
+# Recursos do Container
+CPUS=2
+MEMORY_LIMIT=2000MB
+
+# Caminho para dados persistentes
+APP_PATH=/www/nextcloud/nextcloud_jone

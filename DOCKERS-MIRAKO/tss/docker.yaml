@@ -1,0 +1,14 @@
+services:
+  kokoro:
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:v0.2.4
+    container_name: kokoro_tts
+    ports:
+      - "8880:8880"
+    environment:
+      - DEVICE=cpu
+      - DOWNLOAD_MODEL=true
+      - ONNX_NUM_THREADS=8
+      - ONNX_INTER_OP_THREADS=4
+    restart: always
+    volumes:
+      - ./shared:/app/shared

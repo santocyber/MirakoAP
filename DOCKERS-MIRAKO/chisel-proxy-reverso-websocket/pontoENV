@@ -1,0 +1,8 @@
+# Porta interna do chisel server na VPS
+CHISEL_PORT=6000
+
+# Usuário:senha para autenticação (server --auth / client --auth)
+CHISEL_AUTH=camai:123456
+
+# Keepalive para manter o WS vivo através de proxies
+CHISEL_KEEPALIVE=25s

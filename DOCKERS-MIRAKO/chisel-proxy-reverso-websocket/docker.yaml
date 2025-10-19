@@ -1,0 +1,18 @@
+services:
+  chisel-server:
+    image: jpillora/chisel:latest
+    container_name: chisel-server
+    restart: unless-stopped
+    env_file: .env
+    network_mode: host
+    command:
+      - server
+      - --reverse
+      - --host
+      - 0.0.0.0            # aceita cliente direto em camai.mirako.org:6000
+      - --port
+      - "${CHISEL_PORT}"
+      - --auth
+      - "${CHISEL_AUTH}"
+      - --keepalive
+      - "${CHISEL_KEEPALIVE}"

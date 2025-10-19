@@ -683,6 +683,117 @@ def wifi_connect(ssid, password=None, persist=False):
 
     return {"ok": ok, "ip4": (ip or None), "msg": msg}
 
+# ------------------ Systemd services (scan + actions) ------------------
+SYS_UNIT_IGNORE_PREFIXES = (
+    "systemd-", "user@", "session-", "dbus-", "getty@", "dev-", "sysinit.", "basic.",
+    "rescue.", "emergency.", "-.mount", "network-online.target", "graphical.target",
+)
+
+def _svc_list_units():
+    """
+    Lista unidades de serviço com estados 'Active' e descrição.
+    """
+    out = sh("systemctl list-units --type=service --all --no-legend --no-pager")
+    rows = []
+    for line in (out or "").splitlines():
+        # Ex.: "cron.service           loaded active running Regular background program processing daemon"
+        parts = line.split(None, 4)
+        if len(parts) < 4: 
+            continue
+        unit, load, active, sub = parts[0], parts[1], parts[2], parts[3]
+        desc = parts[4] if len(parts) > 4 else ""
+        rows.append({
+            "unit": unit, "load": load, "active": active, "sub": sub, "description": desc
+        })
+    return rows
+
+def _svc_list_unit_files():
+    """
+    Lista unit files com estado de habilitação (enabled/disabled/static…)
+    """
+    out = sh("systemctl list-unit-files --type=service --no-legend --no-pager")
+    rows = {}
+    for line in (out or "").splitlines():
+        # Ex.: "cron.service                          enabled"
+        parts = line.split()
+        if len(parts) >= 2:
+            unit = parts[0]
+            state = parts[-1]
+            rows[unit] = state
+    return rows  # dict unit -> enabled_state
+    
+
+def _resolve_enabled_state(unit, unitfiles):
+    """
+    Resolve o estado 'enabled' de uma unit:
+    - tenta correspondência direta (list-unit-files)
+    - tenta o template @.service para instâncias
+    - fallback: systemctl is-enabled <unit>
+    """
+    state = unitfiles.get(unit)
+    if state and state != "unknown":
+        return state
+
+    # instância -> template
+    if "@" in unit and not unit.endswith("@.service"):
+        templ = unit.split("@", 1)[0] + "@.service"
+        state = unitfiles.get(templ)
+        if state:
+            return state
+
+    # fallback: captura valores como enabled-runtime, linked, masked etc.
+    out = sh(f"systemctl is-enabled {unit} || true").strip().lower()
+    return out or "unknown"
+
+
+def systemd_scan_services(include_system=False, q=None):
+    units = _svc_list_units()
+    unitfiles = _svc_list_unit_files()
+    out = []
+    ql = (q or "").lower().strip()
+
+    for u in units:
+        unit = u["unit"]
+        if not include_system:
+            if unit.startswith(SYS_UNIT_IGNORE_PREFIXES):
+                continue
+
+        # 🔧 antes: enabled = unitfiles.get(unit, "unknown")
+        enabled = _resolve_enabled_state(unit, unitfiles)
+
+        item = {
+            "unit": unit,
+            "active": u.get("active"),
+            "sub": u.get("sub"),
+            "enabled": enabled,
+            "description": u.get("description") or "",
+        }
+        if ql:
+            if (ql not in unit.lower()) and (ql not in item["description"].lower()):
+                continue
+        out.append(item)
+
+    def _rank(x):
+        act = x.get("active") in ("active", "activating", "reloading")
+        return (0 if act else 1, x.get("unit", ""))
+    out.sort(key=_rank)
+    return out
+
+
+def systemd_action(unit, action):
+    """
+    Actions: start | stop | restart | enable | disable
+    """
+    unit = (unit or "").strip()
+    if not unit.endswith(".service"):
+        unit += ".service"
+    if action not in ("start","stop","restart","enable","disable"):
+        return {"ok": False, "msg": "ação inválida"}
+    cmd = f"systemctl {action} {unit}"
+    rc = subprocess.run(cmd, shell=True).returncode
+    ok = (rc == 0)
+    return {"ok": ok, "msg": f"{action} {'ok' if ok else 'falhou'}", "unit": unit}
+
 
 # ------------------ Coleta ------------------
 def collect_status():
@@ -714,13 +825,6 @@ def collect_status():
         "wifi_clients": wifi_stations(),
         "dhcp_leases": dhcp_leases(),
         "dns_servers": dns_servers(),
-        "services": {
-            "create_ap": svc_state("create_ap.service"),
-            "server":    svc_state("server.service"),
-            "NetworkManager": svc_state("NetworkManager.service"),
-            "dnsmasq":   svc_state("dnsmasq.service"),
-            "chrony":    svc_state("chrony.service") if os.path.exists("/lib/systemd/system/chrony.service") else "n/a",
-        },
         "tests": net_tests(),
         "lan": lan,
         "modem": modem,
@@ -792,12 +896,14 @@ body{margin:20px;background:var(--bg);color:var(--fg);font-family:system-ui,-app
 h1{margin:.2rem 0}
 h3{margin:.2rem 0 .6rem 0}
 .muted{color:var(--muted)}
-.grid{
+.grid{ 
   display:grid;
   grid-template-columns:repeat(auto-fit,minmax(640px,1fr));
   gap:14px;
-  margin-top:14px
+  margin-top:14px;
+  grid-auto-flow: dense; /* <-- deixa itens posteriores ocuparem buracos */
 }
+
 /* Opcional: em telas pequenas, volta pra 1 coluna */
 @media (max-width: 900px){
   .grid{ grid-template-columns: 1fr; }
@@ -928,10 +1034,17 @@ pre.terminal{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Libera
 
   if (sessionStorage.getItem("auth-ok") === "1") unlock();
 
-  const btn  = document.getElementById("lgBtn");
-  const pass = document.getElementById("lgPass");
+const btn  = document.getElementById("lgBtn");
+const pass = document.getElementById("lgPass");
+
+if (btn) {
   btn.addEventListener("click", doLogin);
-  pass.addEventListener("keydown", e => { if(e.key === "Enter"){ e.preventDefault(); doLogin(); }});
+}
+if (pass) {
+  pass.addEventListener("keydown", e => {
+    if (e.key === "Enter") { e.preventDefault(); doLogin(); }
+  });
+}
 
   function setMsg(t){ document.getElementById("loginMsg").textContent = t || ""; }
 
@@ -1041,10 +1154,6 @@ pre.terminal{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Libera
       <table id="leases"><thead><tr><th>IP</th><th>MAC</th><th>Host</th><th>TS</th></tr></thead><tbody></tbody></table>
     </div>
 
-    <div class="card">
-      <h3>Serviços</h3>
-      <div id="svcs"></div>
-    </div>
 
     <div class="card">
       <h3>Interfaces</h3>
@@ -1129,15 +1238,15 @@ pre.terminal{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Libera
   
    
 
+      </div> 
+  
+  
+ 
   
   
   
-  </div>
   
-  
-  
-  
-<div class="card wide" id="termCard">
+<div class="card" id="termCard">
   <h3>Terminal (bash)</h3>
   <div class="term-controls">
     <button class="btn" id="termStart">Iniciar shell</button>
@@ -1158,8 +1267,116 @@ pre.terminal{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Libera
 
     
     
+
+    
+    
   
+<div class="card wide" id="svcCard">
+  <h3>Serviços</h3>
+  <div class="controls">
+    <input id="svcSearch" type="text" placeholder="filtrar por nome/descrição…" style="min-width:220px">
+    <label style="display:flex;gap:6px;align-items:center">
+      <input type="checkbox" id="svcAll"> mostrar todos (inclui systemd/dbus/etc)
+    </label>
+    <button class="btn" id="svcRefresh">Atualizar</button>
+  </div>
+  <table id="svcTable">
+    <thead>
+      <tr>
+        <th style="min-width:260px">Serviço</th>
+        <th>Ativo</th>
+        <th>Habilitado</th>
+        <th style="min-width:220px">Ações</th>
+      </tr>
+    </thead>
+    <tbody><tr><td colspan="4">Carregando…</td></tr></tbody>
+  </table>
+  <small class="muted">Dica: “Ativo” = estado de execução (<i>active</i>/<i>inactive</i>). “Habilitado” = inicia no boot (<i>enabled</i>/<i>disabled</i>/<i>static</i>…)</small>
+</div>
+
   
+  <script>
+ (function(){
+  function stripAnsi(s){
+    if (s == null) return '';
+    s = String(s);
+
+    var ESC = 27, BEL = 7;
+    var CSI_C1 = 0x9B;  // CSI single-byte
+    var OSC_C1 = 0x9D;  // OSC single-byte
+    var ST_C1  = 0x9C;  // String Terminator
+
+    var out = '', i = 0, len = s.length;
+
+    while (i < len) {
+      var c = s.charCodeAt(i);
+
+      if (c === ESC) {
+        var n = (i + 1 < len) ? s.charCodeAt(i + 1) : -1;
+
+        // CSI: ESC '[' ... até final (0x40–0x7E)
+        if (n === 91) {
+          i += 2;
+          while (i < len) { var ch = s.charCodeAt(i++); if (ch >= 64 && ch <= 126) break; }
+          continue;
+        }
+        // OSC: ESC ']' ... termina em BEL, ESC '\', ou ST (C1)
+        if (n === 93) {
+          i += 2;
+          while (i < len) {
+            var ch2 = s.charCodeAt(i++);
+            if (ch2 === BEL) break;
+            if (ch2 === ESC && i < len && s.charCodeAt(i) === 92) { i++; break; } // ESC '\'
+            if (ch2 === ST_C1) break;
+          }
+          continue;
+        }
+        // Charset selects: ESC '(' X  |  ESC ')' X
+        if (i + 2 < len && (n === 40 || n === 41)) { i += 3; continue; }
+
+        // 1-char escapes: ESC + (@.._) descarta
+        if (i + 1 < len) {
+          var n2 = s.charCodeAt(i + 1);
+          if (n2 >= 64 && n2 <= 95) { i += 2; continue; }
+        }
+
+        // Se não casou nada acima, descarta só o ESC
+        i++;
+        continue;
+      }
+
+      // CSI (C1): 0x9B ... até final (0x40–0x7E)
+      if (c === CSI_C1) {
+        i++;
+        while (i < len) { var ch3 = s.charCodeAt(i++); if (ch3 >= 64 && ch3 <= 126) break; }
+        continue;
+      }
+
+      // OSC (C1): 0x9D ... termina em BEL, ST_C1, ou ESC '\'
+      if (c === OSC_C1) {
+        i++;
+        while (i < len) {
+          var ch4 = s.charCodeAt(i++);
+          if (ch4 === BEL || ch4 === ST_C1) break;
+          if (ch4 === ESC && i < len && s.charCodeAt(i) === 92) { i++; break; }
+        }
+        continue;
+      }
+
+      // Filtra controles < 0x20, exceto \n (10), \r (13), \t (9)
+      if (c < 32 && c !== 10 && c !== 13 && c !== 9) { i++; continue; }
+
+      // Normal/imprimível
+      out += s.charAt(i++);
+    }
+    return out;
+  }
+
+  // deixa global
+  window.stripAnsi = stripAnsi;
+})();
+</script>
+
 
 <script>
 /* ===== Core UI (ES5 safe) ===== */
@@ -1313,15 +1530,6 @@ function render(data){
   }
   document.querySelector('#leases tbody').innerHTML = lhtml || '<tr><td colspan="4">—</td></tr>';
 
-  /* Serviços */
-  var svcs = data.services, html='';
-  for(var k in svcs){
-    if(!Object.prototype.hasOwnProperty.call(svcs,k)) continue;
-    var stv = svcs[k];
-    var cls = (stv==='active')?'ok':((stv==='inactive'||stv==='n/a')?'warn':'err');
-    html += '<div>'+escapeHtml(k)+badge(stv,cls)+'</div>';
-  }
-  document.getElementById('svcs').innerHTML = html;
 
   /* Interfaces */
   var ifs = data.interfaces, ifhtml='';
@@ -1586,6 +1794,253 @@ function wifiConnect(){
   }
 })();
 </script>
+
+
+
+
+
+<script>
+(function(){
+  function badge(txt, cls){ return '<span class="badge '+cls+'">'+String(txt)+'</span>'; }
+  function clsActive(s){ return (s==='active'||s==='reloading'||s==='activating') ? 'ok' : (s==='inactive' ? 'warn' : 'err'); }
+
+  // 🔧 NOVO: considerar variações "habilitado"
+  function isEnabledLike(s){
+    s = String(s||'').toLowerCase();
+    return s === 'enabled' || s === 'enabled-runtime' || s === 'linked' || s === 'linked-runtime' || s === 'alias';
+  }
+  function clsEnabled(s){
+    s = String(s||'unknown').toLowerCase();
+    if (s === 'disabled' || s === 'masked') return 'err';
+    if (isEnabledLike(s)) return 'ok';
+    return 'warn'; // static/indirect/generated/unknown…
+  }
+
+  // ===== Estado local (ordem fixa + cache) =====
+  var svcCache = new Map();     // unit -> {active, enabled, description, sub}
+  var svcOrder = [];            // ordem fixa atual (array de units)
+  var lastFilterKey = "";       // chave de filtro p/ detectar quando reordenar
+  var autoTimer = null;
+  var AUTO_REFRESH_MS = 6000;   // menos agressivo
+
+  // ===== Construção da row (uma vez) =====
+  function buildRow(unit, data){
+    var tr = document.createElement('tr');
+    tr.dataset.unit = unit;
+
+    var tdName = document.createElement('td');
+    tdName.className = 'wrap';
+    tdName.innerHTML = '<b>'+unit+'</b><br><small class="muted">'+(data.description||'').replace(/</g,'&lt;')+'</small>';
+
+    var tdActive = document.createElement('td');
+    tdActive.innerHTML = badge(data.active||'unknown', clsActive(data.active||'unknown'));
+
+    var tdEnabled = document.createElement('td');
+    tdEnabled.innerHTML = badge(data.enabled||'unknown', clsEnabled(data.enabled||'unknown'));
+
+    var tdAct = document.createElement('td');
+    tdAct.style.minWidth = '220px';
+    tdAct.innerHTML = actionButtons(unit, data.active, data.enabled);
+
+    tr.appendChild(tdName);
+    tr.appendChild(tdActive);
+    tr.appendChild(tdEnabled);
+    tr.appendChild(tdAct);
+    return tr;
+  }
+
+ function actionButtons(unit, active, enabled){
+    var btns = [];
+    if(active==='active'){
+      btns.push('<button class="btn svc-act" data-a="restart" data-u="'+unit+'">Restart</button>');
+      btns.push('<button class="btn svc-act" data-a="stop" data-u="'+unit+'">Stop</button>');
+    }else{
+      btns.push('<button class="btn svc-act" data-a="start" data-u="'+unit+'">Start</button>');
+    }
+
+    // 🔧 antes: if (enabled === 'enabled') { Disable } else { Enable }
+    if (isEnabledLike(enabled)) {
+      btns.push('<button class="btn svc-act" data-a="disable" data-u="'+unit+'">Disable</button>');
+    } else {
+      btns.push('<button class="btn svc-act" data-a="enable" data-u="'+unit+'">Enable</button>');
+    }
+    return btns.join(' ');
+  }
+
+  // ===== Reuso de linhas (apenas patch) =====
+  function patchRow(tr, data){
+    var tdActive = tr.children[1];
+    var tdEnabled = tr.children[2];
+    var tdAct = tr.children[3];
+
+    // Atualiza só se mudou (evita reflow/piscada)
+    var nextActiveHtml  = badge(data.active||'unknown',  clsActive(data.active||'unknown'));
+    var nextEnabledHtml = badge(data.enabled||'unknown', clsEnabled(data.enabled||'unknown'));
+    if (tdActive.innerHTML !== nextActiveHtml)   tdActive.innerHTML = nextActiveHtml;
+    if (tdEnabled.innerHTML !== nextEnabledHtml) tdEnabled.innerHTML = nextEnabledHtml;
+
+    var nextBtns = actionButtons(data.unit, data.active, data.enabled);
+    if (tdAct.innerHTML !== nextBtns) tdAct.innerHTML = nextBtns;
+  }
+
+  // ===== Render sem recriar tabela inteira =====
+  function renderSvcIncremental(list, resetOrder){
+    var tb = document.querySelector('#svcTable tbody');
+    if(!tb) return;
+
+    // guarda scroll para não "puxar" a lista
+    var keepScroll = tb.parentElement; // table é scrollável; parent é o contêiner
+    var prevScrollTop = (keepScroll && keepScroll.scrollTop) || 0;
+
+    // atualiza cache
+    var incoming = new Set();
+    for (var i=0;i<list.length;i++){
+      var s = list[i];
+      incoming.add(s.unit);
+      svcCache.set(s.unit, s);
+    }
+
+    // atualiza ordem fixa somente quando filtro muda ou 1ª carga
+    if (resetOrder) {
+      svcOrder = list.map(function(s){ return s.unit; });
+    }
+
+    // remove linhas que não estão mais no filtro (sem tocar nas que permanecem)
+    var rows = tb.querySelectorAll('tr[data-unit]');
+    for (var r=0;r<rows.length;r++){
+      var u = rows[r].dataset.unit;
+      if (!incoming.has(u)) rows[r].remove();
+    }
+
+    // percorre ordem fixa e cria/patch em sequência (não resort a cada refresh)
+    var frag = document.createDocumentFragment();
+    for (var j=0;j<svcOrder.length;j++){
+      var unit = svcOrder[j];
+      if (!incoming.has(unit)) continue; // filtrado fora
+      var data = svcCache.get(unit);
+      var tr = tb.querySelector('tr[data-unit="'+unit+'"]');
+      if (!tr) {
+        tr = buildRow(unit, data);
+        frag.appendChild(tr);
+      } else {
+        patchRow(tr, data);
+        // garante que a ordem visual siga a svcOrder (só move se necessário)
+        if (tr.previousElementSibling && tr.previousElementSibling.dataset.unit === unit) {
+          // ok
+        }
+      }
+    }
+    if (frag.childNodes.length) tb.appendChild(frag);
+
+    // restaura scroll
+    if (keepScroll) keepScroll.scrollTop = prevScrollTop;
+  }
+
+  // ===== Carregamento / Filtro / Debounce =====
+  function filterKey(){
+    var all = document.getElementById('svcAll').checked ? '1':'0';
+    var q   = (document.getElementById('svcSearch').value || '').trim().toLowerCase();
+    return all+'|'+q;
+  }
+
+  var svcFetchInFlight = false;
+  function svcLoad(){
+    if (svcFetchInFlight) return;
+    svcFetchInFlight = true;
+
+    var all = document.getElementById('svcAll').checked;
+    var q   = (document.getElementById('svcSearch').value || '').trim();
+    var url = '/api/services?all='+(all?'1':'0')+'&q='+encodeURIComponent(q);
+
+    var tb = document.querySelector('#svcTable tbody');
+    if (tb && tb.children.length===0) {
+      tb.innerHTML = '<tr><td colspan="4">Carregando…</td></tr>';
+    }
+
+    var fk = filterKey();
+    var mustResetOrder = (fk !== lastFilterKey);
+    if (mustResetOrder) lastFilterKey = fk;
+
+    fetch(url, {cache:'no-store'})
+      .then(function(r){ return r.json(); })
+      .then(function(j){
+        var list = j.services || [];
+        // Na primeira vez pós-filtro, define ordem (ordena ativos primeiro e depois nome)
+        if (mustResetOrder) {
+          list.sort(function(a,b){
+            var aRun = (a.active==='active'||a.active==='reloading'||a.active==='activating')?0:1;
+            var bRun = (b.active==='active'||b.active==='reloading'||b.active==='activating')?0:1;
+            if (aRun!==bRun) return aRun-bRun;
+            return (a.unit||'').localeCompare(b.unit||'');
+          });
+        }
+        renderSvcIncremental(list, mustResetOrder);
+      })
+      .catch(function(e){
+        if (tb) tb.innerHTML = '<tr><td colspan="4">Erro: '+String(e)+'</td></tr>';
+      })
+      .finally(function(){ svcFetchInFlight = false; });
+  }
+
+  // Debounce input
+  var tSearch = null;
+  function scheduleSearch(){
+    if (tSearch) clearTimeout(tSearch);
+    tSearch = setTimeout(function(){ svcLoad(); }, 250);
+  }
+
+  // Event delegation para botões (não precisa re-wire por render)
+  document.addEventListener('click', function(ev){
+    var btn = ev.target;
+    if (!btn.classList || !btn.classList.contains('svc-act')) return;
+    var unit = btn.getAttribute('data-u');
+    var act  = btn.getAttribute('data-a');
+    btn.disabled = true;
+    fetch('/api/service_action', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({unit: unit, action: act})
+    })
+    .then(function(r){ return r.json(); })
+    .then(function(){ svcLoad(); })
+    .catch(function(e){ alert('Falha: '+e); })
+    .finally(function(){ btn.disabled = false; });
+  });
+
+  // Wire básico
+  var s = document.getElementById('svcSearch'); if(s) s.addEventListener('input', scheduleSearch);
+  var a = document.getElementById('svcAll');    if(a) a.addEventListener('change', svcLoad);
+  var r = document.getElementById('svcRefresh');if(r) r.addEventListener('click', svcLoad);
+
+  // Auto refresh menos frequente; pausa quando mouse está sobre a tabela (evita atrapalhar interação)
+  function autoStart(){
+    if (autoTimer) return;
+    autoTimer = setInterval(function(){
+      // só recarrega se mouse não está sobre o card
+      var card = document.getElementById('svcCard');
+      if (!card || card.matches(':hover')) return;
+      svcLoad();
+    }, AUTO_REFRESH_MS);
+  }
+  function autoStop(){ if(autoTimer){ clearInterval(autoTimer); autoTimer=null; } }
+
+  var card = document.getElementById('svcCard');
+  if (card){
+    card.addEventListener('mouseenter', autoStop);
+    card.addEventListener('mouseleave', autoStart);
+  }
+
+  // Primeira carga
+  svcLoad();
+  autoStart();
+})();
+</script>
+
+
+
+
+
+
 <script>
 (function(){
   var termSid=null, termPos=0, termTimer=null;
@@ -1594,17 +2049,24 @@ function wifiConnect(){
     try{ return decodeURIComponent(escape(atob(b64))); }
     catch(e){ return atob(b64); }
   }
-  function stripAnsi(s){
-    return s.replace(/\\x1B\[[0-9;]*[ -/]*[@-~]/g,'').replace(/\\x1B[@-Z\\-_]/g,'');
+  
+  
+
+
+function termAppend(txt){
+  var box=document.getElementById('termBox');
+  var stripEl=document.getElementById('termStrip');
+  var doStrip = stripEl ? !!stripEl.checked : false;
+
+  var out = txt;
+  if (doStrip) {
+    try { out = stripAnsi(txt); }
+    catch(e){ console.warn('stripAnsi falhou:', e); out = txt; }
   }
-  function termAppend(txt){
-    var box=document.getElementById('termBox');
-    var stripEl=document.getElementById('termStrip');
-    var strip=stripEl?!!stripEl.checked:false;
-    var out=strip?stripAnsi(txt):txt;
-    box.textContent=(box.textContent||'')+out;
-    box.scrollTop=box.scrollHeight;
-  }
+  box.textContent = (box.textContent||'') + out;
+  box.scrollTop = box.scrollHeight;
+}
+
   function termPoll(){
     if(!termSid) return;
     fetch('/api/term/read?sid='+encodeURIComponent(termSid)+'&pos='+termPos,{cache:'no-store'})
@@ -1846,6 +2308,16 @@ class H(BaseHTTPRequestHandler):
                 # base64 para transmitir bytes/ANSI com segurança
                 self._send_json({"sid": sid, "pos": total, "out_b64": base64.b64encode(out).decode("ascii"), "alive": s.alive}); return
 
+            elif self.path.startswith("/api/services"):
+                # /api/services?all=1&q=texto
+                qs = {}
+                if "?" in self.path:
+                    qs = urllib.parse.parse_qs(self.path.split("?",1)[1])
+                include_system = (qs.get("all",["0"])[0] in ("1","true","yes","on"))
+                q = (qs.get("q",[""])[0] or "")
+                items = systemd_scan_services(include_system=include_system, q=q)
+                self._send_json({"services": items}); return
+
 
 
             else:
@@ -1920,6 +2392,13 @@ class H(BaseHTTPRequestHandler):
                 s.kill()
                 SESSIONS.pop(sid, None)
                 self._send_json({"ok": True}); return
+                
+            elif self.path.startswith("/api/service_action"):
+                # body: { "unit": "nome.service" | "nome", "action": "start|stop|restart|enable|disable" }
+                unit = (data.get("unit") or "")
+                action = (data.get("action") or "")
+                res = systemd_action(unit, action)
+                self._send_json(res); return
                 
 
             else:
