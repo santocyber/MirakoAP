@@ -24,14 +24,14 @@ sudo chmod +x pishrink.sh
 
 
 
-sudo ./pishrink.sh MirakoAP_orangepi_zero3.img MirakoAP-final-orangepi-ditro-by-santocyber.img
+sudo ./pishrink.sh MirakoAP_orangepi_zero3.img MirakoAP-final-orangepi-distro-by-santocyber.img
 
 
 
 
 
 
-gzip raspberrypi_backup.img
+gzip MirakoAP-final-orangepi-distro-by-santocyber.img
 
 
 sudo apt install rpi-imager
