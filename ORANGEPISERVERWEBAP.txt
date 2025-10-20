@@ -3,6 +3,7 @@ tee /usr/local/bin/netstatus.py >/dev/null <<'PY'
 import json, os, re, socket, subprocess, time, math, shutil, urllib.parse
 import glob 
 import pty, select, threading, fcntl, termios, struct, uuid, base64
+import io, cgi   
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -10,7 +11,134 @@ HOST   = os.environ.get("NETSTATUS_HOST", "0.0.0.0")
 PORT   = int(os.environ.get("NETSTATUS_PORT", "80"))
 WIFIIF = os.environ.get("NETSTATUS_WIFI_IF", "wlan0")
 
+INIT_SCAN = os.environ.get("NETSTATUS_INIT_SCAN", "0") in ("1","true","yes")
+
+
+# —— Controle de estado do Wi-Fi ——
+AP_GUARD_INTERVAL = float(os.environ.get("NETSTATUS_AP_GUARD_INTERVAL", "2.0"))
+SCAN_IN_PROGRESS = threading.Event()   # fica ON apenas durante o scan
+
+AP_GUARD_SUPPRESS_FILE = "/run/mirako/ap_guard.suppress"
+os.makedirs(os.path.dirname(AP_GUARD_SUPPRESS_FILE), exist_ok=True)
+
+from contextlib import contextmanager
+@contextmanager
+def _suppress_ap_guard():
+    try:
+        open(AP_GUARD_SUPPRESS_FILE, "w").close()
+    except:
+        pass
+    try:
+        yield
+    finally:
+        try:
+            os.remove(AP_GUARD_SUPPRESS_FILE)
+        except:
+            pass
+
+
+
+# === WIFI SCAN CACHE ===
+import fcntl  # mantenha um único import fcntl
+WIFI_SCAN_CACHE_FILE = "/var/cache/netstatus/wifi_scan.json"
+
+# Trava por arquivo (cross-process) para evitar scans concorrentes
+SCAN_LOCK_FILE = "/run/mirako/wifi_scan.lock"
+os.makedirs(os.path.dirname(SCAN_LOCK_FILE), exist_ok=True)
+
+_last_scan_cache = {"ts": 0, "networks": []}
+
+
+def _scan_cache_load():
+    global _last_scan_cache
+    try:
+        with open(WIFI_SCAN_CACHE_FILE, "r") as f:
+            _last_scan_cache = json.load(f)
+    except Exception:
+        _last_scan_cache = {"ts": 0, "networks": []}
+    return _last_scan_cache
+
+def _scan_cache_save(nets):
+    """Grava em disco e mantém em memória."""
+    global _last_scan_cache
+    os.makedirs(os.path.dirname(WIFI_SCAN_CACHE_FILE), exist_ok=True)
+    data = {"ts": int(time.time()), "networks": nets}
+    tmp = WIFI_SCAN_CACHE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, WIFI_SCAN_CACHE_FILE)
+    _last_scan_cache = data
+    return data
+
+
+
 # ------------------ helpers ------------------
+def _safe_upload_name(name: str) -> str:
+    bn = os.path.basename(name or "")
+    # permite letras, números, ponto, traço e underline
+    bn = re.sub(r"[^A-Za-z0-9._-]+", "_", bn).strip("._")
+    return bn or f"upload_{int(time.time())}"
+
+def root_list_files():
+    out = []
+    try:
+        for name in sorted(os.listdir("/root")):
+            p = os.path.join("/root", name)
+            try:
+                st = os.stat(p)
+                out.append({
+                    "name": name,
+                    "is_dir": os.path.isdir(p),
+                    "size": (st.st_size if os.path.isfile(p) else None),
+                    "mtime": int(st.st_mtime),
+                })
+            except:
+                pass
+    except Exception as e:
+        return {"error": str(e)}
+    return out
+
+def root_upload_from_body(body: bytes, headers) -> dict:
+    ct = (headers.get("Content-Type") or "").lower()
+    if not ct.startswith("multipart/form-data"):
+        return {"ok": False, "msg": "Content-Type precisa ser multipart/form-data"}
+
+    clen = int(headers.get("Content-Length", "0") or 0)
+    env = {
+        "REQUEST_METHOD": "POST",
+        "CONTENT_TYPE": headers.get("Content-Type", ""),
+        "CONTENT_LENGTH": str(clen),
+    }
+    form = cgi.FieldStorage(
+        fp=io.BytesIO(body or b""),
+        headers=None,
+        environ=env,
+        keep_blank_values=True,
+    )
+
+    items = form["file"] if "file" in form else []
+    if not isinstance(items, list):
+        items = [items]
+
+    saved = []
+    for it in items:
+        fname = _safe_upload_name(getattr(it, "filename", "") or "")
+        if not fname:
+            continue
+        dest = os.path.join("/root", fname)
+        with open(dest, "wb") as f:
+            while True:
+                chunk = it.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+        try:
+            st = os.stat(dest)
+            saved.append({"name": fname, "size": st.st_size, "mtime": int(st.st_mtime)})
+        except:
+            saved.append({"name": fname})
+    return {"ok": True, "saved": saved}
+
 def sh(cmd, timeout=2.5):
     try:
         out = subprocess.run(cmd, shell=True, text=True,
@@ -465,13 +593,37 @@ def _wifi_mode():
     m = re.search(r"type\s+(\S+)", t or "")
     return (m.group(1) if m else None) or ""
 
+# --- [NOVO] util de status do systemd ---
+def _svc_active(name):
+    return subprocess.run(f"systemctl is-active --quiet {name}",
+                          shell=True).returncode == 0
+
+
 def _ap_stop():
-    subprocess.run("systemctl stop create_ap.service", shell=True)
-    # matar wpa_supplicant para liberar a IF (evita conflitos)
-    subprocess.run(f"wpa_cli -i {WIFIIF} terminate >/dev/null 2>&1 || pkill -f 'wpa_supplicant.*{WIFIIF}' || true", shell=True)
+    if _svc_active("create_ap.service"):
+        subprocess.run("systemctl stop create_ap.service", shell=True)
+    # encerra processos de hostapd/dnsmasq iniciados pelo create_ap
+    subprocess.run("pkill -f 'hostapd.*create_ap' >/dev/null 2>&1 || true", shell=True)
+    subprocess.run("pkill -f 'dnsmasq.*create_ap' >/dev/null 2>&1 || true", shell=True)
+    # garante que cliente não está segurando a IF
+    subprocess.run(f"wpa_cli -i {WIFIIF} terminate >/dev/null 2>&1 || "
+                   f"pkill -f 'wpa_supplicant.*{WIFIIF}' || true", shell=True)
+    subprocess.run(f"dhclient -r {WIFIIF} >/dev/null 2>&1 || true", shell=True)
 
 def _ap_start():
-    subprocess.run("systemctl restart create_ap.service", shell=True)
+    # só sobe se estiver inativo; não use restart!
+    if not _svc_active("create_ap.service"):
+        subprocess.run("systemctl start create_ap.service", shell=True)
+
+# --- [PEQUENA MUDANÇA] switch_to_ap: não reiniciar à toa ---
+def switch_to_ap(persist=False):
+    _client_stop()
+    _if_set_ap()
+    _ap_start()  # sem restart
+    if persist:
+        set_boot_mode("ap")
+    return {"ok": True, "msg": "modo AP ativo", "persist": bool(persist)}
+
 
 def _if_set_managed():
     subprocess.run(f"ip link set {WIFIIF} down", shell=True)
@@ -479,7 +631,6 @@ def _if_set_managed():
     subprocess.run(f"ip link set {WIFIIF} up", shell=True)
 
 def _if_set_ap():
-    # Alguns drivers falham com "__ap"; "ap" é amplamente aceito
     subprocess.run(f"ip link set {WIFIIF} down", shell=True)
     subprocess.run(f"iw dev {WIFIIF} set type ap", shell=True)
     subprocess.run(f"ip link set {WIFIIF} up", shell=True)
@@ -522,14 +673,6 @@ def wifi_client_reset():
     _if_set_managed()
     # Opcional: não levanta AP aqui, é só um reset do cliente
     return {"ok": True, "msg": "cliente resetado"}
-
-def switch_to_ap(persist=False):
-    _client_stop()
-    _if_set_ap()
-    _ap_start()
-    if persist:
-        set_boot_mode("ap")
-    return {"ok": True, "msg": "modo AP ativo", "persist": bool(persist)}
 
 def wifi_client_status():
     mode = (_wifi_mode() or "").lower()
@@ -581,55 +724,188 @@ def wifi_client_status():
         "services": boot.get("services", {})
     }
 
-def wifi_scan_networks():
-    """Lista redes Wi-Fi disponíveis, pausando o AP se necessário e restaurando em seguida."""
-    networks = []
-    mode_before = _wifi_mode().lower()
-    ap_was_running = (mode_before in ("ap","__ap","master"))
+def _chan_from_freq(freq_mhz):
     try:
-        if ap_was_running:
-            print("[wifi_scan] Parando AP temporariamente…")
-            _ap_stop()
-            time.sleep(1.2)
-        _if_set_managed()
-        scan_out = sh(f"iw dev {WIFIIF} scan", timeout=10)
-        for block in scan_out.split("\nBSS "):
-            ssid = re.search(r"SSID:\s*(.+)", block)
-            freq = re.search(r"freq:\s*(\d+)", block)
-            signal = re.search(r"signal:\s*([\-0-9\.]+)", block)
-            chan = re.search(r"(?:DS Parameter set: channel|primary channel)\s*(\d+)", block)
-            # segurança
-            sec = "OPEN"
-            if "RSN:" in block: sec = "WPA2/3"
-            elif "WPA:" in block: sec = "WPA"
-            if ssid:
-                s = ssid.group(1).strip()
-                if s == "":  # rede oculta
-                    continue
-                networks.append({
-                    "ssid": s,
-                    "freq_mhz": int(freq.group(1)) if freq else None,
-                    "signal_dbm": float(signal.group(1)) if signal else None,
-                    "channel": int(chan.group(1)) if chan else None,
-                    "security": sec
-                })
-        networks = sorted(networks, key=lambda n: n.get("signal_dbm", -999), reverse=True)
-        return networks
-    finally:
-        if ap_was_running:
-            print("[wifi_scan] Restaurando AP…")
-            # volta tipo AP e serviço
-            try: _if_set_ap()
-            except: pass
-            _ap_start()
+        f = int(freq_mhz)
+    except:
+        return None
+    if 2412 <= f <= 2472:  # 2.4 GHz
+        return (f - 2407) // 5
+    if f == 2484:
+        return 14
+    if 5000 <= f <= 5900:  # 5 GHz
+        return (f - 5000) // 5
+    if 5955 <= f <= 7115:  # 6 GHz (6E)
+        return (f - 5950) // 5
+    return None
+
+def _parse_iwlist_scan(text):
+    nets = []
+    cur = None
+    wpa = False
+    wpa2 = False
+    wpa3 = False
+    wep = False
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+
+        m = re.match(r"^Cell\s+\d+\s+-\s+Address:\s*([0-9A-Fa-f:]{17})", line)
+        if m:
+            if cur:
+                # define segurança
+                if cur.get("enc_on") is False:
+                    cur["security"] = "open"
+                else:
+                    if wpa3:
+                        cur["security"] = "WPA3"
+                    elif wpa2 and wpa:
+                        cur["security"] = "WPA2/WPA"
+                    elif wpa2:
+                        cur["security"] = "WPA2"
+                    elif wpa:
+                        cur["security"] = "WPA"
+                    elif wep:
+                        cur["security"] = "WEP"
+                    else:
+                        cur["security"] = "on"  # desconhecido, mas criptografado
+                nets.append(cur)
+            # inicia novo
+            cur = {
+                "bssid": m.group(1).lower(),
+                "ssid": None,
+                "signal_dbm": None,
+                "freq_mhz": None,
+                "channel": None,
+                "enc_on": None,  # True/False
+                "security": "open",
+            }
+            wpa = wpa2 = wpa3 = wep = False
+            continue
+
+        if not cur:
+            continue
+
+        if "ESSID:" in line:
+            ss = line.split("ESSID:", 1)[1].strip()
+            ss = ss.strip('"')
+            cur["ssid"] = ss if ss else "(oculto)"
+            continue
+
+        if line.startswith("Channel:"):
+            try:
+                cur["channel"] = int(line.split(":", 1)[1].strip())
+            except:
+                pass
+            continue
+
+        if line.startswith("Frequency:"):
+            m2 = re.search(r"Frequency:\s*([\d\.]+)\s*GHz", line)
+            if m2:
+                fmhz = int(float(m2.group(1)) * 1000)
+                cur["freq_mhz"] = fmhz
+                if not cur.get("channel"):
+                    cur["channel"] = _chan_from_freq(fmhz)
+            # Alguns iwlist colocam "(Channel N)" no fim
+            m3 = re.search(r"\(Channel\s+(\d+)\)", line)
+            if m3:
+                try:
+                    cur["channel"] = int(m3.group(1))
+                except:
+                    pass
+            continue
+
+        if "Quality=" in line:
+            mQ = re.search(r"Quality=(\d+)/(\d+)", line)
+            mS = re.search(r"Signal level=(-?\d+)\s*dBm", line)
+            if mS:
+                try:
+                    cur["signal_dbm"] = int(mS.group(1))
+                except:
+                    pass
+            # (Quality pode ser útil para ordenar quando não há dBm)
+            continue
+
+        if line.startswith("Encryption key:"):
+            cur["enc_on"] = ("on" in line)
+            continue
+
+        # Heurística de segurança (RSN/WPA/WEP)
+        if line.startswith("IE:"):
+            ln = line.lower()
+            if "wpa version 1" in ln:
+                wpa = True
+            if "ieee 802.11i" in ln or "rsn" in ln:
+                wpa2 = True
+            if "sae" in ln:  # WPA3-Personal
+                wpa3 = True
+            continue
+
+        if "capabilities" in line.lower() and "privacy" in line:
+            wep = True
+            continue
+
+    if cur:
+        # finalizar último
+        if cur.get("enc_on") is False:
+            cur["security"] = "open"
+        else:
+            if wpa3:
+                cur["security"] = "WPA3"
+            elif wpa2 and wpa:
+                cur["security"] = "WPA2/WPA"
+            elif wpa2:
+                cur["security"] = "WPA2"
+            elif wpa:
+                cur["security"] = "WPA"
+            elif wep:
+                cur["security"] = "WEP"
+            else:
+                cur["security"] = "on"
+        nets.append(cur)
+
+    # Dedup por SSID mantendo o mais forte; ocultas por BSSID
+    best = {}
+    for n in nets:
+        key = n["ssid"] if n.get("ssid") and n["ssid"] != "(oculto)" else f"__hidden__{n['bssid']}"
+        prev = best.get(key)
+        if prev is None or (n.get("signal_dbm", -999) > prev.get("signal_dbm", -999)):
+            best[key] = n
+    out = list(best.values())
+    out.sort(key=lambda x: x.get("signal_dbm", -999), reverse=True)
+    # Ajuste: remover campos internos
+    for n in out:
+        n.pop("enc_on", None)
+    return out
+
+
+def wifi_scan_networks():
+    mode = (_wifi_mode() or "").lower()
+    if mode in ("ap","__ap","master") or _svc_active("create_ap.service"):
+        c = _scan_cache_load()
+        return c.get("networks", [])
+
+    with open(SCAN_LOCK_FILE, "w") as lk:
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            c = _scan_cache_load()
+            return c.get("networks", [])
+
+        SCAN_IN_PROGRESS.set()
+        with _suppress_ap_guard():
+            try:
+                out = sh(f"iw dev {WIFIIF} scan ap-force passive", timeout=12) or \
+                      sh(f"iwlist {WIFIIF} scan", timeout=15)
+                nets = _parse_iwlist_scan(out or "")
+                nets.sort(key=lambda x: x.get("signal_dbm", -999), reverse=True)
+                return nets
+            finally:
+                SCAN_IN_PROGRESS.clear()
+
+
+
 
 def wifi_connect(ssid, password=None, persist=False):
-    """
-    Conecta como cliente (managed) usando wpa_supplicant + dhclient.
-    persist=True grava /etc/wpa_supplicant/wpa_supplicant-{WIFIIF}.conf
-    e ajusta boot para 'client'.
-    Retorna dict com ok, ip4, msg.
-    """
     ssid = (ssid or "").strip()
     if not ssid:
         return {"ok": False, "ip4": None, "msg": "SSID vazio"}
@@ -637,51 +913,94 @@ def wifi_connect(ssid, password=None, persist=False):
     conf_tmp = f"/tmp/wpa_{WIFIIF}.conf"
     conf_persist = f"/etc/wpa_supplicant/wpa_supplicant-{WIFIIF}.conf"
 
-    # parar AP e preparar
-    _ap_stop()
-    time.sleep(0.8)
-    _if_set_managed()
+    with _suppress_ap_guard():
+        # 0) Tire o NetworkManager do caminho (se existir)
+        subprocess.run(f"nmcli dev set {WIFIIF} managed no >/dev/null 2>&1 || true", shell=True)
 
-    # finalizar instâncias antigas
-    subprocess.run(f"wpa_cli -i {WIFIIF} terminate >/dev/null 2>&1 || pkill -f 'wpa_supplicant.*{WIFIIF}' || true", shell=True)
-    subprocess.run(f"dhclient -r {WIFIIF} >/dev/null 2>&1 || true", shell=True)
-    subprocess.run(f"ip addr flush dev {WIFIIF}", shell=True)
+        # 1) Derruba AP e resíduos do create_ap de forma agressiva (sem matar dnsmasq global)
+        _ap_stop()
+        # mate apenas processos do create_ap
+        subprocess.run("pkill -f 'hostapd.*create_ap' >/dev/null 2>&1 || true", shell=True)
+        subprocess.run("pkill -f 'dnsmasq.*create_ap' >/dev/null 2>&1 || true", shell=True)
+        time.sleep(0.4)
 
-    # gerar config TEMP
-    if password:
-        subprocess.run(f"wpa_passphrase '{ssid}' '{password}' > {conf_tmp}", shell=True)
-    else:
-        cfg = f'network={{\n\tssid="{ssid}"\n\tkey_mgmt=NONE\n}}\n'
-        with open(conf_tmp, "w") as f:
-            f.write(cfg)
+        # 2) Garante modo managed limpo
+        _if_set_managed()
+        subprocess.run(f"wpa_cli -i {WIFIIF} terminate >/dev/null 2>&1 || "
+                       f"pkill -f 'wpa_supplicant.*{WIFIIF}' || true", shell=True)
+        subprocess.run(f"dhclient -r {WIFIIF} >/dev/null 2>&1 || true", shell=True)
+        subprocess.run(f"ip addr flush dev {WIFIIF}", shell=True)
 
-    # PERSISTÊNCIA: cria diretório, copia e ajusta permissão
-    if persist:
-        try:
-            os.makedirs("/etc/wpa_supplicant", exist_ok=True)
-            shutil.copy(conf_tmp, conf_persist)
-            os.chmod(conf_persist, 0o600)
-        except Exception as e:
-            return {"ok": False, "ip4": None, "msg": f"erro salvando wpa_supplicant: {e}"}
+        # 3) Configurar wpa_supplicant
+        if password:
+            subprocess.run(f"wpa_passphrase '{ssid}' '{password}' > {conf_tmp}", shell=True)
+        else:
+            cfg = f'network={{\n\tssid="{ssid}"\n\tkey_mgmt=NONE\n}}\n'
+            with open(conf_tmp, "w") as f:
+                f.write(cfg)
 
-    # iniciar wpa_supplicant em FOREGROUND (aqui como daemon -B, pois é CLI controlada)
-    subprocess.run(f"wpa_supplicant -B -i {WIFIIF} -c {conf_tmp}", shell=True)
+        if persist:
+            try:
+                os.makedirs("/etc/wpa_supplicant", exist_ok=True)
+                shutil.copy(conf_tmp, conf_persist)
+                os.chmod(conf_persist, 0o600)
+            except Exception as e:
+                return {"ok": False, "ip4": None, "msg": f"erro salvando wpa_supplicant: {e}"}
 
-    # obter IP
-    subprocess.run(f"dhclient -v {WIFIIF}", shell=True)
-    time.sleep(2.0)
-    ip = sh(f"ip -4 addr show {WIFIIF} | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){{3}}' | head -n1")
-    ok = bool(ip)
-    msg = "Conectado" if ok else "Falha ao conectar (sem IP)"
+        # 4) Sobe wpa_supplicant
+        subprocess.run(f"wpa_supplicant -B -i {WIFIIF} -c {conf_tmp}", shell=True)
 
-    # Se persistiu e conectou, já configura boot mode 'client'
-    if persist and ok:
-        try:
-            set_boot_mode("client")
-        except Exception as e:
-            msg += f" (boot não ajustado: {e})"
+        # 5) Aguarda associação por até ~10s
+        t0 = time.time()
+        linked = False
+        while time.time() - t0 < 10:
+            link = sh(f"iw dev {WIFIIF} link", timeout=1.5)
+            if "Connected to" in (link or ""):
+                linked = True
+                break
+            time.sleep(0.5)
 
-    return {"ok": ok, "ip4": (ip or None), "msg": msg}
+        if not linked:
+            return {"ok": False, "ip4": None, "msg": "Falha: não associou ao AP"}
+
+        # 6) DHCP robusto: até 3 tentativas rápidas (-1 = uma tentativa síncrona)
+        ip = None
+        for _ in range(3):
+            subprocess.run(f"dhclient -1 -v {WIFIIF}", shell=True)
+            time.sleep(1.0)
+            ip = sh(f"ip -4 addr show {WIFIIF} | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){{3}}' | head -n1")
+            if ip:
+                break
+            # limpa e tenta de novo
+            subprocess.run(f"dhclient -r {WIFIIF} >/dev/null 2>&1 || true", shell=True)
+            subprocess.run(f"ip addr flush dev {WIFIIF}", shell=True)
+            time.sleep(0.5)
+
+        ok = bool(ip)
+        msg = "Conectado" if ok else "Falha ao obter IP (DHCP)"
+
+        if persist and ok:
+            try:
+                set_boot_mode("client")
+            except Exception as e:
+                msg += f" (boot não ajustado: {e})"
+
+        return {"ok": ok, "ip4": (ip or None), "msg": msg}
+   
+    
+def prewarm_wifi_scan_cache():
+    """
+    NOVO: não escaneia/pausa AP automaticamente.
+    Apenas carrega o cache do disco para a memória.
+    """
+    try:
+        c = _scan_cache_load()
+        nets = c.get("networks", [])
+        print(f"[wifi] cache carregado na memória ({len(nets)} redes)")
+    except Exception as e:
+        print("[wifi] prewarm falhou ao carregar cache:", e)
+
+    
 
 # ------------------ Systemd services (scan + actions) ------------------
 SYS_UNIT_IGNORE_PREFIXES = (
@@ -839,6 +1158,56 @@ def collect_status():
 def svc_state(name):
     s = sh(f"systemctl is-active {name}")
     return s if s else "unknown"
+
+def _want_ap_now():
+    # NÃO mexer no AP se há supressão ativa ou cliente ativo
+    try:
+        if os.path.exists(AP_GUARD_SUPPRESS_FILE):
+            return False
+        # se o serviço wifi-client@ está ativo, queremos cliente, não AP
+        if _svc_active(f"wifi-client@{WIFIIF}.service"):
+            return False
+        # se há wpa_supplicant rodando para a IF, também preferimos cliente
+        ps = sh(f"pgrep -fa 'wpa_supplicant.*{WIFIIF}'")
+        if ps.strip():
+            return False
+
+        boot = get_boot_mode()
+        mode = (boot.get("mode") or "").lower()
+        if mode == "ap":
+            return True
+        svc = boot.get("services", {}).get("create_ap")
+        return svc in ("active", "activating", "reloading")
+    except Exception:
+        # conservador: só força AP se temos certeza (evita piscar)
+        return False
+
+def _ap_guard_tick():
+    # não interferir enquanto estivermos escaneando
+    if SCAN_IN_PROGRESS.is_set():
+        return
+    if not _want_ap_now():
+        return
+    try:
+        mode = (_wifi_mode() or "").lower()
+        if mode not in ("ap", "__ap", "master"):
+            print(f"[ap-guard] corrigindo tipo da IF: {mode} -> ap")
+            # derruba qualquer cliente e supplicant que empurre para managed
+            _client_stop()
+            _if_set_ap()
+            _ap_start()
+        else:
+            # garantir que cliente não suba por acidente
+            subprocess.run(f"systemctl stop wifi-client@{WIFIIF}.service >/dev/null 2>&1 || true", shell=True)
+            subprocess.run(f"pkill -f 'wpa_supplicant.*{WIFIIF}' >/dev/null 2>&1 || true", shell=True)
+    except Exception as e:
+        print("[ap-guard] erro:", e)
+
+def _ap_guard_loop():
+    while True:
+        _ap_guard_tick()
+        time.sleep(AP_GUARD_INTERVAL)
+
 
 # ------------------ Logs & Debug (NOVO) ------------------
 def get_logs(kind="all", n=200):
@@ -1186,7 +1555,8 @@ if (pass) {
   <h3>Wi-Fi Cliente</h3>
 
 <div class="controls">
-  <button class="btn" id="btnWifiScan">Buscar redes</button>
+<button class="btn" id="btnWifiScanCache">Buscar (cache)</button>
+<button class="btn" id="btnWifiScanLive">Buscar (ao vivo)</button>
   <input id="wifiFilter" type="text" placeholder="filtrar SSID..." style="min-width:180px">
   <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="wifiPersist"> Salvar no sistema</label>
   <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="wifiRemember"> Lembrar no navegador</label>
@@ -1213,7 +1583,8 @@ if (pass) {
       <tr><th>SSID</th><th>Sinal</th><th>Canal</th><th>Segurança</th></tr>
     </thead>
     <tbody>
-      <tr><td colspan="4">Sem redes. Clique em “Buscar redes”.</td></tr>
+      <tr><td colspan="4">Sem redes. Use “Buscar (cache)” ou “Buscar (ao vivo)”.</td></tr>
+
     </tbody>
   </table>
 
@@ -1253,10 +1624,12 @@ if (pass) {
     <button class="btn" id="termStop">Encerrar</button>
     <button class="btn" id="termClear">Limpar</button>
     <label style="display:flex;gap:6px;align-items:center">
-      <input type="checkbox" id="termStrip"> remover ANSI
-    </label>
+  <input type="checkbox" id="termStrip" checked> remover ANSI
+</label>
     <button class="btn" id="termCtrlC">Ctrl-C</button>
     <button class="btn" id="termCtrlD">Ctrl-D</button>
+    <button class="btn" id="termRunScript">Script</button>
+
   </div>
   <pre class="terminal" id="termBox">(pressione “Iniciar shell”)</pre>
   <div class="controls" style="margin-top:8px">
@@ -1293,6 +1666,21 @@ if (pass) {
   </table>
   <small class="muted">Dica: “Ativo” = estado de execução (<i>active</i>/<i>inactive</i>). “Habilitado” = inicia no boot (<i>enabled</i>/<i>disabled</i>/<i>static</i>…)</small>
 </div>
+
+<div class="card" id="rootCard">
+  <h3>Arquivos (/root)</h3>
+  <div class="controls">
+    <button class="btn" id="rootRefresh">Atualizar</button>
+    <input type="file" id="rootFile" multiple>
+    <button class="btn" id="rootUpload">Enviar</button>
+    <small id="rootMsg" class="muted"></small>
+  </div>
+  <table id="rootTable">
+    <thead><tr><th>Nome</th><th>Tamanho</th><th>Modificado</th></tr></thead>
+    <tbody><tr><td colspan="3">Carregando…</td></tr></tbody>
+  </table>
+</div>
+
 
   
   <script>
@@ -1582,6 +1970,8 @@ function humanRate(bytesPerSec){
 function num(n, def){ n = Number(n); return isFinite(n) ? n : (def||0); }
 
 function wifiLoadStatus(){
+  if (window.NO_WIFI_CALLS) return Promise.resolve();
+
   return fetch('/api/wifi_status',{cache:'no-store'})
     .then(function(r){ return r.json(); })
     .then(function(s){
@@ -1697,14 +2087,22 @@ function applyWifiFilter(){
 function wifiScan(){
   var btn = document.getElementById('btnWifiScan');
   if(btn){ btn.disabled = true; btn.textContent = 'Buscando...'; }
-  setWifiMsg('Escaneando redes (o AP pausa por alguns segundos)...');
+  setWifiMsg('Escaneando redes ...');
   return fetch('/api/wifi_scan', {cache:'no-store'})
     .then(function(r){ return r.json(); })
-    .then(function(j){
-      wifiScanCache = (j.networks||[]);
-      renderWifiTable(wifiScanCache);
-      setWifiMsg('Encontradas '+wifiScanCache.length+' rede(s).', true);
-    })
+.then(function(j){
+  wifiScanCache = (j.networks||[]);
+  renderWifiTable(wifiScanCache);
+
+  var when = j.ts ? new Date(j.ts*1000).toLocaleString() : '';
+  var src  = j.cached ? 'cache' : 'ao vivo';
+  setWifiMsg(
+    'Redes: ' + wifiScanCache.length + 
+    ' • origem: ' + src + 
+    (when ? (' • ' + when) : ''),
+    true
+  );
+})
     .catch(function(e){ setWifiMsg('Falha ao escanear: '+e); })
     .then(function(){ if(btn){ btn.disabled = false; btn.textContent = 'Buscar redes'; } });
 }
@@ -1733,10 +2131,65 @@ function wifiConnect(){
   .catch(function(e){ setWifiMsg('Erro: '+e); });
 }
 
+
+function disableWifiScanBtns(disabled, txtCache, txtLive){
+  var bC = document.getElementById('btnWifiScanCache');
+  var bL = document.getElementById('btnWifiScanLive');
+  if (bC){ bC.disabled = !!disabled; if (txtCache) bC.textContent = txtCache; }
+  if (bL){ bL.disabled = !!disabled; if (txtLive)  bL.textContent = txtLive;  }
+}
+
+var bScanC = document.getElementById('btnWifiScanCache');
+if (bScanC) bScanC.addEventListener('click', wifiScanCacheOnly);
+
+function wifiScanCacheOnly(){
+  disableWifiScanBtns(true, 'Buscando...', 'Buscar (ao vivo)');
+  setWifiMsg('Carregando redes do cache…');
+
+  return fetch('/api/wifi_scan_cache', {
+    cache: 'no-store',
+    headers: { 'X-Cache-Only': '1' }
+  })
+  .then(r => r.json())
+  .then(j => {
+    wifiScanCache = j.networks || [];
+    renderWifiTable(wifiScanCache);
+    const when = j.ts ? new Date(j.ts*1000).toLocaleString() : '';
+    setWifiMsg('Redes: '+wifiScanCache.length+' • origem: cache'+(when?(' • '+when):''), true);
+  })
+  .catch(e => setWifiMsg('Falha ao ler cache: '+e))
+  .finally(() => disableWifiScanBtns(false, 'Buscar (cache)', 'Buscar (ao vivo)'));
+}
+
+
+function wifiScanLive(){
+  disableWifiScanBtns(true, 'Buscar (cache)', 'Escaneando...');
+  setWifiMsg('Escaneando redes ao vivo — isto pode interromper o AP por alguns segundos…');
+
+  return fetch('/api/wifi_scan?live=1', {cache:'no-store'})
+    .then(r => r.json())
+    .then(j => {
+      // backend recomendado: bloquear se AP ativo e devolver msg
+      if (j && j.ok === false && j.msg === 'AP ativo; bloqueado scan ao vivo') {
+        setWifiMsg('Bloqueado: AP está ativo. Use “Buscar (cache)” ou desative o AP para escanear ao vivo.');
+        return;
+      }
+      wifiScanCache = (j.networks || []);
+      renderWifiTable(wifiScanCache);
+      setWifiMsg('Redes: '+wifiScanCache.length+' • origem: ao vivo', true);
+    })
+    .catch(e => setWifiMsg('Falha ao escanear: '+e))
+    .finally(() => disableWifiScanBtns(false, 'Buscar (cache)', 'Buscar (ao vivo)'));
+}
+
+
+
+
 /* init Wi-Fi Cliente */
 (function(){
   var f = document.getElementById('wifiFilter'); if(f) f.addEventListener('input', applyWifiFilter);
-  var bScan = document.getElementById('btnWifiScan'); if(bScan) bScan.addEventListener('click', wifiScan);
+var bScanL = document.getElementById('btnWifiScanLive');  if (bScanL) bScanL.addEventListener('click', wifiScanLive);
+
   var bConn = document.getElementById('btnWifiConnect'); if(bConn) bConn.addEventListener('click', wifiConnect);
   try{
     var lsSsid = localStorage.getItem('wifiClientSsid');
@@ -1747,17 +2200,50 @@ function wifiConnect(){
   }catch(e){}
 })();
 
+
+
+
 /* Inicialização */
+function initWifiCache(){
+  if (window.NO_WIFI_CALLS) return Promise.resolve();
+  return fetch('/api/wifi_scan_cache', {
+    cache: 'no-store',
+    headers: { 'X-Cache-Only': '1' }
+  })
+  .then(r => r.json())
+  .then(j => {
+    wifiScanCache = j.networks || [];
+    if (wifiScanCache.length) {
+      renderWifiTable(wifiScanCache);
+      const when = j.ts ? new Date(j.ts*1000).toLocaleString() : '';
+      setWifiMsg('Redes carregadas do cache' + (when ? (' • ' + when) : ''), true);
+    } else {
+      setWifiMsg('Sem redes no cache ainda. Você pode clicar em “Buscar (cache)”.');
+    }
+  })
+  .catch(e => console.warn('wifi_scan_cache falhou:', e));
+}
+
+
+
 (function(){
   function refresh(){
     return fetch('/api/status',{cache:'no-store'})
-      .then(function(r){ return r.json(); })
-      .then(function(j){ render(j); })
-      .catch(function(e){ try{ console.error(e); }catch(_e){} });
+      .then(r => r.json())
+      .then(j => render(j))
+      .catch(e => { try{ console.error(e); }catch(_e){} });
   }
-  refresh().then(function(){ return loadLogs(); });
+
+  refresh()
+    .then(loadLogs)
+   // .then(initWifiCache)          // <- agora roda na inicialização
+    .catch(e => console.error(e));
+
   setInterval(refresh, 3000);
+  
 })();
+
+
 </script>
 
 
@@ -1793,6 +2279,40 @@ function wifiConnect(){
     };
   }
 })();
+
+
+
+function uiBusyWifi(busy, msg){
+  var ids = ['btnWifiAP','btnWifiReset','btnWifiScanCache','btnWifiScanLive','btnWifiConnect'];
+  ids.forEach(id => { var b=document.getElementById(id); if(b) b.disabled=!!busy; });
+  setWifiMsg(msg || '', !!busy && !!msg);
+}
+
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+// espera até que /api/wifi_status diga que o modo é "AP" e hostapd está rodando
+async function waitUntilAP(timeoutMs){
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs){
+    try{
+      const s = await fetch('/api/wifi_status',{cache:'no-store'}).then(r=>r.json());
+      const modeOk = (String(s.mode||'').toUpperCase() === 'AP');
+      const hostOk = s.hostapd_running === true || s.ap_running === true;
+      if (modeOk && hostOk) return true;
+    }catch(_){}
+    await sleep(800);
+  }
+  return false;
+}
+
+
+
+
+
+
+
+
+
 </script>
 
 
@@ -2117,23 +2637,141 @@ function termAppend(txt){
     var b64=btoa(bytes);
     fetch('/api/term/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sid:termSid,data_b64:b64})});
   }
-  function wireTerminalButtons(){
-    var b;
-    b=document.getElementById('termStart'); if(b) b.addEventListener('click',function(){termStart();});
-    b=document.getElementById('termStop');  if(b) b.addEventListener('click',function(){termStop(true);});
-    b=document.getElementById('termClear'); if(b) b.addEventListener('click',termClear);
-    b=document.getElementById('termSend');  if(b) b.addEventListener('click',termSendLine);
-    var inp=document.getElementById('termInput');
-    if(inp){ inp.addEventListener('keydown',function(e){ if(e.key==='Enter'){ e.preventDefault(); termSendLine(); } }); }
-    b=document.getElementById('termCtrlC'); if(b) b.addEventListener('click',function(){ termSendRaw(String.fromCharCode(3)); });
-    b=document.getElementById('termCtrlD'); if(b) b.addEventListener('click',function(){ termSendRaw(String.fromCharCode(4)); });
+  
+  
+  
+  
+  function ensureShellStarted(cb){
+  if (termSid) { cb(); return; }
+  termStart();
+  var tries = 0, iv = setInterval(function(){
+    if (termSid || ++tries > 40) { // ~2s (40 * 50ms)
+      clearInterval(iv);
+      cb();
+    }
+  }, 50);
+}
+
+
+function wireTerminalButtons(){
+  var b, inp;
+
+  // Básicos
+  b = document.getElementById('termStart'); if (b) b.addEventListener('click', function(){ termStart(); });
+  b = document.getElementById('termStop');  if (b) b.addEventListener('click', function(){ termStop(true); });
+  b = document.getElementById('termClear'); if (b) b.addEventListener('click', termClear);
+  b = document.getElementById('termSend');  if (b) b.addEventListener('click', termSendLine);
+
+  // Enter no input envia a linha
+  inp = document.getElementById('termInput');
+  if (inp) {
+    inp.addEventListener('keydown', function(e){
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        termSendLine();
+      }
+    });
   }
+
+  // Ctrl-C e Ctrl-D
+  b = document.getElementById('termCtrlC'); if (b) b.addEventListener('click', function(){ termSendRaw(String.fromCharCode(3)); });
+  b = document.getElementById('termCtrlD'); if (b) b.addEventListener('click', function(){ termSendRaw(String.fromCharCode(4)); });
+
+  // Botão "Script"
+  b = document.getElementById('termRunScript');
+  if (b) {
+    b.addEventListener('click', function(){
+      // use \\n para não quebrar a string dentro do Python
+      var send = function(){ termSendRaw("chmod +x ./script.sh && ./script.sh\\n"); };
+      // se preferir sem chmod, use:
+      // var send = function(){ termSendRaw("./script.sh\\n"); };
+
+      if (!termSid) {
+        termStart();
+        setTimeout(send, 400);
+      } else {
+        send();
+      }
+    });
+  }
+}
+
+
+  
   if(document.readyState==='loading'){ document.addEventListener('DOMContentLoaded',wireTerminalButtons); }
   else{ wireTerminalButtons(); }
 })();
 </script>
 
 
+<script>
+(function(){
+  function fmtMTime(ts){
+    if(!ts && ts!==0) return '—';
+    try { return new Date(ts*1000).toLocaleString(); } catch(e){ return String(ts); }
+  }
+  function renderRootTable(files){
+    var tb = document.querySelector('#rootTable tbody');
+    if(!tb) return;
+    if(!files || !files.length){
+      tb.innerHTML = '<tr><td colspan="3">Vazio</td></tr>';
+      return;
+    }
+    files.sort(function(a,b){
+      if ((a.is_dir?1:0)!==(b.is_dir?1:0)) return (b.is_dir?1:0)-(a.is_dir?1:0);
+      return (a.name||'').localeCompare(b.name||'');
+    });
+    var rows='';
+    for(var i=0;i<files.length;i++){
+      var f=files[i];
+      rows+='<tr>'
+          + '<td>'+ (f.is_dir?'📁 ':'') + escapeHtml(f.name||'') +'</td>'
+          + '<td>'+ (f.is_dir?'—':humanBytes(f.size||0)) +'</td>'
+          + '<td>'+ fmtMTime(f.mtime) +'</td>'
+          + '</tr>';
+    }
+    tb.innerHTML=rows;
+  }
+  function rootRefresh(){
+    fetch('/api/root_ls',{cache:'no-store'})
+      .then(r=>r.json())
+      .then(j=> renderRootTable(j.files||[]))
+      .catch(e=>{
+        var tb=document.querySelector('#rootTable tbody');
+        if(tb) tb.innerHTML='<tr><td colspan="3">Erro: '+String(e)+'</td></tr>';
+      });
+  }
+  function rootUpload(){
+    var inp=document.getElementById('rootFile');
+    var msg=document.getElementById('rootMsg');
+    var btn=document.getElementById('rootUpload');
+    if(!inp || !inp.files || !inp.files.length){ msg.textContent='Escolha um arquivo.'; return; }
+    var fd=new FormData();
+    for(var i=0;i<inp.files.length;i++){ fd.append('file', inp.files[i], inp.files[i].name); }
+    if(btn){ btn.disabled=true; btn.textContent='Enviando…'; }
+    msg.textContent='Enviando...';
+    fetch('/api/root_upload',{method:'POST', body: fd})
+      .then(r=>r.json())
+      .then(j=>{
+        if(j.ok){
+          msg.textContent='Enviado: '+(j.saved||[]).map(x=>x.name).join(', ');
+          inp.value='';
+          rootRefresh();
+        }else{
+          msg.textContent='Falha: '+(j.msg||'erro');
+        }
+      })
+      .catch(e=>{ msg.textContent='Erro: '+String(e); })
+      .finally(()=>{ if(btn){ btn.disabled=false; btn.textContent='Enviar'; }});
+  }
+  document.addEventListener('click', function(e){
+    if(e.target&&e.target.id==='rootRefresh') rootRefresh();
+    if(e.target&&e.target.id==='rootUpload')  rootUpload();
+  });
+  // 1ª carga
+  rootRefresh();
+})();
+</script>
 
 
 
@@ -2157,20 +2795,31 @@ class ShellSession:
         if self.pid == 0:
             # filho: exec bash com TERM=xterm
             env = os.environ.copy()
-            env["TERM"] = env.get("TERM","xterm")
-            os.execvpe("/bin/bash", ["bash","-l"], env)
+            env["TERM"] = env.get("TERM", "xterm")
+
+            # >>> COMEÇO: garantir que inicia em /root
+            try:
+                os.chdir("/root")
+                env["HOME"] = "/root"  # opcional, mas ajuda o bash -l a usar perfis certos
+            except Exception:
+                pass
+            # <<< FIM
+
+            os.execvpe("/bin/bash", ["bash", "-l"], env)
+
         # pai:
         self.buf = bytearray()
         self.lock = threading.Lock()
         self.alive = True
         self.last = time.time()
         self.resize(cols, rows)
-        # opcional: prompt “limpo”, menos ruído
-        try: os.write(self.fd, b'export PS1="\\u@\\h:\\w\\$ ";\n')
-        except: pass
-
+        try:
+            os.write(self.fd, b'export PS1="\\u@\\h:\\w\\$ ";\n')
+        except:
+            pass
         self.reader = threading.Thread(target=self._reader, daemon=True)
         self.reader.start()
+
 
     def _reader(self):
         while self.alive:
@@ -2240,6 +2889,8 @@ def _reap_sessions_loop():
 # inicia coletor em background (logo no import)
 threading.Thread(target=_reap_sessions_loop, daemon=True).start()
 
+
+
 class H(BaseHTTPRequestHandler):
     def _json_headers(self):
         self.send_header("Cache-Control","no-store")
@@ -2254,76 +2905,98 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if self.path.startswith("/api/status"):
+            url  = urllib.parse.urlparse(self.path)
+            path = url.path
+            qs   = urllib.parse.parse_qs(url.query)
+
+            if path == "/api/status":
                 data = collect_status()
                 self._send_json(data); return
 
-            elif self.path.startswith("/api/wifi_scan"):
-                data = wifi_scan_networks()
-                self._send_json({"networks": data}); return
+            elif path == "/api/wifi_scan_cache":
+                c = _scan_cache_load()
+                self._send_json({
+                    "ok": True,
+                    "cached": True,
+                    "networks": c.get("networks", []),
+                    "ts": c.get("ts", 0),
+                }); return
 
-            elif self.path.startswith("/api/wifi_connect"):
-                qs = {}
-                if "?" in self.path:
-                    qs = urllib.parse.parse_qs(self.path.split("?",1)[1])
-                ssid = (qs.get("ssid",[None])[0] or "")
-                pw   = (qs.get("pass",[None])[0] or None)
-                persist = (qs.get("persist",["0"])[0] in ("1","true","yes","on"))
-                res = wifi_connect(ssid, pw, persist=persist)
-                self._send_json(res); return
+            elif path == "/api/wifi_scan":
+                want_live = (qs.get("live",["0"])[0] in ("1","true","yes","on"))
+                if want_live:
+                    mode = (_wifi_mode() or "").lower()
+                    if mode in ("ap","__ap","master") or _svc_active("create_ap.service"):
+                        c = _scan_cache_load()
+                        self._send_json({
+                            "ok": False,
+                            "msg": "AP ativo; bloqueado scan ao vivo",
+                            "cached": True,
+                            "networks": c.get("networks", []),
+                            "ts": c.get("ts")
+                        }); return
 
-            elif self.path.startswith("/api/logs"):
-                qs = {}
-                if "?" in self.path:
-                    qs = urllib.parse.parse_qs(self.path.split("?",1)[1])
+                nets = wifi_scan_networks()
+
+                if not nets:
+                    c = _scan_cache_load()
+                    self._send_json({
+                        "networks": c.get("networks", []),
+                        "cached": True,
+                        "ts": c.get("ts")
+                    }); return
+
+                c = _scan_cache_save(nets)
+                self._send_json({
+                    "networks": nets,
+                    "cached": False,
+                    "ts": c.get("ts")
+                }); return
+
+            elif path == "/api/logs":
                 kind = (qs.get("kind",["all"])[0] or "all")
                 n    = (qs.get("n",["200"])[0] or "200")
                 logs = get_logs(kind, n)
                 self._send_json({"kind": kind, "n": int(n), "logs": logs}); return
 
-            elif self.path == "/" or self.path.startswith("/index.html"):
+            elif path == "/" or path == "/index.html":
                 b = HTML.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type","text/html; charset=utf-8")
                 self.send_header("Cache-Control","no-store")
                 self.end_headers()
                 self.wfile.write(b); return
-            
-            elif self.path.startswith("/api/wifi_status"):
+
+            elif path == "/api/wifi_status":
                 self._send_json(wifi_client_status()); return
 
-            elif self.path.startswith("/api/boot_mode"):
+            elif path == "/api/boot_mode":
                 self._send_json(get_boot_mode()); return
-                
-            elif self.path.startswith("/api/term/read"):
-                qs = {}
-                if "?" in self.path:
-                    qs = urllib.parse.parse_qs(self.path.split("?",1)[1])
+
+            elif path == "/api/term/read":
                 sid = (qs.get("sid",[""])[0] or "")
                 pos = int((qs.get("pos",["0"])[0] or "0"))
                 s = _get_session(sid)
                 if not s:
                     self._send_json({"error":"no-session"}, status=404); return
                 out, total = s.read_from(pos)
-                # base64 para transmitir bytes/ANSI com segurança
                 self._send_json({"sid": sid, "pos": total, "out_b64": base64.b64encode(out).decode("ascii"), "alive": s.alive}); return
 
-            elif self.path.startswith("/api/services"):
-                # /api/services?all=1&q=texto
-                qs = {}
-                if "?" in self.path:
-                    qs = urllib.parse.parse_qs(self.path.split("?",1)[1])
+            elif path == "/api/services":
                 include_system = (qs.get("all",["0"])[0] in ("1","true","yes","on"))
                 q = (qs.get("q",[""])[0] or "")
                 items = systemd_scan_services(include_system=include_system, q=q)
                 self._send_json({"services": items}); return
 
-
+            elif path == "/api/root_ls":
+                self._send_json({"dir": "/root", "files": root_list_files()}); return
 
             else:
                 self.send_response(404); self.end_headers()
         except Exception as e:
             self._send_json({"error": str(e)}, status=500)
+
+
 
     def do_POST(self):
         try:
@@ -2399,6 +3072,10 @@ class H(BaseHTTPRequestHandler):
                 action = (data.get("action") or "")
                 res = systemd_action(unit, action)
                 self._send_json(res); return
+            elif self.path.startswith("/api/root_upload"):
+                res = root_upload_from_body(body, self.headers)
+                self._send_json(res); return
+    
                 
 
             else:
@@ -2406,13 +3083,51 @@ class H(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json({"error": str(e)}, status=500)
 
+def _bg_prewarm():
+    # pequeno atraso para deixar o create_ap estabilizar
+    try:
+        time.sleep(3)
+        prewarm_wifi_scan_cache()
+    except Exception as e:
+        print("[wifi] prewarm erro:", e)
+
+def _bg_initial_scan_once():
+    try:
+        # pequeno atraso p/ deixar o create_ap estabilizar
+        time.sleep(5)
+        # só faz sentido se desejamos AP agora (evita briga com cliente)
+        if not _want_ap_now():
+            return
+        # se houver clientes conectados, não vamos derrubar o AP
+        if wifi_stations():
+            print("[init-scan] AP tem clientes; pulando scan inicial.")
+            return
+        print("[init-scan] executando scan inicial…")
+        nets = wifi_scan_networks()
+        if nets:
+            _scan_cache_save(nets)
+            print(f"[init-scan] cache atualizado ({len(nets)} redes).")
+        else:
+            print("[init-scan] nenhum SSID visto; mantendo cache antigo.")
+    except Exception as e:
+        print("[init-scan] erro:", e)
+
+
 if __name__ == "__main__":
+    _scan_cache_load()
+    threading.Thread(target=_ap_guard_loop, daemon=True).start()
+
+    # Só roda se explicitamente habilitado (por padrão, 0)
+    if INIT_SCAN:
+        threading.Thread(target=_bg_initial_scan_once, daemon=True).start()
+
     srv = ThreadingHTTPServer((HOST, PORT), H)
     print(f"[netstatus] ouvindo em http://{HOST}:{PORT}  (wifi_if={WIFIIF})")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+
 
 PY
 
@@ -2494,7 +3209,162 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable --now wifi-client@wlan0.service
+systemctl restart wifi-client@wlan0.service
 
+
+
+
+tee /etc/NetworkManager/dispatcher.d/20-create-ap-restart >/dev/null <<'SH'
+#!/bin/sh
+# NM chama: $1=IFACE  $2=STATE
+IFACE="$1"; STATE="$2"
+
+# Ignore a Wi-Fi do AP
+[ "$IFACE" = "wlan0" ] && exit 0
+
+# Monitore WANs comuns (cabos, USB/RNDIS, PPP/4G/5G)
+case "$IFACE" in
+  end0|eth*|enx*|enp*|ens*|usb*|ppp*|wwan*) ;;
+  *) exit 0 ;;
+esac
+
+# Só reaja a transições que realmente impactam roteamento
+case "$STATE" in
+  up|down|dhcp4-change|carrier|lower-up) ;;
+  *) exit 0 ;;
+esac
+
+# Debounce: no máx. 1 restart a cada 15s
+LOCK=/run/create_ap_restart.lock
+TSF=/run/create_ap_restart.last
+(
+  exec 9>"$LOCK"
+  flock -x -w 5 9 || exit 0
+  NOW=$(date +%s)
+  LAST=0
+  [ -f "$TSF" ] && LAST=$(cat "$TSF" 2>/dev/null || echo 0)
+  [ $((NOW - LAST)) -lt 15 ] && exit 0
+
+  # Só reinicie se o serviço está realmente ativo/enabled
+  if systemctl is-active --quiet create_ap.service; then
+    logger -t create_ap_dispatcher "Estado $IFACE=$STATE -> restart create_ap.service"
+    systemctl restart create_ap.service
+    echo "$NOW" > "$TSF"
+  fi
+) &
+exit 0
+
+SH
+
+chmod +x /etc/NetworkManager/dispatcher.d/20-create-ap-restart
+systemctl restart NetworkManager-dispatcher.service
+
+
+
+
+
+
+tee /usr/local/bin/create_ap_dynamic.sh >/dev/null <<'SH'
+#!/bin/sh
+set -eu
+
+WIFI_IF="${WIFI_IF:-wlan0}"
+SSID="${SSID:-MirakoAP}"
+PASS="${PASS:-12345678}"
+GATEWAY="${GATEWAY:-192.168.7.1}"
+CHANNEL="${CHANNEL:-1}"
+BAND="${BAND:-2.4}"
+CREATE_AP="${CREATE_AP:-/usr/bin/create_ap}"
+
+find_upstream() {
+  # 1) pela rota padrão
+  DEV="$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
+  if [ -n "${DEV:-}" ] && [ "$DEV" != "$WIFI_IF" ]; then
+    echo "$DEV"; return 0
+  fi
+  # 2) varredura por ifs típicas (ignora wlan)
+  for IF in ppp0 end0 eth0 $(ls /sys/class/net 2>/dev/null | grep -E '^(enx|enp|ens|eth|usb|wwan|ppp)' | sort -u); do
+    [ "$IF" = "$WIFI_IF" ] && continue
+    ip link show "$IF" >/dev/null 2>&1 || continue
+    OPER="$(cat /sys/class/net/$IF/operstate 2>/dev/null || echo unknown)"
+    if [ "$OPER" = "up" ] || ip link show "$IF" | grep -q "state UP"; then
+      echo "$IF"; return 0
+    fi
+  done
+  return 1
+}
+
+[ -x "$CREATE_AP" ] || { echo "ERRO: $CREATE_AP não encontrado."; exit 1; }
+ip link show "$WIFI_IF" >/dev/null 2>&1 || { echo "ERRO: $WIFI_IF não existe."; exit 1; }
+
+UPSTREAM_IF="$(find_upstream || true)"
+
+if [ -n "${UPSTREAM_IF:-}" ]; then
+  echo "$(date -Iseconds) [create_ap_dynamic] Upstream: $UPSTREAM_IF (NAT)"
+  exec "$CREATE_AP" -c "$CHANNEL" -w 2 -m nat "$WIFI_IF" "$UPSTREAM_IF" "$SSID" "$PASS" -g "$GATEWAY" --freq-band "$BAND" --no-virt
+else
+  echo "$(date -Iseconds) [create_ap_dynamic] Sem upstream. AP isolado com DHCP (usa DNS do sistema quando houver)."
+  # ⚠️ Força modo sem internet para não exigir "interface de internet"
+  exec "$CREATE_AP" -c "$CHANNEL" -w 2 -m none --no-virt "$WIFI_IF" "$SSID" "$PASS" -g "$GATEWAY" --freq-band "$BAND"
+fi
+SH
+
+chmod +x /usr/local/bin/create_ap_dynamic.sh
+systemctl restart create_ap.service
+
+
+
+
+
+
+
+
+
+
+tee /etc/systemd/system/create_ap.service >/dev/null <<'EOF'
+[Unit]
+Description=Create AP WiFi (auto-detect)
+After=network-online.target
+Wants=network-online.target
+Conflicts=wifi-client@wlan0.service
+
+
+[Service]
+Type=simple
+User=root
+Environment="PATH=/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/usr/local/bin/create_ap_dynamic.sh
+ExecStop=/usr/bin/create_ap --stop wlan0
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+
+
+
+
+
+
+
+
+
+
+systemctl unmask create_ap.service
+systemctl daemon-reload
+systemctl enable --now create_ap.service
+systemctl status create_ap.service
+
+
+
+
+
+
+
+
+journalctl -xeu create_ap.service -f
 
 
 

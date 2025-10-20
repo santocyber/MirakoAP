@@ -150,6 +150,46 @@ systemctl restart NetworkManager-dispatcher.service
 
 
 
+sudo mkdir -p /root/samba
+sudo chown nobody:nogroup /root/samba    # Debian/Ubuntu; em CentOS pode ser nobody:nobody
+sudo chmod 0777 /root/samba
+sudo chmod -R 0777 /root/samba
+sudo ufw allow samba
+
+
+
+
+sudo tee /etc/samba/smb.conf >/dev/null <<'EOF'
+[global]
+   workgroup = WORKGROUP
+   server string = MirakoSamba Server
+   netbios name = MIRAKOSERVER
+   security = user
+   map to guest = Bad User
+   log file = /var/log/samba/%m.log
+   max log size = 50
+
+   # Importante para aparecer na rede
+   server role = standalone server
+   local master = yes
+   preferred master = yes
+   os level = 255
+   wins support = yes
+   name resolve order = bcast host lmhosts wins
+
+[Public]
+   comment = Pasta pública - acesso guest
+   path = /home/public
+   browseable = yes
+   guest ok = yes
+   read only = no
+   writable = yes
+   public = yes
+   force user = nobody
+   create mask = 0777
+   directory mask = 0777
+   printable = no
+EOF
 
 
 
@@ -641,6 +681,116 @@ sudo modprobe option
 sudo modprobe usbnet
 sudo modprobe huawei_cdc_ncm
 
+
+
+
+
+
+//script apk
+
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Instala múltiplos APKs em um Android via adb push + pm install -r
+# Se nenhum arquivo for passado, escaneia a pasta do script por *.apk
+
+ADB_FLAGS="-r -d -g"
+REMOTE_PATH="/data/local/tmp"
+RETRIES=1
+SLEEP_BETWEEN_RETRIES=2
+
+log() { echo -e "[`date +'%H:%M:%S'`] $*"; }
+
+if ! command -v adb >/dev/null 2>&1; then
+  echo "Erro: adb não encontrado no PATH."
+  exit 2
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Define lista de APKs
+if [ "$#" -ge 1 ]; then
+  APKS=( "$@" )
+else
+  log "Escaneando $SCRIPT_DIR por arquivos .apk..."
+  mapfile -d $'\0' -t APKS < <(find "$SCRIPT_DIR" -maxdepth 1 -type f -iname "*.apk" -print0 | sort -z)
+fi
+
+if [ "${#APKS[@]}" -eq 0 ]; then
+  log "Nenhum arquivo .apk encontrado."
+  exit 1
+fi
+
+log "Iniciando adb e aguardando dispositivo..."
+adb start-server >/dev/null 2>&1
+adb wait-for-device
+
+DEV_LINE="$(adb devices | sed -n '2p' || true)"
+if [[ -z "$DEV_LINE" || "$DEV_LINE" == *"unauthorized"* ]]; then
+  log "Dispositivo não autorizado. Aceite a permissão no Android e tente novamente."
+  adb devices
+  exit 3
+fi
+
+DEVICE="$(echo "$DEV_LINE" | awk '{print $1}')"
+log "Conectado ao dispositivo: $DEVICE"
+log "------------------------------------"
+
+FAILED=()
+SUCCESS=()
+
+for apk in "${APKS[@]}"; do
+  if [ ! -f "$apk" ]; then
+    log "Arquivo não encontrado: $apk"
+    FAILED+=("$apk (not found)")
+    continue
+  fi
+
+  base="$(basename "$apk")"
+  remote="$REMOTE_PATH/$base"
+  log "Enviando $base para o dispositivo..."
+  
+  if adb push "$apk" "$remote" >/tmp/push_log.txt 2>&1; then
+    log "  → Upload OK"
+  else
+    log "  ✗ Falha no push de $base"
+    FAILED+=("$apk (push fail)")
+    continue
+  fi
+
+  # Instala com pm install -r
+  log "Instalando $base no Android..."
+  if adb shell pm install -r -g "$remote" >/tmp/install_log.txt 2>&1; then
+    log "  ✓ Instalado com sucesso: $base"
+    SUCCESS+=("$apk")
+    # Remove o apk remoto após sucesso
+    adb shell rm -f "$remote" >/dev/null 2>&1 || true
+  else
+    log "  ✗ Falha ao instalar $base"
+    tail -n 15 /tmp/install_log.txt | sed 's/^/    /'
+    FAILED+=("$apk (install fail)")
+  fi
+
+  sleep "$SLEEP_BETWEEN_RETRIES"
+done
+
+# Resumo final
+echo
+log "=========== RESUMO ==========="
+log "Sucesso: ${#SUCCESS[@]}"
+for s in "${SUCCESS[@]}"; do echo "  - $s"; done
+
+log "Falhas: ${#FAILED[@]}"
+for f in "${FAILED[@]}"; do echo "  - $f"; done
+
+if [ "${#FAILED[@]}" -gt 0 ]; then
+  log "Alguns APKs falharam. Veja acima."
+  exit 4
+fi
+
+log "Todos os APKs foram enviados e instalados com sucesso!"
+exit 0
 
 
 
