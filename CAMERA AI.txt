@@ -298,7 +298,7 @@ finalmente o codigo
 
 //app.py
 
-tee /root/app.py >/dev/null <<'EOF'
+tee /usr/local/bin/app.py >/dev/null <<'EOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os, cv2, time, glob, threading, platform, subprocess, re, json, stat
@@ -1872,8 +1872,8 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/root/
-ExecStart=/usr/bin/python3 /root/app.py
+WorkingDirectory=/usr/local/bin/
+ExecStart=/usr/bin/python3 /usr/local/bin/app.py
 Restart=always
 RestartSec=5
 Environment=PORT=5000

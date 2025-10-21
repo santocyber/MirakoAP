@@ -1,0 +1,208 @@
+tee /usr/local/bin/install_apks_push_log.sh >/dev/null <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Instala vários APKs via adb push + pm install -r
+# e gera log completo com reboot opcional ao final.
+
+ADB_FLAGS="-r -d -g"
+REMOTE_PATH="/data/local/tmp"
+RETRIES=1
+SLEEP_BETWEEN_RETRIES=2
+LOG_FILE="install_log.txt"
+
+log() {
+  echo -e "[`date +'%Y-%m-%d %H:%M:%S'`] $*" | tee -a "$LOG_FILE"
+}
+
+# Inicializa log
+echo "========== LOG DE INSTALAÇÃO - $(date '+%Y-%m-%d %H:%M:%S') ==========" > "$LOG_FILE"
+
+if ! command -v adb >/dev/null 2>&1; then
+  log "ERRO: adb não encontrado. Instale o pacote 'android-platform-tools'."
+  exit 2
+fi
+
+###SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="/root"
+
+# Define lista de APKs
+if [ "$#" -ge 1 ]; then
+  APKS=( "$@" )
+else
+  log "Nenhum argumento informado. Escaneando diretório $SCRIPT_DIR..."
+  mapfile -d $'\0' -t APKS < <(find "$SCRIPT_DIR" -maxdepth 1 -type f -iname "*.apk" -print0 | sort -z)
+fi
+
+if [ "${#APKS[@]}" -eq 0 ]; then
+  log "Nenhum arquivo .apk encontrado. Saindo."
+  exit 1
+fi
+
+log "Iniciando adb e aguardando dispositivo..."
+adb start-server >/dev/null 2>&1
+adb wait-for-device
+
+DEV_LINE="$(adb devices | sed -n '2p' || true)"
+if [[ -z "$DEV_LINE" || "$DEV_LINE" == *"unauthorized"* ]]; then
+  log "ERRO: Dispositivo não autorizado. Verifique o cabo e aceite a permissão no Android."
+  adb devices
+  exit 3
+fi
+
+DEVICE="$(echo "$DEV_LINE" | awk '{print $1}')"
+log "Conectado ao dispositivo: $DEVICE"
+log "------------------------------------------"
+
+FAILED=()
+SUCCESS=()
+
+for apk in "${APKS[@]}"; do
+  if [ ! -f "$apk" ]; then
+    log "Arquivo não encontrado: $apk"
+    FAILED+=("$apk (não encontrado)")
+    continue
+  fi
+
+  base="$(basename "$apk")"
+  remote="$REMOTE_PATH/$base"
+
+  log "Enviando $base para o dispositivo..."
+  if adb push -p "$apk" "$remote" >>"$LOG_FILE" 2>&1; then
+    log "  → Upload concluído."
+  else
+    log "  ✗ Falha no push de $base."
+    FAILED+=("$apk (push falhou)")
+    continue
+  fi
+
+  # Instala via pm install
+  log "Instalando $base..."
+  if adb shell pm install $ADB_FLAGS "$remote" >>"$LOG_FILE" 2>&1; then
+    log "  ✓ Instalado com sucesso: $base"
+    SUCCESS+=("$apk")
+    adb shell rm -f "$remote" >/dev/null 2>&1 || true
+  else
+    log "  ✗ Falha ao instalar $base"
+    FAILED+=("$apk (install falhou)")
+  fi
+
+  sleep "$SLEEP_BETWEEN_RETRIES"
+done
+
+log ""
+log "=========== RESUMO ==========="
+log "Sucesso: ${#SUCCESS[@]}"
+for s in "${SUCCESS[@]}"; do log "  - $s"; done
+
+log "Falhas: ${#FAILED[@]}"
+for f in "${FAILED[@]}"; do log "  - $f"; done
+log "=============================="
+
+# Reboot condicional
+if [ "${#FAILED[@]}" -eq 0 ]; then
+  log "✅ Todas as instalações concluídas com sucesso. Reiniciando dispositivo..."
+  adb reboot
+else
+  log "⚠️  Instalações concluídas com erros. Reboot cancelado."
+fi
+
+log "Log completo salvo em: $LOG_FILE"
+exit 0
+
+SH
+
+
+
+sudo chmod +x /usr/local/bin/install_apks_push_log.sh
+
+
+
+tee /usr/local/bin/android-auto-installer.sh >/dev/null <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="/usr/local/bin"
+INSTALL_SCRIPT="$SCRIPT_DIR/install_apks_push_log.sh"
+CHECK_INTERVAL=30   # segundos entre checagens
+LOG_FILE="/var/log/android_auto_installer.log"
+
+log() {
+  echo "[`date +'%Y-%m-%d %H:%M:%S'`] $*" | tee -a "$LOG_FILE"
+}
+
+log "=== Serviço Android Auto Installer iniciado ==="
+
+while true; do
+  DEVICES=$(adb devices | grep -w "device" | grep -v "List" || true)
+
+  if [ -n "$DEVICES" ]; then
+    DEVICE_ID=$(echo "$DEVICES" | awk '{print $1}')
+    log "Dispositivo detectado: $DEVICE_ID"
+
+    # Evita múltiplas execuções simultâneas
+    if pgrep -f "$INSTALL_SCRIPT" >/dev/null; then
+      log "Instalação já em andamento, aguardando..."
+    else
+      log "Executando script de instalação..."
+      bash "$INSTALL_SCRIPT" >> "$LOG_FILE" 2>&1
+    fi
+  else
+    log "Nenhum dispositivo encontrado."
+  fi
+
+  sleep "$CHECK_INTERVAL"
+done
+
+SH
+
+
+
+sudo chmod +x /usr/local/bin/android-auto-installer.sh
+
+
+
+tee /etc/systemd/system/android-auto-installer.service >/dev/null <<'EOF'
+[Unit]
+Description=Monitor Android USB e instalar APKs automaticamente
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/android-auto-installer.sh
+Restart=always
+RestartSec=10
+User=root
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+StandardOutput=append:/var/log/android_auto_installer.log
+StandardError=append:/var/log/android_auto_installer.log
+
+[Install]
+WantedBy=multi-user.target
+
+EOF
+
+
+
+
+sudo systemctl daemon-reload
+sudo systemctl enable android-auto-installer.service
+sudo systemctl start android-auto-installer.service
+
+
+
+
+sudo journalctl -u android-auto-installer.service -f
+
+
+
+
+sudo nano /etc/udev/rules.d/99-android-autoinstall.rules
+SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", MODE="0666", RUN+="/usr/local/bin/android-auto-installer.sh"
+
+
+
+
+
+
+
