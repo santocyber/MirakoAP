@@ -3,13 +3,21 @@ tee /usr/local/bin/install_apks_push_log.sh >/dev/null <<'SH'
 set -euo pipefail
 
 # Instala vários APKs via adb push + pm install -r
-# e gera log completo com reboot opcional ao final.
+# - Busca APKs em /root/
+# - Desinstala SEM CHECAR (forçado) os pacotes listados (ex.: com.vendcard1)
+# - Captura saída do pm install (Success/Failure)
+# - Em caso de INSTALL_FAILED_UPDATE_INCOMPATIBLE, tenta desinstalar e reinstalar
+# - Faz reboot somente se todas as instalações forem bem-sucedidas
+# - Log completo em /root/install_log.txt
 
 ADB_FLAGS="-r -d -g"
 REMOTE_PATH="/data/local/tmp"
-RETRIES=1
 SLEEP_BETWEEN_RETRIES=2
-LOG_FILE="install_log.txt"
+SCRIPT_DIR="/root"
+LOG_FILE="/root/install_log.txt"
+
+# Pacotes a desinstalar SEMPRE, sem checar
+FORCE_UNINSTALL_PACKAGES=("com.vendcard1")
 
 log() {
   echo -e "[`date +'%Y-%m-%d %H:%M:%S'`] $*" | tee -a "$LOG_FILE"
@@ -19,14 +27,11 @@ log() {
 echo "========== LOG DE INSTALAÇÃO - $(date '+%Y-%m-%d %H:%M:%S') ==========" > "$LOG_FILE"
 
 if ! command -v adb >/dev/null 2>&1; then
-  log "ERRO: adb não encontrado. Instale o pacote 'android-platform-tools'."
+  log "ERRO: adb não encontrado. Instale 'android-platform-tools'."
   exit 2
 fi
 
-###SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_DIR="/root"
-
-# Define lista de APKs
+# Lista de APKs
 if [ "$#" -ge 1 ]; then
   APKS=( "$@" )
 else
@@ -54,6 +59,21 @@ DEVICE="$(echo "$DEV_LINE" | awk '{print $1}')"
 log "Conectado ao dispositivo: $DEVICE"
 log "------------------------------------------"
 
+# Função: desinstala SEM CHECAR um pacote (tenta várias formas, ignora erros)
+uninstall_no_check() {
+  local pkg="$1"
+  [ -z "$pkg" ] && return 0
+  log "Forçando desinstalação (sem checar) de: $pkg"
+  adb shell pm uninstall "$pkg" >>"$LOG_FILE" 2>&1 || true
+  adb shell pm uninstall --user 0 "$pkg" >>"$LOG_FILE" 2>&1 || true
+  adb shell cmd package uninstall -k --user 0 "$pkg" >>"$LOG_FILE" 2>&1 || true
+}
+
+# Desinstala SEM CHECAR todos pacotes forçados ANTES de começar
+for PKG in "${FORCE_UNINSTALL_PACKAGES[@]}"; do
+  uninstall_no_check "$PKG"
+done
+
 FAILED=()
 SUCCESS=()
 
@@ -67,6 +87,7 @@ for apk in "${APKS[@]}"; do
   base="$(basename "$apk")"
   remote="$REMOTE_PATH/$base"
 
+  # Empurra o APK
   log "Enviando $base para o dispositivo..."
   if adb push -p "$apk" "$remote" >>"$LOG_FILE" 2>&1; then
     log "  → Upload concluído."
@@ -76,15 +97,46 @@ for apk in "${APKS[@]}"; do
     continue
   fi
 
-  # Instala via pm install
+  # Instala e CAPTURA a saída textual do pm
   log "Instalando $base..."
-  if adb shell pm install $ADB_FLAGS "$remote" >>"$LOG_FILE" 2>&1; then
+  INSTALL_OUTPUT="$(adb shell pm install $ADB_FLAGS "$remote" 2>&1 || true)"
+  echo "$INSTALL_OUTPUT" >>"$LOG_FILE"
+
+  if echo "$INSTALL_OUTPUT" | grep -qi "Failure"; then
+    if echo "$INSTALL_OUTPUT" | grep -q "INSTALL_FAILED_UPDATE_INCOMPATIBLE"; then
+      log "  ⚠️  Conflito de assinatura. Tentando desinstalar e reinstalar..."
+
+      # 1) Desinstala SEM CHECAR os pacotes forçados (ex.: com.vendcard1)
+      for PKG in "${FORCE_UNINSTALL_PACKAGES[@]}"; do
+        uninstall_no_check "$PKG"
+      done
+
+      # 2) Tentativa de reinstalação
+      log "  → Reinstalando $base..."
+      REINSTALL_OUTPUT="$(adb shell pm install $ADB_FLAGS "$remote" 2>&1 || true)"
+      echo "$REINSTALL_OUTPUT" >>"$LOG_FILE"
+
+      if echo "$REINSTALL_OUTPUT" | grep -qi "Success"; then
+        log "  ✓ Reinstalação bem-sucedida: $base"
+        SUCCESS+=("$apk")
+        adb shell rm -f "$remote" >/dev/null 2>&1 || true
+      else
+        log "  ✗ Falha após tentativa de desinstalação forçada: $(echo "$REINSTALL_OUTPUT" | grep -i 'Failure' || echo 'erro desconhecido')"
+        FAILED+=("$apk (reinstall fail)")
+      fi
+    else
+      log "  ✗ Falha ao instalar $base: $(echo "$INSTALL_OUTPUT" | grep -i 'Failure')"
+      FAILED+=("$apk (install fail)")
+    fi
+
+  elif echo "$INSTALL_OUTPUT" | grep -qi "Success"; then
     log "  ✓ Instalado com sucesso: $base"
     SUCCESS+=("$apk")
     adb shell rm -f "$remote" >/dev/null 2>&1 || true
   else
-    log "  ✗ Falha ao instalar $base"
-    FAILED+=("$apk (install falhou)")
+    log "  ⚠️ Saída inesperada ao instalar $base:"
+    echo "$INSTALL_OUTPUT" | tee -a "$LOG_FILE"
+    FAILED+=("$apk (unknown result)")
   fi
 
   sleep "$SLEEP_BETWEEN_RETRIES"
@@ -109,6 +161,7 @@ fi
 
 log "Log completo salvo em: $LOG_FILE"
 exit 0
+
 
 SH
 
@@ -195,7 +248,7 @@ sudo systemctl start android-auto-installer.service
 sudo journalctl -u android-auto-installer.service -f
 
 
-
+cat install_log.txt
 
 sudo nano /etc/udev/rules.d/99-android-autoinstall.rules
 SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", MODE="0666", RUN+="/usr/local/bin/android-auto-installer.sh"

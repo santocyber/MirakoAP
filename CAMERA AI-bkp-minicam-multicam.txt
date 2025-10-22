@@ -1,7 +1,7 @@
 
 
 
-
+pip uninstall -y opencv-python opencv-python-headless --break-system-packages
 
 
 
@@ -9,7 +9,9 @@
 
 
 sudo apt update
- sudo apt-get install -y python3-requests  python3-opencv ffmpeg
+sudo apt install python3-opencv ffmpeg
+
+
 
 
 
@@ -289,28 +291,18 @@ import os, cv2, time, glob, threading, platform, subprocess, re, json, stat
 from datetime import datetime, date
 from flask import Flask, Response, jsonify, render_template_string, request, send_from_directory, abort
 from werkzeug.middleware.proxy_fix import ProxyFix
-import requests  # === EVO: para enviar ao Evolution
-import base64
-
 
 # ----------------- Pastas -----------------
 MEDIA = {"photos": "photos", "videos": "videos", "thumbs": "thumbs"}
 for d in MEDIA.values():
     os.makedirs(d, exist_ok=True)
 
-# === EVO: Credenciais via ENV (com defaults sugeridos por você)
-EVO_API_URL      = os.environ.get("EVO_API_URL",      "https://evolution.mirako.org").rstrip("/")
-EVO_API_INSTANCE = os.environ.get("EVO_API_INSTANCE", "Mirako")
-EVO_API_KEY      = os.environ.get("EVO_API_KEY",      "f2824a60ab1042f1144fd1e3c83ea5e3b8f8645884a035609782c287401bafbe")
-
 # ----------------- Config persistente -----------------
 CONFIG_FILE = "config.json"
 CFG_LOCK = threading.Lock()
 CFG = {
     "cameras": {},
-    "ui": {"preview_size": "medium", "library_view": "grid"},
-    # === EVO: bloco global Evolution
-    "evo": {"enable": False, "phones": [], "base": ""}
+    "ui": {"preview_size": "medium", "library_view": "grid"}
 }
 
 def _cfg_load():
@@ -324,13 +316,7 @@ def _cfg_load():
                 loaded["ui"].setdefault("library_view", "grid")
                 loaded["ui"].setdefault("selected_devs", [])
                 loaded.setdefault("cameras", {})
-                # === EVO: garantir bloco evo
-                evo = loaded.setdefault("evo", {})
-                evo.setdefault("enable", False)
-                evo.setdefault("phones", [])
-                evo.setdefault("base", "")
                 for k, c in loaded["cameras"].items():
-                    c.setdefault("name", k)  # === EVO: nome amigável da câmera
                     c.setdefault("mic", "default")
                     c.setdefault("timelapse", {"enable": False, "interval": 5})
                     c.setdefault("motion", {
@@ -352,7 +338,6 @@ def get_cam_cfg(dev):
     dev = str(dev)
     with CFG_LOCK:
         c = CFG.setdefault("cameras", {}).setdefault(dev, {})
-        c.setdefault("name", dev)  # === EVO
         c.setdefault("mic", "default")
         c.setdefault("timelapse", {"enable": False, "interval": 5})
         c.setdefault("motion", {
@@ -378,212 +363,8 @@ def set_ui_cfg(updates: dict):
         CFG.setdefault("ui", {}).update(updates or {})
     _cfg_save()
 
-def set_evo_cfg(updates: dict):
-    with CFG_LOCK:
-        evo = CFG.setdefault("evo", {})
-        if "enable" in updates: evo["enable"] = bool(updates["enable"])
-        if "phones" in updates:
-            ph = updates["phones"]
-            if isinstance(ph, str):
-                # aceita linha única/textarea (vírgula/linha)
-                arr = re.split(r"[\n,;]+", ph)
-                evo["phones"] = [p.strip() for p in arr if p.strip()]
-            elif isinstance(ph, (list, tuple)):
-                evo["phones"] = [str(p).strip() for p in ph if str(p).strip()]
-        if "base" in updates: evo["base"] = str(updates["base"]).strip().rstrip("/")
-    _cfg_save()
-
 def sanitize_dev(dev: str) -> str:
     return re.sub(r"[^0-9A-Za-z_\-\.]", "_", str(dev))
-
-# === EVO: Fila/envio assíncrono
-class EvoSender:
-    """
-    Envia foto/vídeo para WhatsApp via Evolution API.
-    Prioridade: fluxo antigo que funcionava (sendMedia + base64).
-    Fallback opcional: envio por URL pública se CFG['evo']['base'] estiver configurado.
-    """
-    def __init__(self):
-        self.q = []
-        self.lock = threading.Lock()
-        self.evt = threading.Event()
-        self.th = threading.Thread(target=self._loop, daemon=True)
-        self.th.start()
-
-    # ---------------- utils ----------------
-    @staticmethod
-    def _norm_phone(raw) -> str:
-        s = str(raw or "").strip()
-        if not s:
-            return ""
-        if s.startswith("+"):
-            return "+" + re.sub(r"\D", "", s)
-        return re.sub(r"\D", "", s)
-
-    def _http_post(self, url, headers, json_data, timeout):
-        # usa requests se existir; senão, urllib
-        try:
-            import requests
-            r = requests.post(url, headers=headers or {}, json=json_data, timeout=timeout)
-            return (r.status_code or 0), (r.text or "")
-        except ImportError:
-            import urllib.request
-            import ssl, json as _json
-            data = _json.dumps(json_data or {}).encode("utf-8")
-            final_headers = {"Content-Type": "application/json"}
-            if headers:
-                final_headers.update(headers)
-            req = urllib.request.Request(url, data=data, headers=final_headers, method="POST")
-            ctx = ssl.create_default_context()
-            try:
-                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-                    status = resp.getcode() or 0
-                    text = resp.read().decode("utf-8", "ignore")
-                    return status, text
-            except Exception as e:
-                return 599, f"{type(e).__name__}: {e}"
-
-    def _build_abs_url(self, rel_url: str):
-        # aceita CFG['evo']['base'] OU CFG['evo']['public_base']
-        with CFG_LOCK:
-            evo = CFG.get("evo") or {}
-            base = (evo.get("base") or evo.get("public_base") or "").strip()
-        if not base:
-            return None
-        rel = rel_url[1:] if rel_url.startswith("/") else rel_url
-        return f"{base.rstrip('/')}/{rel}"
-
-    def _read_b64(self, path: str) -> str | None:
-        try:
-            with open(path, "rb") as f:
-                return base64.b64encode(f.read()).decode("ascii")
-        except Exception as e:
-            print("[EVO] erro lendo arquivo p/ base64:", e)
-            return None
-
-    # ---------------- envio Evolution ----------------
-    def _send_media_base64(self, phone: str, kind: str, filepath: str, caption: str):
-        """
-        Fluxo ANTIGO (o que já funcionava):
-        POST {EVO_API_URL}/message/sendMedia/{instance}
-        body: { number, mediatype, mimetype, caption, media(base64), fileName, delay }
-        """
-        b64 = self._read_b64(filepath)
-        if not b64:
-            return 0, "sem base64"
-        mediatype = "image" if kind == "photo" else "video"
-        # inferência simples de mimetype
-        ext = os.path.splitext(filepath)[1].lower()
-        if mediatype == "image":
-            mimetype = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
-        else:
-            mimetype = "video/mp4"  # seu fluxo grava .mp4
-
-        payload = {
-            "number": phone,
-            "mediatype": mediatype,
-            "mimetype": mimetype,
-            "caption": caption or "",
-            "media": b64,
-            "fileName": os.path.basename(filepath),
-            "delay": 0
-        }
-        url = f"{EVO_API_URL.rstrip('/')}/message/sendMedia/{EVO_API_INSTANCE}"
-        headers = {"apikey": EVO_API_KEY, "Content-Type": "application/json"}
-        return self._http_post(url, headers, payload, timeout=60)
-
-    def _send_media_url(self, phone: str, kind: str, media_url: str, caption: str):
-        """
-        Fallback opcional: envio por URL pública (se configurada).
-        POST {EVO_API_URL}/message/{image|video}/{instance}
-        body: { number, url, caption }
-        """
-        media_type = "image" if kind == "photo" else "video"
-        url = f"{EVO_API_URL.rstrip('/')}/message/{media_type}/{EVO_API_INSTANCE}"
-        headers = {"apikey": EVO_API_KEY, "Content-Type": "application/json"}
-        body = {"number": phone, "url": media_url, "caption": caption or ""}
-        return self._http_post(url, headers, body, timeout=20)
-
-    # ---------------- fila ----------------
-    def queue(self, kind: str, file_path: str, dev: str, when_ts: float = None):
-        task = {"kind": kind, "file_path": file_path, "dev": str(dev), "ts": when_ts or time.time()}
-        with self.lock:
-            self.q.append(task)
-            self.evt.set()
-
-    def _loop(self):
-        while True:
-            self.evt.wait(1.0)
-            while True:
-                with self.lock:
-                    if not self.q:
-                        self.evt.clear()
-                        break
-                    task = self.q.pop(0)
-                try:
-                    self._send_task(task)
-                except Exception as e:
-                    print("[EVO] erro no envio:", e)
-
-    # ---------------- tarefa ----------------
-    def _send_task(self, task):
-        kind = task["kind"]             # "photo" | "video"
-        file_path = task["file_path"]
-        dev = task["dev"]
-        ts = datetime.fromtimestamp(task["ts"]).strftime("%d/%m/%Y %H:%M:%S")
-
-        # Nome amigável da câmera (se existir no CFG)
-        ccfg = get_cam_cfg(dev)
-        cam_name = ccfg.get("name", dev)
-
-        caption = f"🎯 Movimento na câmera {cam_name}\n⏱ {ts}"
-
-        fname = os.path.basename(file_path)
-        if kind == "photo":
-            rel = f"/media/photos/{fname}"
-        else:
-            rel = f"/media/videos/{fname}"
-
-        # lê config Evolution
-        with CFG_LOCK:
-            evo = CFG.get("evo") or {}
-            enabled = bool(evo.get("enable"))
-            raw_phones = evo.get("phones") or []
-        if not enabled:
-            print("[EVO] envio desabilitado (evo.enable=false)")
-            return
-        phones = [self._norm_phone(p) for p in raw_phones if self._norm_phone(p)]
-        if not phones:
-            print("[EVO] nenhum telefone válido configurado")
-            return
-
-        # tenta PRIMEIRO o fluxo antigo (base64), que já funcionava para você
-        sent_any = False
-        for phone in phones:
-            s, t = self._send_media_base64(phone, kind, file_path, caption)
-            if s in (200, 201, 202):
-                print(f"[EVO] B64 OK → {phone}: {fname}")
-                sent_any = True
-                continue
-
-            print(f"[EVO] B64 FAIL → {phone}: {s} {t[:180]}")
-            # fallback: se há base pública, tenta URL
-            media_url = self._build_abs_url(rel)
-            if media_url:
-                s2, t2 = self._send_media_url(phone, kind, media_url, caption)
-                if s2 < 300:
-                    print(f"[EVO] URL OK → {phone}: {fname}")
-                    sent_any = True
-                else:
-                    print(f"[EVO] URL FAIL → {phone}: {s2} {t2[:180]}")
-
-        if not sent_any:
-            print("[EVO] nenhuma entrega concluída (base64 e URL falharam)")
-            
-            
-            
-EVO_SENDER = EvoSender()
-
 
 # ----------------- HTML -----------------
 HTML = """<!doctype html>
@@ -600,12 +381,14 @@ main{display:grid;grid-template-columns:300px 1fr;gap:16px;padding:16px} @media(
 .stream{background:#000;border-radius:8px;overflow:hidden;border:1px solid var(--line)}
 .stream header{display:flex;justify-content:space-between;align-items:center;background:#141414;padding:6px 8px}
 .stream img{width:100%;display:block}
-button,select,input,textarea{background:#222;color:var(--fg);border:1px solid var(--line);padding:6px 8px;border-radius:8px}
+button,select,input{background:#222;color:var(--fg);border:1px solid var(--line);padding:6px 8px;border-radius:8px}
 button{cursor:pointer} button:hover{background:#2b2b2b}
 .thumb{display:flex;gap:8px;align-items:center}
 .thumb img{width:96px;height:64px;object-fit:cover;border-radius:6px;border:1px solid var(--line)}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 small.muted{color:#aaa}
+
+/* Biblioteca agrupada por câmera + origem */
 .cam-block{border:1px solid var(--line); border-radius:10px; padding:10px; margin-bottom:14px; background:#151515}
 .cam-block h4{margin:4px 0 10px 0}
 .cam-section{margin-top:10px}
@@ -617,8 +400,12 @@ small.muted{color:#aaa}
 .cam-items.grid .thumb div{padding:8px}
 .selbox{position:absolute;top:6px;left:6px;background:#0009;border:1px solid var(--line);padding:4px 6px;border-radius:8px}
 .selcount{margin-left:8px;color:#aaa}
-.badge{background:#1f2937; padding:3px 6px; border-radius:6px; color:#cbd5e1}
 </style>
+
+
+
+
+
 </head>
 <body>
 <header><strong>Mini MultiCam</strong> <small id="status"></small></header>
@@ -642,22 +429,6 @@ small.muted{color:#aaa}
         <option value="xxlarge">Muito MUITO grande</option>
       </select>
       <button id="applyUi">Aplicar</button>
-    </div>
-
-    <!-- === EVO: Bloco Evolution API (WhatsApp) -->
-    <h3 style="margin-top:16px">Evolution API (WhatsApp)</h3>
-    <div class="row">
-      <label><input id="evoEnable" type="checkbox"> Enviar no Motion (Evolution)</label>
-    </div>
-    <label>Telefones (um por linha ou separados por vírgula)</label>
-    <textarea id="evoPhones" rows="4" placeholder="+5599999999999
-+5581999999999"></textarea>
-    <label>Base URL pública (opcional)</label>
-    <input id="evoBase" type="text" placeholder="https://meu.dominio:5000">
-    <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap">
-      <button id="evoSave">Salvar Evolution</button>
-      <button id="evoTest">Enviar teste (foto atual)</button>
-      <small class="badge">Instância: {{evo_instance}}</small>
     </div>
 
     <h3 style="margin-top:12px">Biblioteca</h3>
@@ -711,12 +482,14 @@ function url(p){
 function jfetch(p, init){
   return fetch(url(p), init);
 }
+
 window.addEventListener('error', (e)=>{
   try { console.error('JS Error:', e.message, e.error); } catch(_) {}
   const msg = 'Erro JS: ' + (e.message || 'desconhecido');
   const el = document.querySelector('#status');
   if (el) { el.textContent = ' ' + msg; setTimeout(()=>{ el.textContent=''; }, 5000); }
 });
+
 const $ = s => document.querySelector(s);
 function setStatus(t){ $('#status').textContent = ' '+t; setTimeout(()=>$('#status').textContent='', 3000); }
 
@@ -726,6 +499,7 @@ const selected = new Set();
 
 async function persistSelected(){
   const arr = [...selected];
+  // backup local (segue funcionando offline/sem backend)
   localStorage.setItem('selectedDevs', JSON.stringify(arr));
   try{
     await jfetch('api/config', {
@@ -733,8 +507,9 @@ async function persistSelected(){
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ ui: { selected_devs: arr } })
     });
-  }catch(e){}
+  }catch(e){ /* silencioso */ }
 }
+
 function applySelectedFromConfig(){
   const fromServer = GLOBAL_CFG?.ui?.selected_devs;
   const fromLocal  = JSON.parse(localStorage.getItem('selectedDevs') || '[]');
@@ -743,11 +518,11 @@ function applySelectedFromConfig(){
   src.forEach(d => selected.add(d));
 }
 
-let AUDIO_OPTIONS = [];
-let GLOBAL_CFG = null;
+let AUDIO_OPTIONS = [];  // /api/audio
+let GLOBAL_CFG = null;   // /api/config
 
 // Biblioteca seleção
-const SEL = new Set();
+const SEL = new Set();  // "photos|name.jpg" ou "videos|name.mp4"
 function selKey(kind, name){ return kind+'|'+name; }
 function updateSelCount(){ $('#selCount').textContent = SEL.size + ' selecionado(s)'; }
 $('#selAll').onclick = ()=>{ document.querySelectorAll('[data-kind][data-name]').forEach(e=>{ e.checked=true; SEL.add(selKey(e.dataset.kind, e.dataset.name)); }); updateSelCount(); };
@@ -774,7 +549,7 @@ function applyPreviewSize(sz){
   if(sz==='small') px = 260;
   if(sz==='large') px = 480;
   if(sz==='xlarge') px = 720;
-  if(sz==='xxlarge') px = 1100;
+  if(sz==='xxlarge') px = 1100; // “Muito MUITO grande”
   document.documentElement.style.setProperty('--tile', px+'px');
 }
 function libMode(){ return $('#libMode').value === 'list' ? 'list' : 'grid'; }
@@ -871,14 +646,15 @@ function addStream(dev){
     <button class="applyCam">Aplicar</button>
   `;
 
-  ['.micSel','.tlToggle','.tlInt','.mdToggle','.mdSens','.mdAction','.mdCooldown','.mdClip','.mdOverlay']
-  .forEach(sel=>{
-    const el = controls.querySelector(sel);
-    if(el){
-      el.addEventListener('change', ()=> autosaveCam(dev, controls));
-      el.addEventListener('input',  ()=> autosaveCam(dev, controls));
-    }
-  });
+['.micSel','.tlToggle','.tlInt','.mdToggle','.mdSens','.mdAction','.mdCooldown','.mdClip','.mdOverlay']
+.forEach(sel=>{
+  const el = controls.querySelector(sel);
+  if(el){
+    el.addEventListener('change', ()=> autosaveCam(dev, controls));
+    el.addEventListener('input',  ()=> autosaveCam(dev, controls)); // sliders/number
+  }
+});
+
 
   const img = document.createElement('img');
   img.src = url('video_feed?dev='+encodeURIComponent(dev));
@@ -887,6 +663,7 @@ function addStream(dev){
   box.appendChild(controls);
   box.appendChild(img);
   $('#streams').appendChild(box);
+
 
   controls.querySelector('.applyCam').onclick = async ()=>{
     try{
@@ -900,6 +677,8 @@ function addStream(dev){
       const mdO = !!controls.querySelector('.mdOverlay')?.checked;
       const mdC = Math.max(0, parseInt(controls.querySelector('.mdCooldown')?.value,10)||0);
       const mdL = Math.max(5, parseInt(controls.querySelector('.mdClip')?.value,10)||30);
+
+      console.log('applyCam()', {dev, mic, tlE, tlI, mdE, mdS, mdA, mdO, mdC, mdL});
 
       const r = await jfetch('api/config', {
         method:'POST',
@@ -917,6 +696,7 @@ function addStream(dev){
       setStatus('Erro JS ao aplicar: '+err);
     }
   };
+
 }
 
 function gatherCamConfig(dev, controls){
@@ -952,8 +732,10 @@ async function autosaveCam(dev, controls){
     }catch(e){
       console.error('autosaveCam', e);
     }
-  }, 300);
+  }, 300); // debounce
 }
+
+
 
 function removeStream(dev){
   const id = 'stream-'+sanitize(dev);
@@ -977,14 +759,18 @@ async function photo(dev){
     setStatus('Erro JS em Foto: '+err);
   }
 }
+
 async function recStart(dev){
   try{
+    // feedback imediato para ver que o clique funcionou
     setStatus('Iniciando gravação…');
     const card = document.getElementById('stream-'+sanitize(dev));
     const micEl = card ? card.querySelector('.micSel') : null;
     const mic = (micEl && typeof micEl.value === 'string')
       ? micEl.value.trim()
       : ((GLOBAL_CFG && GLOBAL_CFG.cameras && GLOBAL_CFG.cameras[dev] && GLOBAL_CFG.cameras[dev].mic) || 'default');
+
+    console.log('recStart()', { dev, mic });
 
     const r = await jfetch('api/record/start', {
       method:'POST',
@@ -999,8 +785,10 @@ async function recStart(dev){
     setStatus('Erro JS em Gravar: '+err);
   }
 }
+
 async function recStop(dev){
   try{
+    console.log('recStop()', { dev });
     const r = await jfetch('api/record/stop', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
@@ -1014,6 +802,7 @@ async function recStop(dev){
     setStatus('Erro JS em Parar: '+err);
   }
 }
+
 
 // Biblioteca
 function buildMediaQuery(){
@@ -1092,32 +881,6 @@ $('#applyLib').onclick = async ()=>{
   loadMedia();
 };
 
-// === EVO: salvar/recuperar config
-$('#evoSave').onclick = async ()=>{
-  const enable = !!$('#evoEnable').checked;
-  const phones = $('#evoPhones').value;
-  const base   = $('#evoBase').value.trim();
-  const r = await jfetch('api/config', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ evo: { enable, phones, base }})
-  });
-  const j = await r.json();
-  setStatus(j.ok? 'Evolution salvo' : ('Erro: '+(j.error||'')));
-};
-$('#evoTest').onclick = async ()=>{
-  const r = await jfetch('api/evo/test', { method:'POST' });
-  const j = await r.json();
-  setStatus(j.ok? ('Teste enviado: '+j.kind+' '+j.name) : ('Erro teste: '+(j.error||'')));
-};
-
-function fillEvoUI(){
-  const evo = GLOBAL_CFG?.evo || {};
-  $('#evoEnable').checked = !!evo.enable;
-  $('#evoPhones').value = (evo.phones||[]).join("\\n");
-  $('#evoBase').value = evo.base || '';
-}
-
 // Init
 function applyLibModeToSelect(){
   const mode = GLOBAL_CFG?.ui?.library_view || 'grid';
@@ -1139,13 +902,13 @@ async function loadConfig(){
     applyPreviewSize(sz);
     applySelectedFromConfig();
     applyLibModeToSelect();
-    fillEvoUI(); // === EVO
   }catch(e){}
 }
 async function init(){
   await loadAudioOptions();
   await loadConfig();
   await listDevices();
+
   loadMedia();
 }
 init();
@@ -1253,7 +1016,8 @@ class MotionDetector:
         with self.lock:
             return self.last_boxes[:]
 
-# ----------------- Recorder e afins (inalterado na lógica principal) -----------------
+# ----------------- Recorder (stdin + áudio com owner) -----------------
+
 def list_alsa_capture_devices():
     try:
         r = subprocess.run(["arecord","-l"], capture_output=True, text=True)
@@ -1293,6 +1057,7 @@ def list_pulse_sources():
             out.append("pulse:"+cols[1])
     return out
 
+# ----------------- Recorder (stdin + áudio com owner, robusto) -----------------
 def have_cmd(cmd):
     try:
         subprocess.run([cmd, "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1307,7 +1072,7 @@ class Recorder:
         self.thread_by_dev = {}
         self.run_by_dev    = {}
         self.owner_by_dev  = {}
-        self.stderr_buf    = {}
+        self.stderr_buf    = {}   # dev -> str com cauda dos logs do ffmpeg
         self.lock = threading.Lock()
 
     def _stderr_tail(self, dev, limit=4000):
@@ -1318,9 +1083,11 @@ class Recorder:
             return ""
 
     def _spawn_stderr_drain(self, dev, proc):
+        """Drena stderr do ffmpeg para evitar bloqueio de PIPE cheio."""
         from collections import deque
         dq = deque(maxlen=4000)
         self.stderr_buf[dev] = ""
+
         def _drain():
             try:
                 while True:
@@ -1340,6 +1107,7 @@ class Recorder:
                     self.stderr_buf[dev] = "".join(dq)
             except Exception:
                 pass
+
         th = threading.Thread(target=_drain, daemon=True)
         th.start()
 
@@ -1359,6 +1127,7 @@ class Recorder:
         return int(w), int(h), float(fps)
 
     def _ffmpeg_cmd(self, w, h, fps, mic, out_path, audio_backend):
+        # sem -shortest: evita encerrar se o áudio oscilar
         base = [
             "ffmpeg","-loglevel","error","-y",
             "-f","rawvideo","-pix_fmt","bgr24","-s",f"{w}x{h}","-r",str(fps),"-i","-",
@@ -1402,6 +1171,8 @@ class Recorder:
         if not have_cmd("ffmpeg"):
             raise RuntimeError("ffmpeg não encontrado. Instale o pacote ffmpeg.")
         mic = (mic or "").strip()
+
+        # ordem dos backends
         if not mic or mic.lower() == "none":
             backends = [("none", mic)]
         elif mic.lower().startswith("pulse"):
@@ -1410,7 +1181,6 @@ class Recorder:
             backends = [("alsa", mic), ("none", mic)]
 
         tried = []
-        p = None
         for backend, micname in backends:
             cmd = self._ffmpeg_cmd(w, h, fps, micname, out_path, backend)
             p = subprocess.Popen(
@@ -1435,25 +1205,33 @@ class Recorder:
         return p is not None and (p.poll() is None)
 
     def start(self, dev, mic="default", owner="user"):
+        """INCLUIR ESTE MÉTODO — ele que faltava."""
         dev = str(dev)
         cam = get_cam(dev)
+
+        # se já está gravando, devolve o arquivo atual
         if self.is_recording(dev):
             with self.lock:
                 return os.path.basename(self.file_by_dev.get(dev) or "")
+
         w, h, fps = self._probe_cam_dims(cam)
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         prefix = "video-user" if owner == "user" else "video-motion"
         out_path = os.path.join(MEDIA["videos"], f"{prefix}-{sanitize_dev(dev)}-{ts}.mp4")
+
         p, backend = self._start_ffmpeg(dev, w, h, fps, mic, out_path)
+
         with self.lock:
             self.proc_by_dev[dev] = p
             self.file_by_dev[dev] = out_path
             self.run_by_dev[dev]  = True
             self.owner_by_dev[dev]= owner
+
         th = threading.Thread(target=self._writer_loop, args=(dev, cam, p, fps), daemon=True)
         th.start()
         with self.lock:
             self.thread_by_dev[dev] = th
+
         if backend == "none":
             print(f"[Recorder] {dev}: gravando SEM ÁUDIO (fallback).")
         return os.path.basename(out_path)
@@ -1468,10 +1246,13 @@ class Recorder:
             if (owner is not None) and (cur_owner is not None) and (cur_owner != owner) and (not force):
                 raise RuntimeError(f"em uso por {cur_owner}")
             self.run_by_dev[dev] = False
+
         if not p:
             raise RuntimeError("não está gravando")
+
         if th:
             th.join(timeout=3.5)
+
         try:
             p.wait(timeout=6)
         except subprocess.TimeoutExpired:
@@ -1481,17 +1262,21 @@ class Recorder:
                 p.kill()
                 try: p.wait(timeout=2)
                 except Exception: pass
+
         with self.lock:
             self.proc_by_dev.pop(dev, None)
             self.thread_by_dev.pop(dev, None)
             self.run_by_dev.pop(dev, None)
             self.owner_by_dev.pop(dev, None)
+
         if out:
             for _ in range(15):
                 if os.path.isfile(out) and os.path.getsize(out) > 0:
                     return os.path.basename(out)
                 time.sleep(0.1)
-        raise RuntimeError("gravação não gerou arquivo.")
+        err = self._stderr_tail(dev)
+        raise RuntimeError(f"gravação não gerou arquivo.\n{err}")
+
 
 REC = Recorder()
 
@@ -1503,6 +1288,7 @@ class Timelapser:
         self.running = False
         self.lock = threading.Lock()
         self.th = None
+
     def start(self, interval=None):
         with self.lock:
             if interval is not None:
@@ -1513,11 +1299,13 @@ class Timelapser:
             self.th = threading.Thread(target=self._loop, daemon=True)
             self.th.start()
             return True
+
     def stop(self):
         with self.lock:
             self.running = False
         if self.th:
             self.th.join(timeout=1.0)
+
     def _loop(self):
         cam = get_cam(self.dev)
         while True:
@@ -1537,7 +1325,7 @@ class Timelapser:
                     if not self.running: break
                 time.sleep(step)
 
-TIMERS = {}
+TIMERS = {}  # dev -> Timelapser
 def get_timer(dev):
     dev=str(dev)
     if dev not in TIMERS:
@@ -1609,8 +1397,6 @@ class MotionController:
                         if fname:
                             frame = get_cam(self.dev).last_frame()
                             make_thumb_from_frame(frame, os.path.join(MEDIA["videos"], fname))
-                            # === EVO: fila para enviar vídeo
-                            EVO_SENDER.queue("video", os.path.join(MEDIA["videos"], fname), self.dev)
                     except Exception as e:
                         print(f"[Motion] stop rec failed: {e}")
                     finally:
@@ -1627,13 +1413,11 @@ class MotionController:
         path = os.path.join(MEDIA["photos"], name)
         cv2.imwrite(path, frame)
         make_thumb_image(path)
-        # === EVO: fila para enviar foto
-        EVO_SENDER.queue("photo", path, self.dev)
 
     def stop(self):
         self._running = False
 
-MOTIONS = {}
+MOTIONS = {}  # dev -> MotionController
 MOTION_LOCK = threading.Lock()
 def get_motion_ctrl(dev):
     dev=str(dev)
@@ -1643,7 +1427,7 @@ def get_motion_ctrl(dev):
         return MOTIONS[dev]
 
 # ----------------- Captura em thread (preview) -----------------
-CAMS = {}
+CAMS = {}            # dev -> CameraStream
 CAM_LOCK = threading.Lock()
 
 class CameraStream:
@@ -1688,9 +1472,10 @@ class CameraStream:
                     )
                 ctrl.update_cfg()
                 if cfg.get("enable"):
-                    ctrl.on_boxes(boxes)
+                    ctrl.on_boxes(boxes)  # só dispara ação quando detecção ligada
             else:
                 time.sleep(0.02)
+
 
     def _draw_motion(self, f):
         boxes = self.mdet.get_boxes()
@@ -1711,6 +1496,7 @@ class CameraStream:
         ok, buf = cv2.imencode(".jpg", f, [int(cv2.IMWRITE_JPEG_QUALITY), self.q])
         return buf.tobytes() if ok else None
 
+
     def last_frame(self):
         with self.lock:
             return None if self.frame is None else self.frame.copy()
@@ -1730,22 +1516,46 @@ def get_cam(dev):
 
 # ----------------- Biblioteca Helpers -----------------
 def parse_info_from_name(name: str):
+    """
+    Retorna (origin, cam) a partir do nome:
+      video-user-<cam>-YYYYMMDD-HHMMSS.mp4
+      video-motion-<cam>-YYYYMMDD-HHMMSS.mp4
+      rec-user-<cam>-YYYYMMDD-HHMMSS.mp4      (legado)
+      rec-motion-<cam>-YYYYMMDD-HHMMSS.mp4    (legado)
+      photo-user-<cam>-YYYYMMDD-HHMMSS.jpg
+      photo-motion-<cam>-YYYYMMDD-HHMMSS.jpg
+      tl-<cam>-YYYYMMDD-HHMMSS.jpg            => origin='timelapse'
+    """
     base = os.path.basename(name)
+
+    # vídeos (novo + legado)
     m = re.match(r"^(?:video|rec)-(user|motion)-(.+?)-\d{8}-\d{6}\.(?:mp4|mkv|mov)$", base, re.IGNORECASE)
     if m:
-        return m.group(1).lower(), m.group(2)
+        origin = m.group(1).lower()   # 'user' | 'motion'
+        cam = m.group(2)
+        return origin, cam
+
+    # fotos (movimento ou manual)
     m = re.match(r"^photo-(user|motion)-(.+?)-\d{8}-\d{6}\.jpg$", base, re.IGNORECASE)
     if m:
-        return m.group(1).lower(), m.group(2)
+        origin = m.group(1).lower()
+        cam = m.group(2)
+        return origin, cam
+
+    # timelapse
     m = re.match(r"^tl-(.+?)-\d{8}-\d{6}\.jpg$", base, re.IGNORECASE)
     if m:
         return "timelapse", m.group(1)
+
+    # super-legado: rec-<cam>-..., photo-<cam>-..., tl-<cam>-...
     m = re.match(r"^(rec|photo|tl)-(.+?)-\d{8}-\d{6}\.(mp4|jpg)$", base, re.IGNORECASE)
     if m:
         kind, cam = m.group(1).lower(), m.group(2)
         origin = "timelapse" if kind == "tl" else "user"
         return origin, cam
+
     return "_unknown", "_unknown"
+
 
 def in_date_range(path, start_d: date=None, end_d: date=None):
     try:
@@ -1762,10 +1572,12 @@ def in_date_range(path, start_d: date=None, end_d: date=None):
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
 
+
 @app.get("/")
 def index():
     basepath = request.headers.get("X-Forwarded-Prefix") or (request.script_root or "")
-    return render_template_string(HTML, basepath=basepath, evo_instance=EVO_API_INSTANCE)
+    return render_template_string(HTML, basepath=basepath)
+
 
 @app.get("/api/devices")
 def api_devices():
@@ -1842,6 +1654,7 @@ def api_rec_stop():
     dev = data.get("dev")
     if not dev: return jsonify(ok=False, error="falta dev"), 400
     try:
+        # force=True para sempre parar, mesmo se iniciou por movimento
         fname = REC.stop(dev, owner="user", force=True)
         if fname:
             frame = get_cam(dev).last_frame()
@@ -1904,6 +1717,7 @@ def api_media_delete():
             if os.path.isfile(path):
                 os.remove(path)
                 deleted += 1
+                # apagar thumb
                 if kind == "photos":
                     t = os.path.join(MEDIA["thumbs"], name if name.lower().endswith(".jpg") else os.path.splitext(name)[0]+".jpg")
                     if os.path.isfile(t): os.remove(t)
@@ -1924,21 +1738,14 @@ def media(kind, name):
 @app.get("/api/config")
 def api_config_get():
     with CFG_LOCK:
-        out = dict(CFG)
-    return jsonify(out)
+        return jsonify(CFG)
 
 @app.post("/api/config")
 def api_config_post():
     data = request.get_json(silent=True) or {}
-    # === EVO: atualizar bloco evo
-    if "evo" in data and isinstance(data["evo"], dict):
-        set_evo_cfg(data["evo"])
-        return jsonify(ok=True)
-
     dev = data.get("dev")
     if dev:
         updates = {}
-        if "name" in data: updates["name"] = str(data["name"]).strip()  # === EVO: nome da câmera
         if "mic" in data: updates["mic"] = data["mic"]
         if "timelapse" in data and isinstance(data["timelapse"], dict):
             t = {}
@@ -1958,6 +1765,7 @@ def api_config_post():
 
         set_cam_cfg(dev, updates)
 
+        # timelapse apply
         tl = get_timer(dev)
         tcfg = get_cam_cfg(dev).get("timelapse", {})
         if tcfg.get("enable"):
@@ -1965,6 +1773,7 @@ def api_config_post():
         else:
             tl.stop()
 
+        # motion controller update
         get_motion_ctrl(dev).update_cfg()
         return jsonify(ok=True)
 
@@ -1981,15 +1790,19 @@ def api_config_post():
             if lv not in ("grid","list"):
                 return jsonify(ok=False, error="library_view inválido"), 400
             updates["library_view"] = lv
+
         if "selected_devs" in ui:
             sd = ui["selected_devs"]
             if not isinstance(sd, (list, tuple)):
                 return jsonify(ok=False, error="selected_devs inválido"), 400
+        # normaliza para strings
             updates["selected_devs"] = [str(s) for s in sd]
+
         if updates:
             set_ui_cfg(updates)
             return jsonify(ok=True)
     return jsonify(ok=False, error="payload inválido"), 400
+
 
 @app.post("/api/timelapse/start")
 def api_tl_start():
@@ -2008,76 +1821,6 @@ def api_tl_stop():
     set_cam_cfg(dev, {"timelapse":{"enable": False}})
     get_timer(dev).stop()
     return jsonify(ok=True)
-    
-@app.post("/api/evo/ping")
-def api_evo_ping():
-    """Envia uma mensagem de texto 'ping' para o primeiro telefone configurado."""
-    with CFG_LOCK:
-        evo = CFG.get("evo") or {}
-        phones = evo.get("phones") or []
-    if not phones:
-        return jsonify(ok=False, error="Sem telefones em evo.phones"), 400
-    phone = _norm_phone(phones[0])
-    if not phone:
-        return jsonify(ok=False, error="Telefone inválido após normalização"), 400
-    sender = EVO_SENDER
-    s, t = sender._send_text(phone, "ping do Mini MultiCam ✅")
-    return jsonify(ok=(s<300), status=s, resp=t[:500])
-
-@app.get("/api/evo/debug")
-def api_evo_debug():
-    """Expõe um snapshot da config EVO (sem chave)."""
-    with CFG_LOCK:
-        evo = dict(CFG.get("evo") or {})
-    evo["phones"] = [ _norm_phone(p) for p in (evo.get("phones") or []) ]
-    info = {
-        "enabled": bool(evo.get("enable")),
-        "phones_norm": evo["phones"],
-        "base": evo.get("base") or "",
-        "api_url": EVO_API_URL,
-        "instance": EVO_API_INSTANCE,
-        # não expõe a chave
-    }
-    return jsonify(ok=True, evo=info)
-    
-
-# === EVO: endpoint de teste — tira foto do primeiro device selecionado/primeiro disponível e envia
-@app.post("/api/evo/test")
-def api_evo_test():
-    with CFG_LOCK:
-        evo = CFG.get("evo") or {}
-        phones = evo.get("phones") or []
-        base = evo.get("base") or ""
-        if not phones:
-            return jsonify(ok=False, error="configure ao menos um telefone em Evolution"), 400
-        if not base:
-            return jsonify(ok=False, error="configure a Base URL pública em Evolution"), 400
-
-    # escolher dev: 1) selecionado no UI, 2) primeiro device listado
-    try:
-        sel = (CFG.get("ui") or {}).get("selected_devs") or []
-        dev = sel[0] if sel else None
-    except Exception:
-        dev = None
-    if not dev:
-        devs = scan_linux_cams()
-        if not devs:
-            return jsonify(ok=False, error="sem câmeras"), 503
-        dev = devs[0]
-
-    cam = get_cam(dev)
-    frame = cam.last_frame()
-    if frame is None:
-        return jsonify(ok=False, error="sem frame da câmera"), 503
-
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    name = f"photo-user-{sanitize_dev(dev)}-{ts}.jpg"
-    path = os.path.join(MEDIA["photos"], name)
-    cv2.imwrite(path, frame)
-    make_thumb_image(path)
-
-    EVO_SENDER.queue("photo", path, dev)
-    return jsonify(ok=True, kind="photo", name=name)
 
 def _cleanup():
     for c in list(CAMS.values()):
@@ -2100,8 +1843,6 @@ if __name__ == "__main__":
         if tl.get("enable"):
             get_timer(dev).start(tl.get("interval",5))
     app.run("0.0.0.0", 5000, threaded=True)
-
-
 EOF
 
 

@@ -149,11 +149,11 @@ systemctl restart NetworkManager-dispatcher.service
 
 
 
-
-sudo mkdir -p /root/samba
-sudo chown nobody:nogroup /root/samba    # Debian/Ubuntu; em CentOS pode ser nobody:nobody
-sudo chmod 0777 /root/samba
-sudo chmod -R 0777 /root/samba
+sudo apt install samba
+sudo mkdir -p /home/public
+sudo chown nobody:nogroup /home/public    # Debian/Ubuntu; em CentOS pode ser nobody:nobody
+sudo chmod 0777 /home/public
+sudo chmod -R 0777 /home/public
 sudo ufw allow samba
 
 
