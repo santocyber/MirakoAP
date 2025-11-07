@@ -1,7 +1,15 @@
 VERSION=latest
-CONTAINER_NAME=CONTAINER_NAME
+CONTAINER_NAME=openvpn
 HOST_IP=0.0.0.0
 OPENVPN_UDP_PORT=1194
+
+# deploy.resources (tem efeito só em Swarm, mas mantive)
 CPUS=2
-MEMORY_LIMIT=2000MB
+MEMORY_LIMIT=2g        # use 2g (ou 2000m) em vez de 2000MB para compatibilidade
+
+# caminho ABSOLUTO é mais seguro (sem ~). Ajuste ao seu ambiente:
 APP_PATH=/www/dk_project/dk_app/openvpn/openvpn_mirako
+
+# timezone
+TZ=America/Sao_Paulo
+
