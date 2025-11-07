@@ -7,6 +7,7 @@ import io, cgi
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+
 HOST   = os.environ.get("NETSTATUS_HOST", "0.0.0.0")
 PORT   = int(os.environ.get("NETSTATUS_PORT", "80"))
 WIFIIF = os.environ.get("NETSTATUS_WIFI_IF", "wlan0")
@@ -696,6 +697,388 @@ def has_masquerade():
     if r: return True
     r2 = sh("nft list ruleset 2>/dev/null | grep -i masquerade || true")
     return bool(r2.strip())
+    
+# === Rotas / Firewall Helpers para PPP ===
+def _fw_allow_forward(in_if, out_if):
+    """
+    Garante que FORWARD esteja permitido do in_if -> out_if.
+    Tenta nftables primeiro; cai para iptables se necessário.
+    """
+    if not in_if or not out_if:
+        return
+
+    if _nft_has():
+        # tabela/chain filter
+        subprocess.run("nft list table ip filter >/dev/null 2>&1 || nft add table ip filter", shell=True)
+        subprocess.run("nft list chain ip filter FORWARD >/dev/null 2>&1 || nft add chain ip filter { type filter hook forward priority 0 ; }", shell=True)
+        # regra: aceitar tráfego encaminhado entre as duas IFs
+        rule = f'nft list chain ip filter FORWARD | grep -q "iifname \\"{in_if}\\" oifname \\"{out_if}\\""'
+        add  = f'nft add rule ip filter FORWARD iifname "{in_if}" oifname "{out_if}" ct state established,related accept; nft add rule ip filter FORWARD iifname "{in_if}" oifname "{out_if}" accept'
+        subprocess.run(f"{rule} || ( {add} )", shell=True)
+    else:
+        # iptables
+        chk1 = f"iptables -C FORWARD -i {in_if} -o {out_if} -m state --state ESTABLISHED,RELATED -j ACCEPT"
+        add1 = f"iptables -A FORWARD -i {in_if} -o {out_if} -m state --state ESTABLISHED,RELATED -j ACCEPT"
+        if not _iptables(chk1): _iptables(add1)
+
+        chk2 = f"iptables -C FORWARD -i {in_if} -o {out_if} -j ACCEPT"
+        add2 = f"iptables -A FORWARD -i {in_if} -o {out_if} -j ACCEPT"
+        if not _iptables(chk2): _iptables(add2)
+
+
+def _set_default_route_via_iface(ifn, metric=10, via=None):
+    """
+    Força rota default pela interface 'ifn' com a métrica indicada.
+    Se 'via' (gateway) for informado, usa-o; caso contrário, rota direta pela if.
+    """
+    if not ifn:
+        return False
+    try:
+        if via:
+            subprocess.run(f"ip route replace default via {via} dev {ifn} metric {int(metric)}", shell=True, check=False)
+        else:
+            subprocess.run(f"ip route replace default dev {ifn} metric {int(metric)}", shell=True, check=False)
+        # limpa cache de rotas (evita rotas “fantasma”)
+        subprocess.run("ip route flush cache", shell=True)
+        return True
+    except Exception as e:
+        print("[route] falha ao ajustar default:", e)
+        return False
+
+
+def _share_ppp_internet(ppp_if, lan_if=WIFIIF, metric=None, gw=None):
+    """
+    Empacota tudo que precisamos após o PPP ficar on-line:
+      - ip_forward=1
+      - NAT (MASQUERADE) ppp_if
+      - FORWARD permitido lan_if -> ppp_if
+      - rota default preferindo o PPP (métrica PPP_METRIC)
+      - resolv.conf ajustado (se necessário)
+    """
+    try:
+        ensure_ip_forward()
+        ensure_nat_for(ppp_if, in_if=lan_if)
+        _fw_allow_forward(lan_if, ppp_if)
+
+        # Só altera a rota default se ela não estiver apontando para a interface PPP
+        dr = default_route() or {}
+        if dr.get("dev") != ppp_if:
+            try:
+                _set_default_route_via_iface(
+                    ppp_if,
+                    metric if metric is not None else PPP_METRIC,
+                    via=gw
+                )
+            except Exception:
+                # fallback: tenta configurar rota mesmo assim
+                _set_default_route_via_iface(
+                    ppp_if,
+                    metric if metric is not None else PPP_METRIC,
+                    via=gw
+                )
+
+        # DNS — força resolv.conf “bom” se ainda não estiver funcional
+        try:
+            _fix_resolv_conf(ppp_if, gw=(gw or _get_gw_for_if(ppp_if)), force=True)
+        except TypeError:
+            _fix_resolv_conf(ppp_if, gw=(gw or _get_gw_for_if(ppp_if)))
+
+    except Exception as e:
+        print("[ppp-share] erro ao compartilhar PPP:", e)
+
+
+    
+
+
+# === PPP / NAT / COMPARTILHAMENTO VIA AP ==============================
+PPP_ENABLE      = os.environ.get("NETSTATUS_PPP_ENABLE", "1").lower() in ("1","true","yes","on")
+PPP_TTY         = os.environ.get("NETSTATUS_PPP_TTY", "/dev/ttyUSB2")
+PPP_APN         = os.environ.get("NETSTATUS_PPP_APN", "internet")
+PPP_USER        = os.environ.get("NETSTATUS_PPP_USER", "")
+PPP_PASS        = os.environ.get("NETSTATUS_PPP_PASS", "")
+PPP_DIAL        = os.environ.get("NETSTATUS_PPP_DIAL", "*99#")
+PPP_PEER        = os.environ.get("NETSTATUS_PPP_PEER", "mobile")
+PPP_BAUD        = int(os.environ.get("NETSTATUS_PPP_BAUD", "115200"))
+PPP_IDLE        = int(os.environ.get("NETSTATUS_PPP_IDLE", "0"))  # 0 = nunca desconectar por inatividade
+PPP_ECHO_INT    = int(os.environ.get("NETSTATUS_PPP_ECHO_INTERVAL", "10"))
+PPP_ECHO_FAIL   = int(os.environ.get("NETSTATUS_PPP_ECHO_FAILURE", "6"))
+PPP_METRIC      = int(os.environ.get("NETSTATUS_PPP_METRIC", "10"))  # rota default preferencial
+PPP_NAT_IN_IF   = WIFIIF                 # onde os clientes estão (AP)
+PPP_NAT_OUT_IF  = os.environ.get("NETSTATUS_PPP_NAT_OUT_IF", "")  # detectado em runtime (pppX), pode deixar vazio
+
+_last_ppp_attempt = 0.0
+_ppp_iface_cache  = None
+
+
+def _write_atomic(path, text, mode=0o600):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+    os.chmod(path, mode)
+
+
+def ensure_ip_forward():
+    try:
+        _write_atomic("/proc/sys/net/ipv4/ip_forward", "1\n", 0o644)
+    except Exception:
+        subprocess.run("sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true", shell=True)
+
+
+def _iptables(cmd):
+    return subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def _nft_has():
+    return shutil.which("nft") is not None
+
+
+def ensure_nat_for(out_if, in_if=PPP_NAT_IN_IF):
+    """
+    Garante MASQUERADE de in_if->out_if.
+    Tenta nftables primeiro; se não houver, cai para iptables.
+    """
+    if not out_if:
+        return
+
+    ensure_ip_forward()
+
+    if _nft_has():
+        # cria tabela/cadeias caso não existam
+        subprocess.run("nft list table ip nat >/dev/null 2>&1 || nft add table ip nat", shell=True)
+        subprocess.run("nft list chain ip nat POSTROUTING >/dev/null 2>&1 || nft add chain ip nat POSTROUTING { type nat hook postrouting priority 100 ; }", shell=True)
+        # regra de masquerade
+        rule = f'nft list chain ip nat POSTROUTING | grep -q "oifname \\"{out_if}\\" masquerade"'
+        add  = f'nft add rule ip nat POSTROUTING oifname "{out_if}" masquerade'
+        subprocess.run(f"{rule} || {add}", shell=True)
+        return
+
+    # iptables fallback
+    chk = f"iptables -t nat -C POSTROUTING -o {out_if} -j MASQUERADE"
+    add = f"iptables -t nat -A POSTROUTING -o {out_if} -j MASQUERADE"
+    if not _iptables(chk):
+        _iptables(add)
+
+
+def _ppp_peer_contents():
+    usr = PPP_USER or "user"
+    ppp_peer = f"""/dev/ttyUSB{os.path.basename(PPP_TTY).lstrip('ttyUSB') if 'ttyUSB' in PPP_TTY else PPP_TTY}
+{PPP_BAUD}
+crtscts
+lock
+modem
+noauth
+connect "/usr/sbin/chat -v -f /etc/ppp/chat-{PPP_PEER}"
+usepeerdns
+defaultroute
+replacedefaultroute
+persist
+idle {PPP_IDLE}
+lcp-echo-interval {PPP_ECHO_INT}
+lcp-echo-failure {PPP_ECHO_FAIL}
+user "{usr}"
+ipparam {PPP_PEER}
+"""
+    return ppp_peer
+
+
+def _ppp_chat_contents():
+    # Nota: chat não lê env; gravamos APN/numero direto
+    return f"""ABORT "BUSY"
+ABORT "NO CARRIER"
+ABORT "ERROR"
+ABORT "NO DIALTONE"
+ABORT "Invalid Login"
+ABORT "Login incorrect"
+ABORT "NO ANSWER"
+TIMEOUT 12
+"" ATZ
+OK ATH
+OK ATE1
+OK AT+CFUN=1
+OK AT+CGDCONT=1,"IP","{PPP_APN}"
+OK ATDT{PPP_DIAL}
+CONNECT \d\c
+"""
+
+
+def ppp_build_peer_files():
+    peer_path = f"/etc/ppp/peers/{PPP_PEER}"
+    chat_path = f"/etc/ppp/chat-{PPP_PEER}"
+    _write_atomic(peer_path, _ppp_peer_contents(), 0o600)
+    _write_atomic(chat_path, _ppp_chat_contents(), 0o600)
+
+    # secrets (algumas operadoras ignoram, mas vamos preencher)
+    if PPP_USER or PPP_PASS:
+        try:
+            # chap-secrets / pap-secrets
+            for sec in ("/etc/ppp/chap-secrets", "/etc/ppp/pap-secrets"):
+                if PPP_USER and PPP_PASS:
+                    line = f'{PPP_USER}\t*\t{PPP_PASS}\t*\n'
+                    if os.path.exists(sec):
+                        txt = open(sec, "r", encoding="utf-8", errors="ignore").read()
+                        if PPP_USER not in txt:
+                            with open(sec, "a") as f:
+                                f.write(line)
+                    else:
+                        _write_atomic(sec, line, 0o600)
+        except Exception as e:
+            print("[ppp] falha ao gravar secrets:", e)
+
+
+def _detect_ppp_iface():
+    j = sh("ip -o link | awk -F': ' '/ppp[0-9]+/ {print $2}'") or ""
+    for l in j.splitlines():
+        if l.strip().startswith("ppp"):
+            return l.strip()
+    return None
+
+
+def _iface_has_ip(ifn):
+    if not ifn:
+        return False
+    ip = sh(f"ip -4 addr show {ifn} | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){{3}}' | head -n1")
+    return bool(ip.strip())
+
+
+def ppp_up(timeout_s=35):
+    """Sobe PPP (pppd call <peer>), aguarda iface pppX aparecer, ajusta NAT."""
+    global _ppp_iface_cache
+    ppp_build_peer_files()
+    # derruba qualquer resíduo
+    subprocess.run(f"poff {PPP_PEER} >/dev/null 2>&1 || true", shell=True)
+    time.sleep(0.5)
+    # sobe
+    cmd = f"/usr/sbin/pppd call {PPP_PEER}"
+    if not shutil.which("pppd"):
+        return {"ok": False, "msg": "pppd não encontrado"}
+    rc = subprocess.run(cmd, shell=True).returncode
+    if rc not in (0, 1):  # pppd costuma retornar 0/1 mesmo quando ok; vamos aguardar iface
+        print("[ppp] pppd rc:", rc)
+
+    t0 = time.time()
+    got = None
+    while time.time() - t0 < timeout_s:
+        got = _detect_ppp_iface()
+        if got and _iface_has_ip(got):
+            break
+        time.sleep(1.0)
+
+    if not got:
+        return {"ok": False, "msg": "pppX não apareceu (timeout)"}
+
+    _ppp_iface_cache = got
+
+    # gateway da PPP (se houver)
+    gw = None
+    try:
+        gw = _get_gw_for_if(got) or None
+    except Exception:
+        gw = None
+
+    # Rota + DNS + NAT + FORWARD + ip_forward
+    try:
+        _share_ppp_internet(got, lan_if=PPP_NAT_IN_IF, metric=PPP_METRIC, gw=gw)
+    except Exception as e:
+        print("[ppp] share falhou:", e)
+
+    # Validação rápida de internet via PPP
+    t = iface_tests(got)
+    print("[ppp] tests:", t)
+    return {"ok": True, "if": got, "ip": sh(f"ip -4 addr show {got} | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){{3}}' | head -n1"), "tests": t}
+
+
+def ppp_down():
+    global _ppp_iface_cache
+    subprocess.run(f"poff {PPP_PEER} >/dev/null 2>&1 || true", shell=True)
+    time.sleep(0.5)
+    _ppp_iface_cache = None
+    return {"ok": True}
+
+
+def ppp_status():
+    ifn = _detect_ppp_iface()
+    ip  = sh(f"ip -4 addr show {ifn} | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){{3}}' | head -n1") if ifn else ""
+    up  = bool(ifn and ip.strip())
+    return {
+        "enabled": bool(PPP_ENABLE),
+        "iface": ifn,
+        "ip4": ip.strip() or None,
+        "default_route": default_route(),
+        "nat": has_masquerade(),
+    }
+
+
+def _usb_tty_present():
+    # heurística simples: se existir /dev/ttyUSB* ou /dev/ttyACM*, consideramos modem serial disponível
+    return bool(glob.glob("/dev/ttyUSB*") or glob.glob("/dev/ttyACM*"))
+
+
+def _internet_ok():
+    t = net_tests()
+    return bool(t.get("ping_internet") and t.get("dns_resolve"))
+
+
+def _ppp_guard_tick():
+    """
+    Estratégia:
+      - Se PPP habilitado, há TTY USB e internet NÃO está ok, tenta subir PPP.
+      - Se PPP já está up, garante NAT e segue.
+      - Debounce de tentativas para não flapar.
+    """
+    global _last_ppp_attempt
+    if not PPP_ENABLE:
+        return
+    ifn = _detect_ppp_iface()
+    if ifn:
+        # Se PPP já está up, garanta que o compartilhamento permaneça correto
+        try:
+            gw = _get_gw_for_if(ifn) or None
+        except Exception:
+            gw = None
+        ensure_nat_for(ifn, in_if=PPP_NAT_IN_IF)
+        _fw_allow_forward(PPP_NAT_IN_IF, ifn)
+        _set_default_route_via_iface(ifn, metric=PPP_METRIC, via=gw)
+        return
+    # sem pppX
+    if not _usb_tty_present():
+        return
+    if _internet_ok():
+        return
+    # backoff 20s
+    if time.time() - _last_ppp_attempt < 20:
+        return
+    _last_ppp_attempt = time.time()
+    print("[ppp-guard] tentando subir PPP…")
+    res = ppp_up()
+    print("[ppp-guard]", res)
+
+
+def _ppp_guard_loop():
+    while True:
+        try:
+            _ppp_guard_tick()
+        except Exception as e:
+            print("[ppp-guard] erro:", e)
+        time.sleep(5)
+
+
+# === Endpoints HTTP para PPP =========================================
+# Acrescente dentro da classe H (handlers HTTP):
+#   - GET  /api/ppp_status
+#   - POST /api/ppp_up
+#   - POST /api/ppp_down
+
+
+def api_ppp_share():
+    ifn = _detect_ppp_iface()
+    if not ifn or not _iface_has_ip(ifn):
+        return {"ok": False, "msg": "PPP não está ativo"}
+    gw = _get_gw_for_if(ifn) or None
+    _share_ppp_internet(ifn, lan_if=PPP_NAT_IN_IF, metric=PPP_METRIC, gw=gw)
+    return {"ok": True, "msg": f"Compartilhamento aplicado (LAN {PPP_NAT_IN_IF} -> {ifn})"}
+
 
 def _has(cmd): return shutil.which(cmd) is not None
 
@@ -1889,10 +2272,19 @@ if (pass) {
       <div class="kv" id="lan_kv"></div>
     </div>
 
-    <div class="card">
-      <h3>Modem / USB / PPP</h3>
-      <div class="kv" id="modem_kv"></div>
-    </div>
+<div class="card">
+  <h3>Modem / USB / PPP</h3>
+  <!--  Botões para controlar a PPP -->
+  <div class="controls">
+    <button class="btn" id="btnPPPUp">Conectar</button>
+    <button class="btn" id="btnPPPDown">Desconectar</button>
+    <button class="btn" id="btnPPPShare">Compartilhar internet</button>
+    <small id="pppMsg" class="muted"></small>
+  </div>
+  <div class="kv" id="modem_kv"></div>
+  <small class="muted">Status PPP: <span id="pppStatus"></span></small>
+</div>
+
 
     <div class="card">
       <h3>DHCP Leases</h3>
@@ -2165,6 +2557,78 @@ if (pass) {
     }
   });
 })();
+
+
+/* === PPP Modem === */
+function pppMsg(txt, ok) {
+  var el = document.getElementById('pppMsg');
+  if (!el) return;
+  el.textContent = txt || '';
+  el.style.color = ok ? 'var(--ok)' : 'var(--muted)';
+}
+
+function pppRefresh() {
+  fetch('/api/ppp_status', {cache:'no-store'})
+    .then(function(r) { return r.json(); })
+    .then(function(s) {
+      var st = '';
+      st += (s.enabled ? 'on' : 'off') + ' • ';
+      st += 'iface: ' + (s.iface || '—') + ' • ';
+      st += 'IP: ' + (s.ip4 || '—') + ' • ';
+      st += 'NAT: ' + (s.nat ? 'on' : 'off');
+      var el = document.getElementById('pppStatus');
+      if (el) el.textContent = st;
+    });
+}
+
+// executado quando o DOM estiver pronto
+(function(){
+  var upBtn   = document.getElementById('btnPPPUp');
+  var downBtn = document.getElementById('btnPPPDown');
+  var shareBtn= document.getElementById('btnPPPShare');
+  if (upBtn) upBtn.addEventListener('click', function(){
+    pppMsg('Conectando PPP…');
+    fetch('/api/ppp_up', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: '{}'
+    }).then(function(r){ return r.json(); })
+      .then(function(j){
+        if (j.ok) {
+          pppMsg('Conectado em ' + (j.if || '') + ' IP ' + (j.ip || ''), true);
+        } else {
+          pppMsg('Falha: ' + (j.msg || 'erro')); }
+        pppRefresh();
+      });
+  });
+  if (downBtn) downBtn.addEventListener('click', function(){
+    pppMsg('Desconectando PPP…');
+    fetch('/api/ppp_down', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: '{}'
+    }).then(function(r){ return r.json(); })
+      .then(function(){ pppMsg('Desconectado.', true); pppRefresh(); });
+  });
+  if (shareBtn) shareBtn.addEventListener('click', function(){
+    pppMsg('Configurando compartilhamento…');
+    fetch('/api/ppp_share', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: '{}'
+    }).then(function(r){ return r.json(); })
+      .then(function(j){
+        if (j.ok) { pppMsg(j.msg || 'Compartilhamento aplicado', true); }
+        else { pppMsg('Falha: ' + (j.msg || 'erro')); }
+        pppRefresh();
+      });
+  });
+  // atualiza status PPP a cada 5s
+  pppRefresh();
+  setInterval(pppRefresh, 5000);
+})();
+
+
 
 function escapeHtml(s){
   return String(s).replace(/[&<>\"']/g, function(m){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'})[m]; });
@@ -3195,6 +3659,7 @@ function wireTerminalButtons(){
 
 
 # ------------------ Terminal (PTY) ------------------
+# ------------------ Terminal (PTY) ------------------
 SESSIONS = {}
 SESSION_TTL = 1800  # 30min de inatividade
 
@@ -3402,6 +3867,10 @@ class H(BaseHTTPRequestHandler):
 
             elif path == "/api/root_ls":
                 self._send_json({"dir": "/root", "files": root_list_files()}); return
+                
+            elif path == "/api/ppp_status":
+                self._send_json(ppp_status()); return
+                
 
             else:
                 self.send_response(404); self.end_headers()
@@ -3504,6 +3973,20 @@ class H(BaseHTTPRequestHandler):
                 self._send_json(switch_to_ap(persist=persist, force_reboot=force_reboot)); return    
                 
 
+            elif self.path.startswith("/api/ppp_up"):
+                res = ppp_up()
+                self._send_json(res); return
+
+            elif self.path.startswith("/api/ppp_down"):
+                res = ppp_down()
+                self._send_json(res); return
+
+            elif self.path == "/api/ppp_share" and self.command == "POST":
+                # garante que o json é enviado corretamente
+                res = api_ppp_share()
+                self._send_json(res); return
+
+
             else:
                 self._send_json({"error":"endpoint inválido"}, status=404)
         except Exception as e:
@@ -3542,6 +4025,8 @@ def _bg_initial_scan_once():
 if __name__ == "__main__":
     _scan_cache_load()
     threading.Thread(target=_ap_guard_loop, daemon=True).start()
+    threading.Thread(target=_ppp_guard_loop, daemon=True).start()
+    
 
     # Só roda se explicitamente habilitado (por padrão, 0)
     if INIT_SCAN:
@@ -3551,6 +4036,7 @@ if __name__ == "__main__":
     print(f"[netstatus] ouvindo em http://{HOST}:{PORT}  (wifi_if={WIFIIF})")
     try:
         srv.serve_forever()
+        ensure_ip_forward()
     except KeyboardInterrupt:
         pass
 
@@ -3559,11 +4045,6 @@ PY
 
 chmod +x /usr/local/bin/netstatus.py
 systemctl restart netstatus.service
-
-
-
-
-
 
 
 
@@ -3579,7 +4060,7 @@ Wants=network-online.target
 [Service]
 ExecStart=/usr/bin/python3 /usr/local/bin/netstatus.py
 # Para porta alternativa, descomente:
-# Environment=NETSTATUS_PORT=8080
+# Environment=NETSTATUS_PORT=80
 # Environment=NETSTATUS_WIFI_IF=wlan0
 Restart=on-failure
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -3591,6 +4072,8 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable --now netstatus.service
+
+
 
 
 
@@ -3689,6 +4172,34 @@ systemctl restart NetworkManager-dispatcher.service
 
 
 
+sudo mkdir -p /etc/dhcp/dhclient-enter-hooks.d
+sudo tee /etc/dhcp/dhclient-enter-hooks.d/90-route-metric >/dev/null <<'EOF'
+#!/bin/sh
+# Define métricas por interface (menor = mais preferida)
+case "$interface" in
+  end0)  METRIC=100 ;;
+  enx*)  METRIC=200 ;;   # modem SIMCom RNDIS/ECM renomeado
+  *)     METRIC=300 ;;
+esac
+
+# Sempre manter a rota da LAN local
+if [ "$interface" = "end0" ] && [ -n "$new_ip_address" ] && [ -n "$new_subnet_mask" ]; then
+  ip route replace ${new_network_number}/${new_subnet_mask} dev "$interface" src "$new_ip_address" || true
+fi
+
+# Reaplicar default com métrica (dhclient pode inserir sem métrica)
+if [ -n "$new_routers" ]; then
+  for gw in $new_routers; do
+    ip route replace default via "$gw" dev "$interface" metric "$METRIC" || true
+  done
+fi
+EOF
+sudo chmod +x /etc/dhcp/dhclient-enter-hooks.d/90-route-metric
+
+
+
+
+
 
 tee /usr/local/bin/create_ap_dynamic.sh >/dev/null <<'SH'
 #!/bin/sh
@@ -3781,17 +4292,98 @@ EOF
 systemctl unmask create_ap.service
 systemctl daemon-reload
 systemctl enable --now create_ap.service
+
+
+
+
+
+
+
+
+
+
+tee /etc/ppp/peers/gprs >/dev/null <<'EOF'
+connect "/usr/sbin/chat -v -f /etc/chatscripts/gprs"
+
+# Auth
+noauth
+user "vivo"
+password "vivo"
+hide-password
+
+# DNS/IP/robustez
+usepeerdns
+noipdefault
+persist
+maxfail 0
+ipcp-accept-local
+ipcp-accept-remote
+
+# Rota default via PPP (pode deixar que o ip-up ajuste as políticas)
+defaultroute
+
+EOF
+
+
+tee /etc/chatscripts/gprs >/dev/null <<'EOF'
+ABORT 'NO CARRIER'
+ABORT 'ERROR'
+ABORT 'NO DIALTONE'
+ABORT 'BUSY'
+ABORT 'NO ANSWER'
+TIMEOUT 60
+'' ATZ
+OK 'ATE0'
+OK 'AT+CFUN=1'
+OK 'AT+CGATT=1'
+OK 'AT+CGDCONT=1,"IP","zap.vivo.com.br"'
+OK 'ATD*99#'
+CONNECT ''
+EOF
+
+
+
+
+
+
+sudo tee /etc/sysctl.d/99-ipforward.conf >/dev/null <<'EOF'
+net.ipv4.ip_forward=1
+EOF
+
+
+
+sudo tee /etc/sysctl.d/98-rpfilter.conf >/dev/null <<'EOF'
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
+EOF
+sudo sysctl --system
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+reboot
+
+
+
+
 systemctl status create_ap.service
 
-
-
-
-
-
-
-
 journalctl -xeu create_ap.service -f
-
+journalctl -xeu netstatus.service  -f
+systemctl status netstatus.service
 
 
 

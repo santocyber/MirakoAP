@@ -35,7 +35,7 @@ figlet "SantoCyber"
 
 
 sudo apt update
-sudo apt install -y hostapd dnsmasq ppp usb-modeswitch wpasupplicant iptables-persistent python3-flask python3-systemd traceroute
+sudo apt install -y hostapd dnsmasq ppp usb-modeswitch wpasupplicant iptables-persistent python3-flask python3-systemd traceroute tcpdump
 
 
 
@@ -44,6 +44,18 @@ sudo apt install -y hostapd dnsmasq ppp usb-modeswitch wpasupplicant iptables-pe
 echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-iptables.conf
 sudo sysctl -p /etc/sysctl.d/99-iptables.conf
 
+
+
+
+sudo tee /etc/wpa_supplicant/wpa_supplicant-wlan0.conf >/dev/null <<'EOF'
+ctrl_interface=/var/run/wpa_supplicant
+update_config=1
+country=BR
+ap_scan=1
+# redes serão adicionadas pela sua UI via wpa_cli (save_config grava aqui)
+EOF
+
+sudo systemctl enable --now wpa_supplicant@wlan0.service
 
 
 
@@ -169,293 +181,60 @@ EOF
 
 sudo tee /usr/local/bin/profiles.sh >/dev/null <<'EOF'
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -uo pipefail
 
-# ===== Config =====
-SSID="MirakoAP"
-PASS="12345678"
-CHANNEL=6
-COUNTRY="BR"
+PROFILE_FILE=/var/lib/mirako/last_profile
+DEF=ap
+want="$(cat "$PROFILE_FILE" 2>/dev/null || echo "$DEF")"
 
-WLAN_IF="wlan0"
-LAN_IF="end0"     # sua WAN cabeada
-PPP_IF="ppp0"
-PPP_PEER="3g"
+export WLAN_IF="${WLAN_IF:-wlan0}"
+export LAN_IF="${LAN_IF:-end0}"
+export PPP_IF="${PPP_IF:-ppp0}"
+export PPP_PEER="${PPP_PEER:-3g}"
+export PROFILES_SCRIPT="${PROFILES_SCRIPT:-/usr/local/bin/profiles.sh}"
 
-# Gateways padrão (pode sobrescrever via ambiente)
-AP_GW="${AP_GW:-192.168.0.1}"
-# PPP_GW não é necessário em PPP (rota p2p); deixe o pppd gerir
+log(){ echo "[autoboot] $*"; }
 
-log(){ echo "[profiles] $*"; }
-log "PATH=$PATH"
-command -v create_ap || log "ERRO: create_ap não encontrado no PATH"
-have(){ command -v "$1" >/dev/null 2>&1; }
-T(){ timeout -k 5 "${2:-25}"s bash -lc "$1"; }
-
-# ---------- helpers de rede ----------
-ensure_ip_forward(){ sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true; }
-
-ensure_nat(){
-  local WAN="$1"
-  command -v iptables >/dev/null 2>&1 || return 0
-  # MASQUERADE
-  iptables -t nat -C POSTROUTING -o "$WAN" -j MASQUERADE 2>/dev/null || \
-    iptables -t nat -A POSTROUTING -o "$WAN" -j MASQUERADE
-  # FORWARD: retorno do WAN -> WLAN
-  iptables -C FORWARD -i "$WAN" -o "$WLAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -i "$WAN" -o "$WLAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
-  # FORWARD: saída do WLAN -> WAN
-  iptables -C FORWARD -i "$WLAN_IF" -o "$WAN" -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -i "$WLAN_IF" -o "$WAN" -j ACCEPT
+# Garante que, se o perfil não for cliente Wi-Fi, o wpa_supplicant não roube o modo da interface
+disable_sta_daemon(){
+  systemctl stop "wpa_supplicant@${WLAN_IF}.service" >/dev/null 2>&1 || true
+  systemctl disable "wpa_supplicant@${WLAN_IF}.service" >/dev/null 2>&1 || true
+  pkill -f "wpa_supplicant.*${WLAN_IF}" >/dev/null 2>&1 || true
 }
 
-pick_ppp_iface(){
-  # Se já existe e tem IPv4, ok
-  if ip -4 addr show dev "$PPP_IF" 2>/dev/null | grep -q 'inet '; then return 0; fi
-  # tenta ppp0
-  if ip -4 addr show dev ppp0 2>/dev/null | grep -q 'inet '; then PPP_IF="ppp0"; export PPP_IF; return 0; fi
-  # procura qualquer pppX
-  for d in /sys/class/net/ppp*; do
-    [ -e "$d" ] || continue
-    dev="$(basename "$d")"
-    if ip -4 addr show dev "$dev" 2>/dev/null | grep -q 'inet '; then PPP_IF="$dev"; export PPP_IF; return 0; fi
-  done
-  return 1
-}
-
-stop_conflict(){
-  systemctl stop create_ap 2>/dev/null || true
-  systemctl stop hostapd dnsmasq 2>/dev/null || true
-  systemctl stop "wpa_supplicant@${WLAN_IF}.service" 2>/dev/null || true
-  systemctl stop NetworkManager 2>/dev/null || true
-
-  pkill -f "wpa_supplicant.*${WLAN_IF}" 2>/dev/null || true
-  pkill -f "hostapd.*${WLAN_IF}"        2>/dev/null || true
-  pkill dnsmasq 2>/dev/null || true
-
-  rfkill unblock all || true
-  ip link set "$WLAN_IF" down || true
-  ip addr flush dev "$WLAN_IF" || true
-  ip link set "$WLAN_IF" up || true
-}
-
-create_ap_daemon(){
-  local WAN="$1"
-
-  # Tenta parar instância anterior do create_ap (se houver)
-  create_ap --stop "$WLAN_IF" 2>/dev/null || true
-
-  # Se não tiver WAN definida, sobe AP nativo (hostapd/dnsmasq)
-  if [ -z "$WAN" ]; then
-    echo "[profiles] WAN vazia — usando AP nativo (hostapd/dnsmasq)"
-    start_ap_native
-    return
-  fi
-
-  # Se existir create_ap, tenta em modo daemon; se falhar, cai pro nativo
-  if command -v create_ap >/dev/null 2>&1; then
-    if ! create_ap --daemon --no-virt --ieee80211n --freq-band 2.4 \
-                   -c "$CHANNEL" --country "$COUNTRY" \
-                   "$WLAN_IF" "$WAN" "$SSID" "$PASS"; then
-      echo "[profiles] create_ap falhou — caindo para AP nativo (hostapd/dnsmasq)"
-      start_ap_native
-    fi
-  else
-    echo "[profiles] create_ap não encontrado — usando AP nativo (hostapd/dnsmasq)"
-    start_ap_native
-  fi
-}
-
-
-has_ppp_ipv4(){ ip -4 addr show dev "$PPP_IF" 2>/dev/null | grep -q 'inet '; }
-
-ensure_ppp_up(){
-  if has_ppp_ipv4; then
-    log "PPP já está com IPv4 em ${PPP_IF}"
-    return 0
-  fi
-  pkill -x pppd 2>/dev/null || true
-  rm -f /var/lock/LCK..ttyUSB* 2>/dev/null || true
-
-  if have pppd && [ -f "/etc/ppp/peers/${PPP_PEER}" ]; then
-    log "Discando: pppd call ${PPP_PEER}"
-    T "pppd call ${PPP_PEER}" 30 || true
-  elif have pon; then
-    log "Discando: pon ${PPP_PEER}"
-    T "pon ${PPP_PEER}" 30 || true
-  else
-    log "ERRO: nem pppd nem pon encontrados."
-    return 1
-  fi
-
-  for i in {1..60}; do
-    if pick_ppp_iface && has_ppp_ipv4; then
-      log "PPP ativo com IPv4 em ${PPP_IF}"
-      return 0
-    fi
-    sleep 1
-  done
-
-  log "PPP não obteve IPv4 a tempo, últimos logs ppp/chat:"
-  journalctl -b -n 60 --no-pager | grep -iE 'ppp|chat' || true
-  return 1
-}
-
-start_ppp(){
-  pkill -x pppd 2>/dev/null || true
-  rm -f /var/lock/LCK..ttyUSB* 2>/dev/null || true
-  if have pppd && [ -f "/etc/ppp/peers/${PPP_PEER}" ]; then
-    log "Iniciando PPP via: pppd call ${PPP_PEER}"
-    T "pppd call ${PPP_PEER}" 30 || true
-  elif have pon; then
-    log "Iniciando PPP via: pon ${PPP_PEER}"
-    T "pon ${PPP_PEER}" 30 || true
-  else
-    log "ERRO: nem pppd nem pon encontrados."
-    return 1
-  fi
-}
-
-renew_dhcp(){
-  have dhclient || return 0
-  T "dhclient -r $1" 8  || true
-  T "dhclient $1"   20 || true
-}
-
-
-# === Adições para fallback e checagem de conectividade ===
-PPP_CONNECT_CHECK_HOST="${PPP_CONNECT_CHECK_HOST:-8.8.8.8}"
-
-start_ap_native(){
-  # Sobe AP com hostapd/dnsmasq caso create_ap não exista
-  systemctl unmask hostapd dnsmasq >/dev/null 2>&1 || true
-  systemctl stop hostapd dnsmasq >/dev/null 2>&1 || true
-  ip addr flush dev "$WLAN_IF" || true
-  ip addr add 192.168.7.1/24 dev "$WLAN_IF" || true
-  ip link set "$WLAN_IF" up || true
-  # dnsmasq/hostapd conforme /etc/hostapd/hostapd.conf e /etc/dnsmasq.d/mirako.conf
-  systemctl enable --now dnsmasq >/dev/null 2>&1 || true
-  systemctl enable --now hostapd >/dev/null 2>&1 || true
-}
-
-start_ap_wan(){
-  local WAN_IF="$1"
-  stop_conflict
-  ensure_ip_forward
-  if [ -n "$WAN_IF" ]; then ensure_nat "$WAN_IF"; fi
-  if have create_ap; then
-    create_ap --stop "$WLAN_IF" >/dev/null 2>&1 || true
-    if [ -n "$WAN_IF" ]; then
-      create_ap --daemon --no-virt --ieee80211n --freq-band 2.4 -c "$CHANNEL" --country "$COUNTRY" \
-                "$WLAN_IF" "$WAN_IF" "$SSID" "$PASS"
-    else
-      # Sem WAN: use fallback nativo; create_ap sem WAN é inconsistente em algumas builds
-      start_ap_native
-    fi
-  else
-    start_ap_native
-  fi
-}
-
-ppp_has_connectivity(){
-  # Interface com IPv4 + consegue pingar um destino rápido
-  has_ppp_ipv4 || return 1
-  ping -I "$PPP_IF" -c2 -W3 "$PPP_CONNECT_CHECK_HOST" >/dev/null 2>&1
-}
-
-usage(){ echo "Uso: $0 {ap|3g|client-wifi|client-lan|ap-stop}"; exit 1; }
-[ $# -ge 1 ] || usage
-PROFILE="$1"
-
-case "$PROFILE" in
+case "$want" in
   ap)
-    log "== Roteador AP (WAN=${LAN_IF} → AP em ${WLAN_IF}) =="
-    stop_conflict
+    log "Boot: aplicando AP e fixando modo AP (sem wpa_supplicant)."
+    disable_sta_daemon
+    "$PROFILES_SCRIPT" ap || true
+    exit 0
+    ;;
 
-    ip link set "$LAN_IF" up || true
-    renew_dhcp "$LAN_IF"
-
-    # rota padrão e NAT via LAN
-    ensure_ip_forward
-    ip route replace default via "$AP_GW" dev "$LAN_IF" || ip route replace default dev "$LAN_IF"
-    ensure_nat "$LAN_IF"
-
-    create_ap_daemon "$LAN_IF"
-    log "OK: AP+NAT via ${LAN_IF} (GW=${AP_GW})"
-  ;;
-
-3g|ppp|ppp3g)
-    log "== Perfil: Roteador 3G/4G (WAN=${PPP_IF} → AP em ${WLAN_IF}) =="
-    stop_conflict
-
-    # mate qualquer DHCP/rota herdada da LAN/WLAN
-    pkill -f "dhclient.*${LAN_IF}" 2>/dev/null || true
-    ip route del default dev "${LAN_IF}" 2>/dev/null || true
-    ip route del default dev "${WLAN_IF}" 2>/dev/null || true
-
-    # disca e aguarda IPv4 no PPP
-    if ensure_ppp_up && pick_ppp_iface; then
-      ensure_ip_forward
-
-      # force a default via PPP (e apague defaults zumbis)
-      ip route del default 2>/dev/null || true
-      ip route add default dev "$PPP_IF" 2>/dev/null || ip route replace default dev "$PPP_IF"
-
-      ensure_nat "$PPP_IF"
-      start_ap_wan "$PPP_IF"
-
-      # (opcional) teste de reachability sem derrubar o modo
-      if ! ping -I "$PPP_IF" -c2 -W3 1.1.1.1 >/dev/null 2>&1 && \
-         ! ping -I "$PPP_IF" -c2 -W3 8.8.8.8  >/dev/null 2>&1; then
-        log "AVISO: PPP tem IP mas sem resposta ICMP (pode ser bloqueio da operadora)."
-      fi
-
-      log "OK: AP+NAT via ${PPP_IF} (default via PPP)"
-    else
-      log "FALLBACK: PPP não subiu — mudando para perfil AP"
-      exec "$0" ap
-    fi
-  ;;
-
-  client-wifi|wifi-client|sta)
-    log "== Cliente Wi-Fi (WAN=${WLAN_IF}) =="
-    create_ap --stop "$WLAN_IF" 2>/dev/null || true
-    systemctl stop hostapd dnsmasq 2>/dev/null || true
-
-    systemctl start NetworkManager 2>/dev/null || true
-    systemctl restart "wpa_supplicant@${WLAN_IF}.service" 2>/dev/null || true
-    ip link set "$WLAN_IF" up || true
-
-    have dhclient && { T "dhclient -r ${WLAN_IF}" 8 || true; T "dhclient ${WLAN_IF}" 20 || true; }
-    ip route show default | grep -q " dev ${WLAN_IF}" || ip route replace default dev "${WLAN_IF}" || true
-    log "OK: STA no Wi-Fi; Internet pela ${WLAN_IF}"
-  ;;
+  3g|ppp|ppp3g)
+    log "Boot: aplicando 3G + AP; rediscagem ficará a cargo do keepalive."
+    disable_sta_daemon
+    "$PROFILES_SCRIPT" 3g || true
+    exit 0
+    ;;
 
   client-lan|lan-client)
-    log "== Cliente LAN (WAN=${LAN_IF}; Wi-Fi livre p/ scan) =="
-    create_ap --stop "$WLAN_IF" 2>/dev/null || true
-    systemctl stop hostapd dnsmasq 2>/dev/null || true
+    log "Boot: cliente LAN."
+    "$PROFILES_SCRIPT" client-lan || true
+    exit 0
+    ;;
 
-    ip link set "$LAN_IF" up || true
-    renew_dhcp "$LAN_IF"
-
-    systemctl start NetworkManager 2>/dev/null || true
-    systemctl restart "wpa_supplicant@${WLAN_IF}.service" 2>/dev/null || true
-    ip link set "$WLAN_IF" up || true
-    ip addr flush dev "$WLAN_IF" || true
-
-    log "OK: WAN pela ${LAN_IF}; Wi-Fi em managed p/ scan"
-  ;;
-
-  ap-stop)
-    log "Parando AP"
-    create_ap --stop "$WLAN_IF" 2>/dev/null || true
-    log "OK"
-  ;;
+  client-wifi|wifi-client|sta)
+    log "Boot: cliente Wi-Fi com fallback interno do profiles.sh."
+    "$PROFILES_SCRIPT" client-wifi || true
+    exit 0
+    ;;
 
   *)
-    usage
-  ;;
+    log "Boot: perfil desconhecido '$want' — caindo em AP."
+    disable_sta_daemon
+    "$PROFILES_SCRIPT" ap || true
+    exit 0
+    ;;
 esac
 
 
@@ -477,284 +256,557 @@ mkdir /opt/mirako_web
 
 sudo tee /opt/mirako_web/web_config.py >/dev/null <<'EOF'
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-from flask import Flask, render_template_string, request, redirect, url_for, flash
-import subprocess, os, re, time, shutil, glob, math
+"""
+Revised Mirako router configuration web application.
+
+This version cleans up unused helpers, fixes DNS handling when
+switching profiles, exposes DHCP lease information reliably and
+adds several requested UI features:
+
+* A password field for Wi‑Fi connections now includes a toggle to
+  reveal the password.
+* The currently saved operation profile is displayed alongside the
+  profile selection buttons.
+* A new "Serviços" card lists the key systemd services used by the
+  router (hostapd, dnsmasq, wpa_supplicant for wlan0, create_ap and
+  NetworkManager).  Each service row shows whether the service is
+  active and enabled and provides buttons to start, stop, restart,
+  enable or disable the unit.
+* Template style assets no longer depend solely on external CDNs.
+  The Bootstrap JavaScript already falls back to a local copy.  A
+  similar pattern is used for CSS: the page attempts to load a
+  local static file ``/static/css/bootstrap.min.css`` when the
+  remote CDN is unavailable.
+
+The original functionality (Wi‑Fi scanning/connection, PPP modem
+control, network statistics, logs) is preserved.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import time
+import glob
+import shutil
+import subprocess
+from typing import Any, List, Tuple, Dict
+
+from flask import (
+    Flask,
+    render_template_string,
+    request,
+    redirect,
+    url_for,
+    flash,
+)
+
+import threading
+import signal
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("MIRAKO_SECRET", "devkey")
 
-# ======== Configs ========
+###############################################################################
+# Runtime configuration
+###############################################################################
+# Interfaces and scripts may be overridden via environment variables to make the
+# web app flexible for different hardware.  These defaults mirror the install
+# scripts used on Orange Pi Zero boards.
 WLAN_IF = os.environ.get("WLAN_IF", "wlan0")
-LAN_IF  = os.environ.get("LAN_IF",  "end0")
-PPP_IF  = os.environ.get("PPP_IF",  "ppp0")
+LAN_IF = os.environ.get("LAN_IF", "end0")
+PPP_IF = os.environ.get("PPP_IF", "ppp0")
 PPP_PEER = os.environ.get("PPP_PEER", "3g")
 PROFILES_SCRIPT = os.environ.get("PROFILES_SCRIPT", "/usr/local/bin/profiles.sh")
 
+# When using the 3G/PPP profile, the router can automatically attempt to
+# connect/disconnect the modem if this flag file exists.  The keepalive
+# daemon (mirako-ppp-keepalive.sh) checks for its presence before
+# redialing.  The web UI can toggle this flag.
+AUTO_DIAL_FILE = "/var/lib/mirako/auto_dial_enabled"
 
-
-# ======== paths (tentativa via which e fallback) ========
-def find_bin(name, fallbacks):
-    p = shutil.which(name)
-    if p: return p
-    for fb in fallbacks:
-        if os.path.exists(fb) and os.access(fb, os.X_OK):
-            return fb
-    return name  # deixa pro PATH da unit
-PPPD_BIN    = find_bin("pppd",   ["/usr/sbin/pppd","/sbin/pppd","/usr/bin/pppd"])
-IP_BIN       = find_bin("ip",      ["/usr/sbin/ip","/sbin/ip","/usr/bin/ip"])
-IW_BIN       = find_bin("iw",      ["/usr/sbin/iw","/sbin/iw","/usr/bin/iw"])
-IWLIST_BIN   = find_bin("iwlist",  ["/usr/sbin/iwlist","/sbin/iwlist","/usr/bin/iwlist"])
-WPA_CLI_BIN  = find_bin("wpa_cli", ["/usr/sbin/wpa_cli","/sbin/wpa_cli","/usr/bin/wpa_cli"])
-RESOLVECTL_BIN = find_bin("resolvectl", ["/usr/bin/resolvectl","/usr/sbin/resolvectl","/bin/resolvectl"])
-PON_BIN      = find_bin("pon",     ["/usr/bin/pon","/sbin/pon"])
-POFF_BIN     = find_bin("poff",    ["/usr/bin/poff","/sbin/poff"])
-
-TCPDUMP_BIN = find_bin("tcpdump", ["/usr/sbin/tcpdump","/sbin/tcpdump","/usr/bin/tcpdump"])
-LOG_DIR = "/var/log/mirako"
-os.makedirs(LOG_DIR, exist_ok=True)
-TCPDUMP_FILE = os.path.join(LOG_DIR, f"tcpdump_{WLAN_IF}.log")
-
-# SSID/PASS padrão para modo AP (mantém em sincronia com profiles.sh)
+# Default SSID/passphrase used when creating an AP.  Keep these in sync
+# with the values in profiles.sh.
 SSID = os.environ.get("SSID") or os.environ.get("AP_SSID") or "MirakoAP"
 PASS = os.environ.get("PASS") or os.environ.get("AP_PASS") or "12345678"
 
+###############################################################################
+# Executable discovery
+###############################################################################
+def find_bin(name: str, fallbacks: List[str]) -> str:
+    """Return the path of an executable, falling back to known locations."""
+    p = shutil.which(name)
+    if p:
+        return p
+    for fb in fallbacks:
+        if os.path.exists(fb) and os.access(fb, os.X_OK):
+            return fb
+    return name  # hope it's on PATH
 
-RUN_AS_ROOT = (os.geteuid() == 0)
+PPPD_BIN = find_bin("pppd", ["/usr/sbin/pppd", "/sbin/pppd", "/usr/bin/pppd"])
+IP_BIN = find_bin("ip", ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"])
+IW_BIN = find_bin("iw", ["/usr/sbin/iw", "/sbin/iw", "/usr/bin/iw"])
+IWLIST_BIN = find_bin("iwlist", ["/usr/sbin/iwlist", "/sbin/iwlist", "/usr/bin/iwlist"])
+WPA_CLI_BIN = find_bin("wpa_cli", ["/usr/sbin/wpa_cli", "/sbin/wpa_cli", "/usr/bin/wpa_cli"])
+RESOLVECTL_BIN = find_bin(
+    "resolvectl", ["/usr/bin/resolvectl", "/usr/sbin/resolvectl", "/bin/resolvectl"]
+)
 
-# ======== helpers ========
-def run(cmd, timeout=10):
+###############################################################################
+# Terminal / Live Shell Helpers
+###############################################################################
+# We provide a simple live shell environment accessible via the web UI.
+# Commands run in their own process group to allow Ctrl+C to stop them.
+# Output is written to a log file which is tailed by the front‑end via AJAX.
+
+# Prepare directory and file for terminal logs
+LOG_DIR = "/var/log/mirako"
+os.makedirs(LOG_DIR, exist_ok=True)
+TERM_LOG = os.path.join(LOG_DIR, "terminal.log")
+
+# Maintain a single running process at a time
+RUN: Dict[str, Any] = {"proc": None, "pgid": None}
+RUN_LOCK = threading.Lock()
+
+def _write_line(text: str) -> None:
+    """Append a line of text to the terminal log."""
     try:
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        with open(TERM_LOG, "a", encoding="utf-8", errors="ignore") as f:
+            f.write(text)
+            if not text.endswith("\n"):
+                f.write("\n")
+    except Exception:
+        pass
+
+
+def _pump_stdout(proc: subprocess.Popen) -> None:
+    """Background thread: read stdout/stderr from a process and append to log."""
+    try:
+        for line in iter(proc.stdout.readline, ""):
+            _write_line(line.rstrip("\n"))
+    except Exception as e:
+        _write_line(f"[pump] erro: {e}")
+    finally:
+        code = proc.wait()
+        _write_line(f"\n[processo finalizado] exit={code}")
+
+
+def start_command(cmd: str) -> None:
+    """Start a shell command, stopping any existing one."""
+    raw = cmd.strip()
+    if not raw:
+        return
+    with RUN_LOCK:
+        # If a process is already running, send SIGINT to its group
+        if RUN["proc"] is not None and RUN["proc"].poll() is None:
+            try:
+                os.killpg(RUN["pgid"], signal.SIGINT)
+            except Exception:
+                try:
+                    RUN["proc"].terminate()
+                except Exception:
+                    pass
+        # Reset the log and note the command
+        try:
+            with open(TERM_LOG, "w", encoding="utf-8", errors="ignore") as f:
+                f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} — exec: {raw}\n")
+        except Exception:
+            pass
+        # Spawn new process in its own process group
+        proc = subprocess.Popen(
+            raw,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            preexec_fn=os.setsid,
+        )
+        RUN["proc"] = proc
+        RUN["pgid"] = os.getpgid(proc.pid)
+        # Start thread to pump stdout
+        t = threading.Thread(target=_pump_stdout, args=(proc,), daemon=True)
+        t.start()
+
+
+def stop_command() -> None:
+    """Send SIGINT to the running command (if any)."""
+    with RUN_LOCK:
+        if RUN["proc"] is not None and RUN["proc"].poll() is None:
+            try:
+                os.killpg(RUN["pgid"], signal.SIGINT)
+                _write_line("[SIGINT enviado]")
+            except Exception as e:
+                _write_line(f"[erro SIGINT] {e}")
+                try:
+                    RUN["proc"].terminate()
+                except Exception:
+                    pass
+
+
+def clear_log() -> None:
+    """Clear the terminal log file."""
+    try:
+        with open(TERM_LOG, "w", encoding="utf-8") as f:
+            f.write("")
+    except Exception:
+        pass
+
+
+def read_log_tail(max_bytes: int = 120_000) -> str:
+    """Return the last part of the terminal log (up to max_bytes)."""
+    try:
+        with open(TERM_LOG, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            off = max(0, size - max_bytes)
+            f.seek(off, os.SEEK_SET)
+            data = f.read().decode("utf-8", errors="ignore")
+            return data
+    except Exception:
+        return "(sem saída ainda)"
+
+###############################################################################
+# Generic helpers
+###############################################################################
+def run(cmd: List[str], timeout: int = 10) -> Tuple[int, str]:
+    """Run a command and return (exit_code, output)."""
+    try:
+        out = subprocess.check_output(
+            cmd, stderr=subprocess.STDOUT, text=True, timeout=timeout
+        )
         return 0, out.strip()
     except subprocess.CalledProcessError as e:
         return e.returncode, (e.output or "").strip()
     except Exception as e:
         return 1, f"{type(e).__name__}: {e}"
 
-def human_bytes(n):
-    try: n=float(n)
-    except: return str(n)
-    units=["B","KB","MB","GB","TB"]; i=0
-    while n>=1024 and i < len(units)-1:
-        n/=1024.0; i+=1
+
+def human_bytes(n: float) -> str:
+    """Convert a byte count into a human-readable string."""
+    try:
+        n = float(n)
+    except Exception:
+        return str(n)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    while n >= 1024 and i < len(units) - 1:
+        n /= 1024.0
+        i += 1
     return f"{n:.1f} {units[i]}"
 
-# -------- IP / DNS / Interfaces --------
-def ensure_iface_up(dev):
-    base=f"/sys/class/net/{dev}"
-    if not os.path.exists(base): return
-    try:
-        state=open(os.path.join(base,"operstate")).read().strip().lower()
-    except:
-        state="unknown"
-    if state != "up":
-        run([IP_BIN,"link","set","dev",dev,"up"])
 
-def get_ipv4_list(dev):
-    rc, out = run([IP_BIN,"-4","addr","show","dev",dev])
-    if rc!=0: return "-"
-    ips=[]
+###############################################################################
+# Network helpers
+###############################################################################
+def ensure_iface_up(dev: str) -> None:
+    """Ensure a network interface is up."""
+    base = f"/sys/class/net/{dev}"
+    if not os.path.exists(base):
+        return
+    try:
+        state = open(os.path.join(base, "operstate")).read().strip().lower()
+    except Exception:
+        state = "unknown"
+    if state != "up":
+        run([IP_BIN, "link", "set", "dev", dev, "up"])
+
+
+def get_ipv4_list(dev: str) -> str:
+    rc, out = run([IP_BIN, "-4", "addr", "show", "dev", dev])
+    if rc != 0:
+        return "-"
+    ips: List[str] = []
     for line in out.splitlines():
-        line=line.strip()
-        if line.startswith("inet "):
-            parts=line.split()
-            if len(parts)>=2:
+        s = line.strip()
+        if s.startswith("inet "):
+            parts = s.split()
+            if len(parts) >= 2:
                 ips.append(parts[1])
     return ", ".join(ips) if ips else "-"
 
-def default_route():
-    rc, out = run([IP_BIN,"-4","route","show","default"])
-    return out if rc==0 and out else "<sem rota>"
 
-def routes():
-    rc, out = run([IP_BIN,"-4","route"])
-    return out if rc==0 else f"(erro ip route rc={rc})"
+def default_route() -> str:
+    rc, out = run([IP_BIN, "-4", "route", "show", "default"])
+    return out if rc == 0 and out else "<sem rota>"
 
-def dns_info():
-    # usa resolvectl se existir; senão, resolv.conf
+
+def routes() -> str:
+    rc, out = run([IP_BIN, "-4", "route"])
+    return out if rc == 0 else f"(erro ip route rc={rc})"
+
+
+def dns_info() -> str:
+    # Prefer systemd-resolved if available
     if os.path.exists(RESOLVECTL_BIN):
-        rc, out = run([RESOLVECTL_BIN,"status"], timeout=5)
-        if rc==0 and out: return out
+        rc, out = run([RESOLVECTL_BIN, "status"], timeout=5)
+        if rc == 0 and out:
+            return out
     try:
-        with open("/etc/resolv.conf","r",encoding="utf-8",errors="ignore") as f:
+        with open("/etc/resolv.conf", "r", encoding="utf-8", errors="ignore") as f:
             return f.read()
     except Exception as e:
         return f"# erro ao ler resolv.conf: {e}"
 
-# -------- DHCP leases (dnsmasq) --------
-def read_dnsmasq_leases():
-    # caminhos comuns do dnsmasq em Debian
+
+def read_dnsmasq_leases() -> Tuple[List[dict], str, str | None]:
+    """Parse dnsmasq lease file.  Returns a list of leases and raw text."""
     paths = ["/var/lib/misc/dnsmasq.leases", "/var/lib/dnsmasq/dnsmasq.leases"]
     for path in paths:
         if os.path.exists(path):
-            leases=[]
-            raw=""
+            leases: List[dict] = []
+            raw = ""
             try:
                 raw = open(path, "r", encoding="utf-8", errors="ignore").read()
                 for line in raw.splitlines():
                     parts = line.split()
-                    # Formato: <expiry> <mac> <ip> <hostname> <client_id>
                     if len(parts) >= 5:
                         expiry, mac, ip, hostname, client_id = parts[:5]
+                        # expiry is epoch seconds (0 means infinite)
                         try:
                             expi = int(expiry)
-                            when = ("infinito" if expi == 0 else time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expi)))
-                        except:
+                            when = (
+                                "infinito"
+                                if expi == 0
+                                else time.strftime(
+                                    "%Y-%m-%d %H:%M:%S", time.localtime(expi)
+                                )
+                            )
+                        except Exception:
                             when = expiry
-                        leases.append({
-                            "expiry": when,
-                            "mac": mac,
-                            "ip": ip,
-                            "hostname": hostname if hostname != "*" else "",
-                            "client_id": client_id
-                        })
+                        leases.append(
+                            {
+                                "expiry": when,
+                                "mac": mac,
+                                "ip": ip,
+                                "hostname": hostname if hostname != "*" else "",
+                                "client_id": client_id,
+                            }
+                        )
             except Exception as e:
                 raw = f"(erro ao ler {path}: {e})"
             return leases, raw, path
     return [], "(arquivo de leases não encontrado)", None
 
-# -------- Sistema (CPU temp, CPU %, Mem, Disco) --------
-def cpu_temp_c():
-    temps=[]; best=None
+
+###############################################################################
+# System state helpers
+###############################################################################
+def cpu_temp_c() -> float | None:
+    temps: List[float] = []
+    best: float | None = None
     for path in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
         try:
-            t=int(open(path).read().strip())
-            c=t/1000.0 if t>1000 else float(t)
-            ttype_path = path.replace("/temp","/type")
-            ttype = open(ttype_path).read().strip().lower() if os.path.exists(ttype_path) else ""
-            if "cpu" in ttype or "soc" in ttype: best=c
+            t = int(open(path).read().strip())
+            c = t / 1000.0 if t > 1000 else float(t)
+            ttype_path = path.replace("/temp", "/type")
+            ttype = (
+                open(ttype_path).read().strip().lower()
+                if os.path.exists(ttype_path)
+                else ""
+            )
+            if "cpu" in ttype or "soc" in ttype:
+                best = c
             temps.append(c)
-        except: pass
-    if best is not None: return best
-    if temps: return sum(temps)/len(temps)
+        except Exception:
+            pass
+    if best is not None:
+        return best
+    if temps:
+        return sum(temps) / len(temps)
     try:
-        c=int(open("/sys/class/thermal/thermal_zone0/temp").read().strip())/1000.0
+        c = int(open("/sys/class/thermal/thermal_zone0/temp").read().strip()) / 1000.0
         return c
-    except: return None
-
-def cpu_usage_pct(sample_sec=0.2):
-    def read():
-        with open("/proc/stat","r") as f:
-            for line in f:
-                if line.startswith("cpu "):
-                    parts=line.split()
-                    vals=list(map(int, parts[1:]))
-                    idle=vals[3] + (vals[4] if len(vals)>4 else 0)
-                    total=sum(vals)
-                    return idle, total
-        return 0,1
-    idle1,total1=read(); time.sleep(sample_sec); idle2,total2=read()
-    dtotal=total2-total1; didle=idle2-idle1
-    if dtotal<=0: return 0.0
-    busy = 100.0*(1.0 - (didle/dtotal))
-    if busy<0: busy=0.0
-    if busy>100*os.cpu_count(): busy=100*os.cpu_count()
-    return busy
-
-def mem_stats():
-    info={}
-    with open("/proc/meminfo","r") as f:
-        for line in f:
-            k,v = line.split(":",1)
-            info[k.strip()] = v.strip()
-    def kB(name):
-        val=info.get(name,"0").split()[0]
-        return int(val)
-    total=kB("MemTotal")*1024
-    avail=kB("MemAvailable")*1024
-    used=total-avail
-    pct= (used/total*100.0) if total>0 else 0.0
-    return dict(total=total, used=used, avail=avail, pct=pct)
-
-def disk_stats(path="/"):
-    du = shutil.disk_usage(path)
-    used=du.total-du.free
-    pct = used/du.total*100.0 if du.total else 0.0
-    return dict(total=du.total, used=used, free=du.free, pct=pct)
-
-# -------- Processos --------
-def processes_top(n=20):
-    rc, out = run(["ps","-eo","pid,comm,%cpu,%mem","--sort=-%cpu"])
-    procs=[]
-    if rc==0 and out:
-        lines=out.splitlines()
-        for line in lines[1:][:n]:
-            parts=line.split(None,3)
-            if len(parts)==4:
-                pid,comm,pcpu,pmem = parts
-                procs.append(dict(pid=pid, comm=comm, pcpu=pcpu, pmem=pmem))
-    return procs
-
-# -------- Rede (estatísticas) --------
-def net_stats_for(dev):
-    base=f"/sys/class/net/{dev}"
-    if not os.path.exists(base):
-        return dict(dev=dev, state="DOWN", ipv4="-", rx="-", tx="-")
-    try:
-        state=open(os.path.join(base,"operstate")).read().strip().upper()
-    except:
-        state="?"
-    def read_num(p):
-        try: return int(open(p).read().strip())
-        except: return 0
-    rx=read_num(os.path.join(base,"statistics/rx_bytes"))
-    tx=read_num(os.path.join(base,"statistics/tx_bytes"))
-    return dict(dev=dev, state=state, ipv4=get_ipv4_list(dev),
-                rx=human_bytes(rx), tx=human_bytes(tx))
-
-# -------- Wi-Fi --------
-
-def estimate_distance_m(rssi_dbm, freq_mhz):
-    """
-    Estimativa grosseira via FSPL (free-space). Não é precisa em indoor/multipath.
-    d(m) ≈ 10 ^ ((27.55 - 20*log10(f_MHz) + |RSSI|) / 20)
-    """
-    try:
-        return round(10 ** ((27.55 - (20*math.log10(float(freq_mhz))) + abs(float(rssi_dbm))) / 20), 1)
     except Exception:
         return None
 
-def iw_info():
+
+def cpu_usage_pct(sample_sec: float = 0.2) -> float:
+    def read_cpu() -> Tuple[int, int]:
+        with open("/proc/stat", "r") as f:
+            for line in f:
+                if line.startswith("cpu "):
+                    parts = line.split()
+                    vals = list(map(int, parts[1:]))
+                    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+                    total = sum(vals)
+                    return idle, total
+        return 0, 1
+
+    idle1, total1 = read_cpu()
+    time.sleep(sample_sec)
+    idle2, total2 = read_cpu()
+    dtotal = total2 - total1
+    didle = idle2 - idle1
+    if dtotal <= 0:
+        return 0.0
+    busy = 100.0 * (1.0 - (didle / dtotal))
+    if busy < 0:
+        busy = 0.0
+    # Cap at 100% per CPU
+    max_pct = 100 * os.cpu_count()
+    return busy if busy <= max_pct else max_pct
+
+
+def mem_stats() -> Dict[str, float]:
+    info: Dict[str, str] = {}
+    with open("/proc/meminfo", "r") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            info[k.strip()] = v.strip()
+
+    def kB(name: str) -> int:
+        val = info.get(name, "0").split()[0]
+        return int(val)
+
+    total = kB("MemTotal") * 1024
+    avail = kB("MemAvailable") * 1024
+    used = total - avail
+    pct = (used / total * 100.0) if total > 0 else 0.0
+    return dict(total=total, used=used, avail=avail, pct=pct)
+
+
+def disk_stats(path: str = "/") -> Dict[str, float]:
+    du = shutil.disk_usage(path)
+    used = du.total - du.free
+    pct = used / du.total * 100.0 if du.total else 0.0
+    return dict(total=du.total, used=used, free=du.free, pct=pct)
+
+
+def processes_top(n: int = 20) -> List[dict]:
+    rc, out = run(["ps", "-eo", "pid,comm,%cpu,%mem", "--sort=-%cpu"])
+    procs: List[dict] = []
+    if rc == 0 and out:
+        lines = out.splitlines()
+        for line in lines[1 : 1 + n]:
+            parts = line.split(None, 3)
+            if len(parts) == 4:
+                pid, comm, pcpu, pmem = parts
+                procs.append(dict(pid=pid, comm=comm, pcpu=pcpu, pmem=pmem))
+    return procs
+
+
+###############################################################################
+# Network statistics per interface
+###############################################################################
+def net_stats_for(dev: str) -> dict:
+    base = f"/sys/class/net/{dev}"
+    if not os.path.exists(base):
+        return dict(dev=dev, state="DOWN", ipv4="-", rx="-", tx="-")
+    try:
+        state = open(os.path.join(base, "operstate")).read().strip().upper()
+    except Exception:
+        state = "?"
+
+    def read_num(p: str) -> int:
+        try:
+            return int(open(p).read().strip())
+        except Exception:
+            return 0
+
+    rx = read_num(os.path.join(base, "statistics/rx_bytes"))
+    tx = read_num(os.path.join(base, "statistics/tx_bytes"))
+    return dict(
+        dev=dev,
+        state=state,
+        ipv4=get_ipv4_list(dev),
+        rx=human_bytes(rx),
+        tx=human_bytes(tx),
+    )
+
+
+###############################################################################
+# Wi‑Fi helpers
+###############################################################################
+def estimate_distance_m(rssi_dbm: float, freq_mhz: float) -> float | None:
+    """
+    Very rough free‑space estimate of client distance.
+    d(m) ≈ 10 ^ ((27.55 - 20*log10(f_MHz) + |RSSI|) / 20)
+    """
+    try:
+        return round(
+            10 ** ((27.55 - (20 * math.log10(float(freq_mhz))) + abs(float(rssi_dbm))) / 20), 1
+        )
+    except Exception:
+        return None
+
+
+def iw_info() -> dict:
     rc, out = run([IW_BIN, "dev", WLAN_IF, "info"])
-    info = {"type":"-", "channel":"-", "freq_mhz":None, "txpower_dbm":"-"}
-    if rc==0 and out:
+    info: Dict[str, Any] = {
+        "type": "-",
+        "channel": "-",
+        "freq_mhz": None,
+        "txpower_dbm": "-",
+    }
+    if rc == 0 and out:
         for ln in out.splitlines():
             s = ln.strip()
             if s.startswith("type "):
-                info["type"] = s.split(" ",1)[1].strip()
+                info["type"] = s.split(" ", 1)[1].strip()
             elif "channel" in s and "(" in s and "MHz" in s:
-                # ex: channel 6 (2437 MHz)
+                # e.g. "channel 6 (2437 MHz)"
                 try:
                     parts = s.split()
                     info["channel"] = parts[1]
                     mhz = s.split("(")[1].split("MHz")[0].strip()
                     info["freq_mhz"] = float(mhz)
-                except: pass
+                except Exception:
+                    pass
             elif s.startswith("txpower "):
-                # ex: txpower 20.00 dBm
                 try:
                     val = s.split()[1]
                     info["txpower_dbm"] = f"{float(val):.1f} dBm"
-                except: pass
+                except Exception:
+                    pass
     return info
 
-def iw_link():
+
+def get_ap_ssid() -> str:
+    # Try to read temporary create_ap hostapd config if present
+    for path in glob.glob("/tmp/create_ap*.conf"):
+        try:
+            txt = open(path, "r", encoding="utf-8", errors="ignore").read()
+            m = re.search(r"^\s*ssid\s*=\s*(.+)$", txt, re.M)
+            if m:
+                return m.group(1).strip()
+        except Exception:
+            pass
+    # Some drivers show the AP SSID in iw dev info
+    rc, out = run([IW_BIN, "dev", WLAN_IF, "info"])
+    if rc == 0 and out:
+        for ln in out.splitlines():
+            s = ln.strip()
+            if s.lower().startswith("ssid "):
+                return s.split(None, 1)[1].strip()
+    # Fallback to configured SSID
+    return SSID
+
+
+def iw_link() -> dict:
     """
-    STA: retorna SSID/BSSID, RSSI, bitrates, RX/TX acumulados.
-    AP: 'Not connected' -> usamos 'station dump' p/ contar clientes.
+    Return detailed link information for wlan0.  When in AP mode, count
+    connected stations; when in STA, return SSID/BSSID, RSSI and bitrates.
     """
     rc, out = run([IW_BIN, "dev", WLAN_IF, "link"])
-    d = {"connected": False, "ssid":"-", "bssid":"-", "signal_dbm":None,
-         "rx_bitrate":"-", "tx_bitrate":"-", "rx":"-", "tx":"-", "clients":0}
-    if rc==0 and out:
+    d: Dict[str, Any] = {
+        "connected": False,
+        "ssid": "-",
+        "bssid": "-",
+        "signal_dbm": None,
+        "rx_bitrate": "-",
+        "tx_bitrate": "-",
+        "rx": "-",
+        "tx": "-",
+        "clients": 0,
+    }
+    if rc == 0 and out:
         if "Not connected." in out:
-            # em modo AP contamos estações
+            # In AP mode – count stations
             d["connected"] = True
-            d["ssid"] = get_ap_ssid()     # ⇐ usar descoberta automática
+            d["ssid"] = get_ap_ssid()
             rc2, st = run([IW_BIN, "dev", WLAN_IF, "station", "dump"])
-            if rc2==0 and st:
-                # conta estações conectadas e pega RSSI médio do primeiro, se houver
+            if rc2 == 0 and st:
                 clients = 0
                 rssi = None
                 for ln in st.splitlines():
@@ -763,326 +815,481 @@ def iw_link():
                         clients += 1
                     if s.startswith("signal:"):
                         try:
-                            rssi = float(s.split()[1])  # dBm
-                        except: pass
+                            rssi = float(s.split()[1])
+                        except Exception:
+                            pass
                 d["clients"] = clients
                 if rssi is not None:
                     d["signal_dbm"] = rssi
             return d
         else:
+            # Connected as STA
             d["connected"] = True
             for ln in out.splitlines():
                 s = ln.strip()
                 if s.startswith("SSID:"):
-                    d["ssid"] = s.split(":",1)[1].strip()
+                    d["ssid"] = s.split(":", 1)[1].strip()
                 elif s.startswith("Connected to "):
                     d["bssid"] = s.split()[2].strip()
                 elif s.startswith("signal:"):
                     try:
                         d["signal_dbm"] = float(s.split()[1])
-                    except: pass
+                    except Exception:
+                        pass
                 elif s.startswith("rx bitrate:"):
-                    d["rx_bitrate"] = s.split(":",1)[1].strip()
+                    d["rx_bitrate"] = s.split(":", 1)[1].strip()
                 elif s.startswith("tx bitrate:"):
-                    d["tx_bitrate"] = s.split(":",1)[1].strip()
+                    d["tx_bitrate"] = s.split(":", 1)[1].strip()
                 elif s.startswith("RX:"):
-                    d["rx"] = s.split(":",1)[1].strip()
+                    d["rx"] = s.split(":", 1)[1].strip()
                 elif s.startswith("TX:"):
-                    d["tx"] = s.split(":",1)[1].strip()
+                    d["tx"] = s.split(":", 1)[1].strip()
     return d
-    
-    
 
-def get_ap_ssid():
-    """
-    Tenta descobrir o SSID do AP atual:
-    1) Lendo os arquivos temporários do create_ap (hostapd.conf).
-    2) Tentando via 'iw dev <if> info' (alguns drivers mostram 'ssid ...').
-    3) Cai para o SSID default configurado neste app.
-    """
-    # 1) create_ap costuma gerar hostapd.conf temporário em /tmp
-    for path in glob.glob("/tmp/create_ap*.conf"):
-        try:
-            txt = open(path, "r", encoding="utf-8", errors="ignore").read()
-            m = re.search(r'^\s*ssid\s*=\s*(.+)$', txt, re.M)
-            if m:
-                return m.group(1).strip()
-        except Exception:
-            pass
 
-    # 2) alguns drivers mostram ssid em 'iw dev wlan0 info'
-    rc, out = run([IW_BIN, "dev", WLAN_IF, "info"])
-    if rc == 0 and out:
-        for ln in out.splitlines():
-            s = ln.strip()
-            # ex.: "ssid MirakoAP"
-            if s.lower().startswith("ssid "):
-                return s.split(None, 1)[1].strip()
-
-    # 3) fallback: variável deste app
-    return SSID
-
-    
-
-def iface_byte_counters(dev):
-    base=f"/sys/class/net/{dev}/statistics"
+def iface_byte_counters(dev: str) -> Tuple[int, int, int, int]:
+    base = f"/sys/class/net/{dev}/statistics"
     try:
-        rx1=int(open(os.path.join(base,"rx_bytes")).read().strip())
-        tx1=int(open(os.path.join(base,"tx_bytes")).read().strip())
+        rx1 = int(open(os.path.join(base, "rx_bytes")).read().strip())
+        tx1 = int(open(os.path.join(base, "tx_bytes")).read().strip())
         time.sleep(0.25)
-        rx2=int(open(os.path.join(base,"rx_bytes")).read().strip())
-        tx2=int(open(os.path.join(base,"tx_bytes")).read().strip())
-        rx_bps=(rx2-rx1)*8*4  # 0.25s -> *4 p/ bps
-        tx_bps=(tx2-tx1)*8*4
+        rx2 = int(open(os.path.join(base, "rx_bytes")).read().strip())
+        tx2 = int(open(os.path.join(base, "tx_bytes")).read().strip())
+        rx_bps = (rx2 - rx1) * 8 * 4  # convert to bits/s
+        tx_bps = (tx2 - tx1) * 8 * 4
         return (rx2, tx2, rx_bps, tx_bps)
-    except:
-        return (0,0,0,0)
+    except Exception:
+        return (0, 0, 0, 0)
 
-def wifi_status_details():
-    st = wpa_status()  # já existe no seu código
+
+def wpa_status() -> dict:
+    rc, out = run([WPA_CLI_BIN, "-i", WLAN_IF, "status"])
+    d: Dict[str, Any] = {}
+    if rc == 0:
+        for line in out.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                d[k] = v
+    return d
+
+
+def wifi_status_details() -> dict:
+    st = wpa_status()
     ii = iw_info()
     lk = iw_link()
     rxB, txB, rxbps, txbps = iface_byte_counters(WLAN_IF)
-
-    # Monta estrutura para o template
-    mode = ii.get("type","-").upper()
-    state = st.get("wpa_state","-")
-    channel = ii.get("channel","-")
+    mode = ii.get("type", "-").upper()
+    state = st.get("wpa_state", "-")
+    channel = ii.get("channel", "-")
     freq_mhz = ii.get("freq_mhz")
     rssi = lk.get("signal_dbm")
-    dist_m = estimate_distance_m(rssi, freq_mhz) if (rssi is not None and freq_mhz) else None
-
+    dist_m = (
+        estimate_distance_m(rssi, freq_mhz) if (rssi is not None and freq_mhz) else None
+    )
     return {
-        "mode": mode, "state": state,
-        "ssid": lk.get("ssid","-"),
-        "bssid": lk.get("bssid","-"),
+        "mode": mode,
+        "state": state,
+        "ssid": lk.get("ssid", "-"),
+        "bssid": lk.get("bssid", "-"),
         "channel": channel,
-        "freq_mhz": (f"{freq_mhz:.0f} MHz" if freq_mhz else "-"),
-        "txpower": ii.get("txpower_dbm","-"),
-        "rssi": (f"{rssi:.0f} dBm" if rssi is not None else "-"),
-        "tx_bitrate": lk.get("tx_bitrate","-"),
-        "rx_bitrate": lk.get("rx_bitrate","-"),
+        "freq_mhz": f"{freq_mhz:.0f} MHz" if freq_mhz else "-",
+        "txpower": ii.get("txpower_dbm", "-"),
+        "rssi": f"{rssi:.0f} dBm" if rssi is not None else "-",
+        "tx_bitrate": lk.get("tx_bitrate", "-"),
+        "rx_bitrate": lk.get("rx_bitrate", "-"),
         "rx_bytes": human_bytes(rxB),
         "tx_bytes": human_bytes(txB),
-        "rx_bps": (f"{rxbps/1e6:.2f} Mbit/s" if rxbps>0 else "0"),
-        "tx_bps": (f"{txbps/1e6:.2f} Mbit/s" if txbps>0 else "0"),
-        "clients": lk.get("clients",0),
-        "distance_m": (f"~{dist_m} m" if dist_m else "-"),
+        "rx_bps": f"{rxbps/1e6:.2f} Mbit/s" if rxbps > 0 else "0",
+        "tx_bps": f"{txbps/1e6:.2f} Mbit/s" if txbps > 0 else "0",
+        "clients": lk.get("clients", 0),
+        "distance_m": f"~{dist_m} m" if dist_m else "-",
     }
 
-# === tcpdump curto (para UI) ===
-def tcpdump_capture(iface=WLAN_IF, seconds=5, count=120):
-    # captura curta, sem resolver nomes, grava em texto
-    try:
-        cmd=[TCPDUMP_BIN, "-i", iface, "-n", "-vv", "-s", "120", "-c", str(count)]
-        # usa timeout externo
-        rc, out = run(cmd, timeout=seconds+1)
-        # salva (limita tamanho em disco)
-        txt = out or "(sem saída)"
-        # mantém só as últimas ~400 linhas para evitar crescer demais
-        lines = txt.splitlines()[-400:]
-        with open(TCPDUMP_FILE,"w",encoding="utf-8",errors="ignore") as f:
-            f.write("\n".join(lines))
-        return True, "\n".join(lines)
-    except Exception as e:
-        return False, f"erro tcpdump: {e}"
 
-def read_last_tcpdump():
-    try:
-        with open(TCPDUMP_FILE,"r",encoding="utf-8",errors="ignore") as f:
-            return f.read()
-    except:
-        return "(ainda sem captura)"
-
-
-def wpa_status():
-    rc, out = run([WPA_CLI_BIN,"-i",WLAN_IF,"status"])
-    d = {}
-    if rc==0:
-        for line in out.splitlines():
-            if "=" in line:
-                k,v = line.split("=",1); d[k]=v
-    return d
-
-def wifi_scan():
+def wifi_scan() -> Tuple[List[dict], str | None]:
     ensure_iface_up(WLAN_IF)
-    # tenta iw scan
-    rc, out = run([IW_BIN,"dev",WLAN_IF,"scan"])
-    if rc==0 and out:
-        bss=None; nets=[]
+    rc, out = run([IW_BIN, "dev", WLAN_IF, "scan"])
+    if rc == 0 and out:
+        bss: Dict[str, Any] | None = None
+        nets: List[dict] = []
         for line in out.splitlines():
-            s=line.strip()
+            s = line.strip()
             if s.startswith("BSS "):
-                if bss: nets.append(bss)
-                bss={"ssid":"", "signal":"","freq":"","security":"?"}
+                if bss:
+                    nets.append(bss)
+                bss = {"ssid": "", "signal": "", "freq": "", "security": "?"}
             elif s.startswith("SSID:"):
-                if bss is None: bss={}
-                bss["ssid"]=s[5:].strip()
+                if bss is None:
+                    bss = {}
+                bss["ssid"] = s[5:].strip()
             elif s.startswith("freq:"):
-                if bss is None: bss={}
-                bss["freq"]=s[5:].strip()
+                if bss is None:
+                    bss = {}
+                bss["freq"] = s[5:].strip()
             elif s.startswith("signal:"):
-                if bss is None: bss={}
-                bss["signal"]=s[7:].strip()
+                if bss is None:
+                    bss = {}
+                bss["signal"] = s[7:].strip()
             elif s.startswith("RSN:") or s.startswith("WPA:"):
-                if bss is None: bss={}
-                bss["security"]="WPA/WPA2"
-        if bss: nets.append(bss)
-        nets=[n for n in nets if n.get("ssid")]
-        uniq={}
+                if bss is None:
+                    bss = {}
+                bss["security"] = "WPA/WPA2"
+        if bss:
+            nets.append(bss)
+        nets = [n for n in nets if n.get("ssid")]
+        uniq: Dict[str, dict] = {}
         for n in nets:
-            ssid=n["ssid"]
-            if ssid not in uniq or (n.get("signal","") > uniq[ssid].get("signal","")):
-                uniq[ssid]=n
+            ssid = n["ssid"]
+            if ssid not in uniq or n.get("signal", "") > uniq[ssid].get("signal", ""):
+                uniq[ssid] = n
         return list(uniq.values()), None
-    # fallback iwlist
+    # fallback to iwlist
     rc2, out2 = run([IWLIST_BIN, WLAN_IF, "scan"])
-    if rc2==0 and out2:
-        blocks = out2.split("Cell ")
-        nets=[]
-        for b in blocks:
-            ssid = re.search(r'ESSID:"(.*)"', b)
+    if rc2 == 0 and out2:
+        nets = []
+        for b in out2.split("Cell "):
+            ssid_m = re.search(r'ESSID:"(.*)"', b)
             qual = re.search(r"Signal level=(-?\d+)", b) or re.search(r"Quality=([0-9/]+)", b)
             freq = re.search(r"Frequency:([0-9\.]+)", b)
-            enc  = "Open" if "Encryption key:off" in b else "WPA/WPA2"
-            if ssid:
-                nets.append({"ssid":ssid.group(1), "signal": (qual.group(1) if qual else "?"),
-                             "freq": (freq.group(1) if freq else "?"), "security": enc})
+            enc = "Open" if "Encryption key:off" in b else "WPA/WPA2"
+            if ssid_m:
+                nets.append(
+                    {
+                        "ssid": ssid_m.group(1),
+                        "signal": (qual.group(1) if qual else "?"),
+                        "freq": (freq.group(1) if freq else "?"),
+                        "security": enc,
+                    }
+                )
         return nets, None
+
+
+# ====================== Saved networks and file manager helpers =====================
+def get_saved_networks() -> List[Dict[str, str]]:
+    """
+    Return a list of saved Wi‑Fi networks using wpa_cli. Each entry has keys:
+    id, ssid, bssid and flags. Returns an empty list on error.
+    """
+    rc, out = run([WPA_CLI_BIN, "-i", WLAN_IF, "list_networks"])
+    nets: List[Dict[str, str]] = []
+    if rc == 0 and out:
+        lines = out.splitlines()[1:]
+        for line in lines:
+            parts = line.split("\t")
+            if len(parts) >= 4:
+                nets.append(
+                    {
+                        "id": parts[0].strip(),
+                        "ssid": parts[1].strip(),
+                        "bssid": parts[2].strip(),
+                        "flags": parts[3].strip(),
+                    }
+                )
+    return nets
+
+def list_root_files() -> List[str]:
+    """List non-hidden files in /root for a simple file manager."""
+    try:
+        return [f for f in os.listdir("/root") if not f.startswith(".")]
+    except Exception:
+        return []
     return [], f"iw rc={rc} out={out} | iwlist rc={rc2} out={out2}"
 
-def wifi_connect(ssid, psk=None):
-    # garante wpa_supplicant@wlan0
-    rc_svc, _ = run(["systemctl","is-active",f"wpa_supplicant@{WLAN_IF}.service"])
+
+def wifi_connect(ssid: str, psk: str | None = None) -> Tuple[bool, str]:
+    # Ensure wpa_supplicant is active
+    rc_svc, _ = run(["systemctl", "is-active", f"wpa_supplicant@{WLAN_IF}.service"])
     if rc_svc != 0:
-        return False, "wpa_supplicant não está ativo (use o perfil Cliente Wi-Fi)."
-
-    # cria/seleciona rede
-    rc, out = run([WPA_CLI_BIN,"-i",WLAN_IF,"list_networks"])
-    existing_id=None
-    if rc==0 and out:
+        return False, "wpa_supplicant não está ativo (use o perfil Cliente Wi‑Fi)."
+    # Find or create network
+    rc, out = run([WPA_CLI_BIN, "-i", WLAN_IF, "list_networks"])
+    existing_id: str | None = None
+    if rc == 0 and out:
         for line in out.splitlines():
-            parts=line.split("\t")
-            if len(parts)>=2 and parts[1]==ssid:
-                existing_id=parts[0]; break
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[1] == ssid:
+                existing_id = parts[0]
+                break
     if existing_id is None:
-        rc, out = run([WPA_CLI_BIN,"-i",WLAN_IF,"add_network"])
-        if rc!=0: return False, f"add_network falhou: {out}"
+        rc, out = run([WPA_CLI_BIN, "-i", WLAN_IF, "add_network"])
+        if rc != 0:
+            return False, f"add_network falhou: {out}"
         existing_id = out.strip()
-
-    rc1, out1 = run([WPA_CLI_BIN,"-i",WLAN_IF,"set_network",existing_id,"ssid", f"\"{ssid}\""])
-    if rc1!=0: return False, f"set ssid falhou: {out1}"
+    # Configure network
+    rc1, out1 = run([WPA_CLI_BIN, "-i", WLAN_IF, "set_network", existing_id, "ssid", f'"{ssid}"'])
+    if rc1 != 0:
+        return False, f"set ssid falhou: {out1}"
     if psk and psk.strip():
-        rc2, out2 = run([WPA_CLI_BIN,"-i",WLAN_IF,"set_network",existing_id,"psk", f"\"{psk}\""])
+        rc2, out2 = run([
+            WPA_CLI_BIN,
+            "-i",
+            WLAN_IF,
+            "set_network",
+            existing_id,
+            "psk",
+            f'"{psk}"',
+        ])
     else:
-        rc2, out2 = run([WPA_CLI_BIN,"-i",WLAN_IF,"set_network",existing_id,"key_mgmt","NONE"])
-    if rc2!=0: return False, f"config segurança falhou: {out2}"
-
-    rc3, out3 = run([WPA_CLI_BIN,"-i",WLAN_IF,"enable_network",existing_id])
-    rc4, out4 = run([WPA_CLI_BIN,"-i",WLAN_IF,"select_network",existing_id])
-    run([WPA_CLI_BIN,"-i",WLAN_IF,"save_config"])
-    run([WPA_CLI_BIN,"-i",WLAN_IF,"reassociate"])
-    if not (rc3==0 and rc4==0):
-        return False, ("; ".join([out3,out4])).strip()
-
-    # espera associação
+        rc2, out2 = run([
+            WPA_CLI_BIN,
+            "-i",
+            WLAN_IF,
+            "set_network",
+            existing_id,
+            "key_mgmt",
+            "NONE",
+        ])
+    if rc2 != 0:
+        return False, f"config segurança falhou: {out2}"
+    rc3, out3 = run([WPA_CLI_BIN, "-i", WLAN_IF, "enable_network", existing_id])
+    rc4, out4 = run([WPA_CLI_BIN, "-i", WLAN_IF, "select_network", existing_id])
+    run([WPA_CLI_BIN, "-i", WLAN_IF, "save_config"])
+    run([WPA_CLI_BIN, "-i", WLAN_IF, "reassociate"])
+    if not (rc3 == 0 and rc4 == 0):
+        return False, ("; ".join([out3, out4])).strip()
+    # Wait for association
     deadline = time.time() + 30
     last_state = ""
     while time.time() < deadline:
         st = wpa_status()
-        last_state = st.get("wpa_state","")
+        last_state = st.get("wpa_state", "")
         if last_state == "COMPLETED":
             break
         time.sleep(1)
     if last_state != "COMPLETED":
         return False, f"associação não completou (estado={last_state or 'desconhecido'})"
-
     # DHCP
-    run(["dhclient","-r",WLAN_IF])
-    rc_dh, out_dh = run(["dhclient",WLAN_IF], timeout=25)
-
+    run(["dhclient", "-r", WLAN_IF])
+    rc_dh, out_dh = run(["dhclient", WLAN_IF], timeout=25)
     ip = get_ipv4_list(WLAN_IF)
     if ip == "-" or rc_dh != 0:
         return False, f"associou, mas sem IP (dhclient rc={rc_dh}) {out_dh}"
-
-    # DNS + rota default com gateway a partir do lease
-    routers, dns = parse_dhclient_lease(WLAN_IF)
+    # Parse DHCP lease for DNS and routers
+    routers, dns_servers = parse_dhclient_lease(WLAN_IF)
     if routers:
         ensure_default_via(routers[0], WLAN_IF)
-    if dns:
-        apply_dns(dns)
+    if dns_servers:
+        apply_dns(dns_servers)
+    return True, (
+        f"conectado com IP {ip}; GW={routers[0] if routers else '?'}; DNS="
+        + (", ".join(dns_servers) if dns_servers else "?")
+    )
 
-    return True, f"conectado com IP {ip}; GW={routers[0] if routers else '?'}; DNS={', '.join(dns) if dns else '?'}"
+
+def wifi_disconnect() -> Tuple[bool, str]:
+    rc, out = run([WPA_CLI_BIN, "-i", WLAN_IF, "disconnect"])
+    return (rc == 0, out)
 
 
-def wifi_disconnect():
-    rc, out = run([WPA_CLI_BIN,"-i",WLAN_IF,"disconnect"])
-    return (rc==0, out)
+###############################################################################
+# Service management helpers
+###############################################################################
+def list_services() -> List[dict]:
+    """
+    Return status information for **all** systemd services.  Each entry in the
+    returned list contains the unit name, whether it is currently active and
+    whether it is enabled.  To avoid excessive overhead this function uses
+    ``systemctl list-unit-files`` to fetch the list of services and then
+    individually queries each unit's active state.  In systems with hundreds of
+    units this may take a moment.
+    """
+    services: List[dict] = []
+    rc, out = run([
+        "systemctl",
+        "list-unit-files",
+        "--type=service",
+        "--no-pager",
+        "--no-legend",
+    ])
+    if rc != 0 or not out:
+        return services
+    for line in out.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        name = parts[0]
+        state = parts[1] if len(parts) > 1 else "disabled"
+        # Determine if the service is currently active (running)
+        rc_active, _ = run(["systemctl", "is-active", name])
+        active = (rc_active == 0)
+        # Enabled states include "enabled" and "enabled-runtime"
+        enabled = state.startswith("enabled")
+        services.append({"name": name, "active": active, "enabled": enabled})
+    # Sort alphabetically for readability
+    services.sort(key=lambda x: x["name"])
+    return services
 
-def profile_set(profile):
+
+def service_action(service: str, action: str) -> Tuple[bool, str]:
+    """Perform a systemctl action on a given service."""
+    valid_actions = {"start", "stop", "restart", "enable", "disable"}
+    if action not in valid_actions:
+        return False, f"ação inválida: {action}"
+    if action in {"start", "stop", "restart"}:
+        cmd = ["systemctl", action, service]
+    elif action == "enable":
+        cmd = ["systemctl", "enable", service]
+    else:  # disable
+        cmd = ["systemctl", "disable", service]
+    rc, out = run(cmd, timeout=20)
+    return (rc == 0, out)
+
+
+###############################################################################
+# DHCP helpers
+###############################################################################
+def parse_dhclient_lease(iface: str) -> Tuple[List[str], List[str]]:
+    path = f"/var/lib/dhcp/dhclient.{iface}.leases"
+    routers: List[str] = []
+    dns: List[str] = []
+    try:
+        if os.path.exists(path):
+            txt = open(path, "r", encoding="utf-8", errors="ignore").read()
+            m_dns = re.findall(r"option\s+domain-name-servers\s+([^;]+);", txt)
+            m_rtr = re.findall(r"option\s+routers\s+([^;]+);", txt)
+            if m_dns:
+                dns = [i.strip() for i in re.split(r"[,\s]+", m_dns[-1].strip()) if i.strip()]
+            if m_rtr:
+                routers = [i.strip() for i in re.split(r"[,\s]+", m_rtr[-1].strip()) if i.strip()]
+    except Exception:
+        pass
+    return routers, dns
+
+
+def apply_dns(nameservers: List[str]) -> Tuple[bool, str]:
+    try:
+        if os.path.islink("/etc/resolv.conf"):
+            os.unlink("/etc/resolv.conf")
+        with open("/etc/resolv.conf", "w", encoding="utf-8") as f:
+            f.write("# Generated by Mirako client‑wifi\n")
+            for ns in nameservers:
+                if ns:
+                    f.write(f"nameserver {ns}\n")
+        return True, "resolv.conf atualizado"
+    except Exception as e:
+        return False, f"erro ao escrever resolv.conf: {e}"
+
+# ----- Auto dial helpers -----
+def is_auto_dial_enabled() -> bool:
+    """Return True if automatic PPP dial is enabled."""
+    try:
+        return os.path.exists(AUTO_DIAL_FILE)
+    except Exception:
+        return False
+
+def set_auto_dial(enabled: bool) -> None:
+    """Enable or disable automatic PPP dialing by creating/removing a flag file."""
+    try:
+        if enabled:
+            os.makedirs(os.path.dirname(AUTO_DIAL_FILE), exist_ok=True)
+            with open(AUTO_DIAL_FILE, "w") as f:
+                f.write("1")
+        else:
+            if os.path.exists(AUTO_DIAL_FILE):
+                os.remove(AUTO_DIAL_FILE)
+    except Exception:
+        pass
+
+
+def ensure_default_via(gw: str, dev: str) -> None:
+    if not gw:
+        return
+    run([IP_BIN, "route", "replace", "default", "via", gw, "dev", dev])
+
+
+###############################################################################
+# Interface enumeration
+###############################################################################
+def list_interfaces(include_virtual: bool = True, include_lo: bool = True) -> List[str]:
+    try:
+        names = sorted(os.listdir("/sys/class/net"))
+    except Exception:
+        names = []
+    skip_prefix = ("veth", "br-", "docker", "virbr", "vmnet", "vnet", "zt")
+    out: List[str] = []
+    for n in names:
+        if not include_lo and n == "lo":
+            continue
+        if not include_virtual and n.startswith(skip_prefix):
+            continue
+        out.append(n)
+    return out
+
+
+###############################################################################
+# Service for profiles
+###############################################################################
+def profile_set(profile: str) -> Tuple[int, str]:
     return run([PROFILES_SCRIPT, profile], timeout=90)
 
-def modem_connect():
-    # mata pppd antigo, limpa locks
-    run(["pkill","-x","pppd"])
-    run(["rm","-f","/var/lock/LCK..ttyUSB*"])
-    # dispara pppd call 3g (daemoniza)
+
+###############################################################################
+# PPP modem helpers
+###############################################################################
+def modem_connect() -> Tuple[bool, str]:
+    run(["pkill", "-x", "pppd"])
+    run(["rm", "-f", "/var/lock/LCK..ttyUSB*"])
     try:
-        p = subprocess.Popen([PPPD_BIN, "call", PPP_PEER],
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.STDOUT)
+        subprocess.Popen([
+            PPPD_BIN,
+            "call",
+            PPP_PEER,
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     except Exception as e:
         return False, f"erro ao iniciar pppd: {e}"
-
-    # espera até 20s pelo ppp0 subir
+    # Wait up to 20 seconds for ppp0
     deadline = time.time() + 20
     up = False
     while time.time() < deadline:
-        rc, _ = run([IP_BIN,"link","show",PPP_IF])
+        rc, _ = run([IP_BIN, "link", "show", PPP_IF])
         if rc == 0:
             up = True
             break
         time.sleep(1.0)
-
     if up:
         return True, "pppd call enviado e ppp0 ativo"
+    # Collect recent journal logs for debugging
+    rc1, j1 = run(["journalctl", "-b", "-n", "50", "--no-pager"])
+    last: List[str] = []
+    if rc1 == 0 and j1:
+        for ln in j1.splitlines():
+            if ("pppd" in ln.lower()) or ("chat" in ln.lower()):
+                last.append(ln)
+    msg = "ppp0 não subiu. "
+    if last:
+        msg += "Logs recentes: " + ("\n".join(last[-8:]))
     else:
-        # coleta logs breves do pppd/chat pra mostrar na UI
-        rc1, j1 = run(["journalctl","-b","-n","50","--no-pager"])
-        last = []
-        if rc1 == 0 and j1:
-            for ln in j1.splitlines():
-                if ("pppd" in ln.lower()) or ("chat" in ln.lower()):
-                    last.append(ln)
-        msg = "ppp0 não subiu. "
-        if last:
-            msg += "Logs recentes: " + ("\n".join(last[-8:]))
-        else:
-            msg += "Sem logs do pppd/chat."
-        return False, msg
+        msg += "Sem logs do pppd/chat."
+    return False, msg
 
-def modem_disconnect():
-    rc, out = run([POFF_BIN, PPP_PEER], timeout=20)
+
+def modem_disconnect() -> Tuple[bool, str]:
+    rc, out = run(["poff", PPP_PEER], timeout=20)
     msg = (out or "").strip()
     if rc != 0 and ("No pppd is running" in msg or "None stopped" in msg):
         return True, "pppd já estava parado"
     if rc != 0:
-        run(["pkill","-x","pppd"])
-        run(["rm","-f","/var/lock/LCK..ttyUSB*"])
+        run(["pkill", "-x", "pppd"])
+        run(["rm", "-f", "/var/lock/LCK..ttyUSB*"])
         return True, "pppd finalizado"
     return True, msg or "poff enviado"
 
 
-# -------- dmesg --------
-def get_dmesg():
-    # tenta com -T (timestamps legíveis); se não suportar, cai para sem -T
-    rc, out = run(["dmesg", "-T"], timeout=10)
-    if rc == 0 and out: 
-        return out
-    rc2, out2 = run(["dmesg"], timeout=10)
-    return out2 if rc2 == 0 else f"(falha ao obter dmesg: rc={rc} / rc2={rc2})"
+###############################################################################
+# Last profile helper
+###############################################################################
+def get_last_profile() -> str:
+    path = "/var/lib/mirako/last_profile"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip() or "ap"
+    except Exception:
+        return "ap"
 
-# ======== Template ========
+
+###############################################################################
+# Template
+###############################################################################
 TEMPLATE = """
 <!doctype html>
 <html lang="pt-br" data-bs-theme="dark">
@@ -1090,7 +1297,8 @@ TEMPLATE = """
     <meta charset="utf-8">
     <title>Mirako — Orange Pi Router</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Attempt remote Bootstrap; if unavailable load local copy -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" onerror="this.onerror=null;this.href='/static/css/bootstrap.min.css';">
     <style>
       pre{white-space:pre-wrap;word-wrap:break-word}
       .ssid-row{cursor:pointer}
@@ -1102,7 +1310,7 @@ TEMPLATE = """
     <nav class="navbar navbar-expand-lg bg-dark border-bottom border-secondary mb-4">
       <div class="container">
         <span class="navbar-brand">Mirako Router</span>
-        <span class="navbar-text small">Orange Pi Zero 3 — Debian 12</span>
+        <span class="navbar-text small">Orange Pi — Debian</span>
       </div>
     </nav>
 
@@ -1121,27 +1329,27 @@ TEMPLATE = """
         <!-- Perfis -->
         <div class="col-12 col-lg-4">
           <div class="card h-100">
-            <div class="card-header">Perfis de operação</div>
+            <div class="card-header">Perfis de operação (atual: {{ last_profile }})</div>
             <div class="card-body">
   <form method="post" action="{{ url_for('setprofile') }}" class="d-grid gap-2">
-  <button class="btn btn-primary" name="profile" value="ap">Roteador AP (WAN={{LAN_IF}} → AP em {{WLAN_IF}})</button>
-  <button class="btn btn-primary" name="profile" value="3g">Roteador 3G PPP (WAN={{PPP_IF}} → AP/LAN)</button>
-  <button class="btn btn-primary" name="profile" value="client-wifi">Cliente Wi-Fi (WAN={{WLAN_IF}} → LAN {{LAN_IF}})</button>
-  <button class="btn btn-secondary" name="profile" value="client-lan">Cliente LAN (WAN={{LAN_IF}}; Wi-Fi liberado p/ scan)</button>
-</form>
-
+    <button class="btn btn-primary" name="profile" value="ap">Roteador AP (WAN={{LAN_IF}} → AP em {{WLAN_IF}})</button>
+    <button class="btn btn-primary" name="profile" value="3g">Roteador 3G PPP (WAN={{PPP_IF}} → AP/LAN)</button>
+    <button class="btn btn-primary" name="profile" value="client-wifi">Cliente Wi‑Fi (WAN={{WLAN_IF}} → LAN {{LAN_IF}})</button>
+    <button class="btn btn-secondary" name="profile" value="client-lan">Cliente LAN (WAN={{LAN_IF}}; Wi‑Fi liberado p/ scan)</button>
+  </form>
             </div>
           </div>
         </div>
 
-        <!-- Wi-Fi -->
-         <!-- Wi-Fi -->
+        <!-- Wi‑Fi -->
         <div class="col-12 col-lg-8">
           <div class="card h-100">
             <div class="card-header d-flex justify-content-between align-items-center">
               <span>Wi‑Fi ({{WLAN_IF}})</span>
               <div class="d-flex gap-2">
-                <form method="post" action="{{ url_for('wifi_scan_route') }}"><button class="btn btn-sm btn-outline-light">Escanear redes</button></form>
+                <form method="post" action="{{ url_for('wifi_scan_route') }}">
+                  <button class="btn btn-sm btn-outline-light">Escanear redes</button>
+                </form>
               </div>
             </div>
             <div class="card-body">
@@ -1159,7 +1367,6 @@ TEMPLATE = """
                   <div class="small text-secondary">Canal / Freq / TX pwr</div>
                   <div class="fs-6">{{ wifi.channel }} / {{ wifi.freq_mhz }} / {{ wifi.txpower }}</div>
                 </div>
-
                 <div class="col-sm-3">
                   <div class="small text-secondary">RSSI</div>
                   <div class="fs-6">{{ wifi.rssi }}</div>
@@ -1176,7 +1383,6 @@ TEMPLATE = """
                   <div class="small text-secondary">Clientes (se AP)</div>
                   <div class="fs-6">{{ wifi.clients }}</div>
                 </div>
-
                 <div class="col-sm-6">
                   <div class="small text-secondary">Tráfego (bytes)</div>
                   <div class="fs-6">TX: {{ wifi.tx_bytes }} — RX: {{ wifi.rx_bytes }}</div>
@@ -1186,16 +1392,47 @@ TEMPLATE = """
                   <div class="fs-6">TX: {{ wifi.tx_bps }} — RX: {{ wifi.rx_bps }}</div>
                 </div>
               </div>
-
               <hr>
-              <!-- Form de conexão STA -->
-              <form class="row gy-2 gx-2 align-items-end" method="post" action="{{ url_for('wifi_connect_route') }}">
-                <div class="col-sm-5"><label class="form-label">SSID</label><input type="text" class="form-control" name="ssid" id="ssidField" required></div>
-                <div class="col-sm-5"><label class="form-label">Senha (vazio = rede aberta)</label><input type="password" class="form-control" name="psk" autocomplete="off"></div>
-                <div class="col-sm-2 d-grid"><button class="btn btn-success">Conectar</button></div>
+              <!-- Formulário de conexão STA -->
+              <form class="row gy-2 gx-2" method="post" action="{{ url_for('wifi_connect_route') }}">
+                <div class="col-12">
+                  <label class="form-label">SSID</label>
+                  <input type="text" class="form-control" name="ssid" id="ssidField" required>
+                </div>
+                <div class="col-12">
+                  <label class="form-label">Senha (vazio = rede aberta)</label>
+                  <input type="password" class="form-control" name="psk" id="pskField" autocomplete="off">
+                  <div class="form-check mt-1">
+                    <input class="form-check-input" type="checkbox" id="showPass" onchange="togglePass()">
+                    <label class="form-check-label small" for="showPass">Mostrar senha</label>
+                  </div>
+                </div>
+                <div class="col-12 d-grid mt-2">
+                  <button class="btn btn-success">Conectar</button>
+                </div>
               </form>
-              <form method="post" action="{{ url_for('wifi_disconnect_route') }}" class="mt-2"><button class="btn btn-outline-warning btn-sm">Desconectar Wi‑Fi</button></form>
+              <form method="post" action="{{ url_for('wifi_disconnect_route') }}" class="mt-2">
+                <button class="btn btn-outline-warning btn-sm">Desconectar Wi‑Fi</button>
+              </form>
 
+              {% if saved_networks and saved_networks|length > 0 %}
+              <hr>
+              <div class="small text-secondary">Redes salvas</div>
+              <div class="table-responsive">
+                <table class="table table-sm table-hover align-middle">
+                  <thead><tr><th>ID</th><th>SSID</th><th>Flags</th></tr></thead>
+                  <tbody>
+                  {% for n in saved_networks %}
+                    <tr>
+                      <td class="mono">{{ n.id }}</td>
+                      <td class="mono">{{ n.ssid }}</td>
+                      <td>{{ n.flags }}</td>
+                    </tr>
+                  {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+              {% endif %}
               {% if scan %}
               <hr>
               <div class="table-responsive">
@@ -1217,18 +1454,25 @@ TEMPLATE = """
           </div>
         </div>
 
-
         <!-- Modem 3G -->
         <div class="col-12 col-lg-4">
           <div class="card h-100">
             <div class="card-header">Modem 3G/PPP ({{PPP_IF}})</div>
             <div class="card-body">
               <div class="d-grid gap-2">
-<form method="post" action="{{ url_for('modem_connect_route') }}">
-  <button class="btn btn-success">Conectar modem (pppd call {{PPP_PEER}})</button>
-</form>
-
-                <form method="post" action="{{ url_for('modem_disconnect_route') }}"><button class="btn btn-outline-warning">Desconectar modem (poff {{PPP_PEER}})</button></form>
+                <form method="post" action="{{ url_for('modem_connect_route') }}">
+                  <button class="btn btn-success">Conectar modem (pppd call {{PPP_PEER}})</button>
+                </form>
+                <form method="post" action="{{ url_for('modem_disconnect_route') }}">
+                  <button class="btn btn-outline-warning">Desconectar modem (poff {{PPP_PEER}})</button>
+                </form>
+                <!-- Toggle auto dial when in 3G profile -->
+                <form method="post" action="{{ url_for('modem_auto_dial_route') }}">
+                  <div class="form-check form-switch mt-2">
+                    <input class="form-check-input" type="checkbox" id="autoDialToggle" name="auto_dial" value="1" {% if auto_dial_enabled %}checked{% endif %} onchange="this.form.submit()">
+                    <label class="form-check-label" for="autoDialToggle">Discagem automática (3G)</label>
+                  </div>
+                </form>
               </div>
               <hr>
               <div class="small text-secondary">IPv4 ({{PPP_IF}})</div>
@@ -1243,10 +1487,22 @@ TEMPLATE = """
             <div class="card-header">Sistema</div>
             <div class="card-body">
               <div class="row g-3">
-                <div class="col-md-3"><div class="small text-secondary">Temp CPU</div><div class="fs-5">{{ cpu_temp }}</div></div>
-                <div class="col-md-3"><div class="small text-secondary">Uso CPU</div><div class="fs-5">{{ cpu_pct }}%</div></div>
-                <div class="col-md-3"><div class="small text-secondary">Memória</div><div class="fs-6">{{ mem_used }} / {{ mem_total }} ({{ mem_pct }}%)</div></div>
-                <div class="col-md-3"><div class="small text-secondary">Disco (/)</div><div class="fs-6">{{ disk_used }} / {{ disk_total }} ({{ disk_pct }}%)</div></div>
+                <div class="col-md-3">
+                  <div class="small text-secondary">Temp CPU</div>
+                  <div class="fs-5">{{ cpu_temp }}</div>
+                </div>
+                <div class="col-md-3">
+                  <div class="small text-secondary">Uso CPU</div>
+                  <div class="fs-5">{{ cpu_pct }}%</div>
+                </div>
+                <div class="col-md-3">
+                  <div class="small text-secondary">Memória</div>
+                  <div class="fs-6">{{ mem_used }} / {{ mem_total }} ({{ mem_pct }}%)</div>
+                </div>
+                <div class="col-md-3">
+                  <div class="small text-secondary">Disco (/)</div>
+                  <div class="fs-6">{{ disk_used }} / {{ disk_total }} ({{ disk_pct }}%)</div>
+                </div>
               </div>
             </div>
           </div>
@@ -1314,102 +1570,332 @@ TEMPLATE = """
           </div>
         </div>
 
-        <!-- LOG: DMESG -->
-        <!-- LOG: DMESG -->
+        <!-- SERVIÇOS -->
         <div class="col-12">
-          <div class="card">
-            <div class="card-header d-flex justify-content-between align-items-center">
-              <span>Log do Kernel (dmesg)</span>
-              <form method="post" action="{{ url_for('tcpdump_route') }}">
-                <button class="btn btn-sm btn-outline-info">Capturar tcpdump ({{WLAN_IF}}) 5s</button>
-              </form>
-            </div>
+          <div class="card h-100">
+            <div class="card-header">Serviços</div>
             <div class="card-body">
-              <pre class="mono scroll" id="dmesgBox">{{ dmesg }}</pre>
-              <hr>
-              <div class="small text-secondary">tcpdump (última captura — {{WLAN_IF}})</div>
-              <pre class="mono scroll">{{ last_tcpdump }}</pre>
+              <div class="table-responsive">
+                <table class="table table-sm table-hover align-middle">
+                  <thead><tr><th>Serviço</th><th>Status</th><th>Enabled</th><th>Ações</th></tr></thead>
+                  <tbody>
+                    {% for s in services %}
+                      <tr>
+                        <td class="mono">{{ s.name }}</td>
+                        <td>{{ 'ativo' if s.active else 'inativo' }}</td>
+                        <td>{{ 'habilitado' if s.enabled else 'desabilitado' }}</td>
+                        <td>
+                          <form method="post" action="{{ url_for('svc_action_route') }}" class="d-inline">
+                            <input type="hidden" name="svc" value="{{ s.name }}">
+                            <div class="btn-group btn-group-sm" role="group">
+                              <button class="btn btn-success" name="action" value="start">Start</button>
+                              <button class="btn btn-warning" name="action" value="stop">Stop</button>
+                              <button class="btn btn-info" name="action" value="restart">Restart</button>
+                              {% if s.enabled %}
+                              <button class="btn btn-secondary" name="action" value="disable">Disable</button>
+                              {% else %}
+                              <button class="btn btn-primary" name="action" value="enable">Enable</button>
+                              {% endif %}
+                            </div>
+                          </form>
+                        </td>
+                      </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         </div>
 
+        <!-- Gerenciador de Arquivos -->
+        <div class="col-12">
+          <div class="card">
+            <div class="card-header">Gerenciador de Arquivos (diretório root)</div>
+            <div class="card-body">
+              <form method="post" enctype="multipart/form-data" action="{{ url_for('file_upload_route') }}">
+                <div class="row g-2 align-items-end">
+                  <div class="col-sm-9">
+                    <input class="form-control" type="file" name="file" required>
+                  </div>
+                  <div class="col-sm-3 d-grid">
+                    <button class="btn btn-primary">Enviar</button>
+                  </div>
+                </div>
+              </form>
+              {% if root_files and root_files|length > 0 %}
+              <hr>
+              <div class="small text-secondary">Arquivos em /root</div>
+              <ul class="list-group list-group-flush">
+                {% for f in root_files %}
+                  <li class="list-group-item">{{ f }}</li>
+                {% endfor %}
+              </ul>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+
+        <!-- TERMINAL AO VIVO -->
+        <div class="col-12" id="terminal_card">
+          <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <span>Terminal ao vivo</span>
+              <div class="d-flex flex-wrap gap-2">
+                <button type="button" class="btn btn-sm btn-outline-primary" onclick="prefill('dmesg -wT')">dmesg</button>
+                <button type="button" class="btn btn-sm btn-outline-primary" onclick="prefill('top -b')">top</button>
+                <button type="button" class="btn btn-sm btn-outline-info" onclick="prefill('tcpdump -i {{WLAN_IF}} -n -vv -s 120')">tcpdump ({{WLAN_IF}})</button>
+                <button type="button" class="btn btn-sm btn-warning" onclick="stopCmd()">Ctrl+C</button>
+                <button type="button" class="btn btn-sm btn-secondary" onclick="clearLog()">Limpar</button>
+                <button type="button" class="btn btn-sm btn-danger" onclick="rebootConfirm()">Reiniciar</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div id="terminal_wrap" class="mono" style="background:#0b0d10;border:1px solid #222;border-radius:.25rem;padding:.5rem;height:50vh;overflow:auto;">
+                <pre id="terminal_out" class="mono m-0" style="color:#d6d6d6;white-space:pre-wrap;"></pre>
+              </div>
+              <div class="input-group mt-2">
+                <span class="input-group-text" style="background:#151a1f;color:#9ad;">$</span>
+                <input id="terminal_cmd" class="form-control" placeholder="Digite um comando e pressione Enter">
+                <button class="btn btn-success" type="button" id="terminal_run_btn" title="Executar (Enter)">Enter</button>
+              </div>
+              <div class="form-text">Dica: para usar o top ao vivo aqui, basta digitar <code>top</code> — eu ativo <code>-b</code> automaticamente.</div>
+            </div>
+          </div>
+        </div>
 
       </div><!-- row -->
       <div class="py-4"></div>
     </div><!-- container -->
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <!-- Local bootstrap fallback JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-ENjdO4Dr2bkBIFxQpeoDGLVYI3GXx3E4p+3nZl5Mq9UOz1pENhb4u91WTrQF3R9F" crossorigin="anonymous" onerror="loadLocalBootstrap()"></script>
     <script>
-      // auto-scroll para o final do dmesg ao carregar
-      (function(){
-        var el = document.getElementById('dmesgBox');
-        if (el) { el.scrollTop = el.scrollHeight; }
-      })();
+    function loadLocalBootstrap() {
+      var s = document.createElement('script');
+      s.src = '/static/js/bootstrap.bundle.min.js';
+      document.head.appendChild(s);
+      console.warn('Bootstrap CDN indisponível, carregando versão local...');
+    }
+    function togglePass() {
+      var ps = document.getElementById('pskField');
+      if (ps) {
+        ps.type = ps.type === 'password' ? 'text' : 'password';
+      }
+    }
+    </script>
+
+    <!-- Terminal control scripts -->
+    <script>
+    // ===== ANSI → HTML =====
+    function ansiToHtml(text) {
+      // Escape HTML special characters
+      text = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const colors = {
+        30:'color:#777;',31:'color:#ff6b6b;',32:'color:#9be564;',33:'color:#ffd166;',34:'color:#6ab0ff;',35:'color:#d785ff;',36:'color:#74d3ea;',37:'color:#eeeeee;',
+        90:'color:#999;',91:'color:#ff7b7b;',92:'color:#a8f07a;',93:'color:#ffe07a;',94:'color:#7abaff;',95:'color:#e19bff;',96:'color:#85e9ff;',97:'color:#ffffff;'
+      };
+      const bg = {
+        40:'background:#222;',41:'background:#5c1e1e;',42:'background:#294025;',43:'background:#4a3f1d;',
+        44:'background:#1c2e4a;',45:'background:#3a2143;',46:'background:#1f3f45;',47:'background:#444;',
+        100:'background:#333;',101:'background:#6b2a2a;',102:'background:#35552e;',103:'background:#5a4d24;',
+        104:'background:#253c66;',105:'background:#4a2d54;',106:'background:#28545b;',107:'background:#666;'
+      };
+      return text.replace(/\x1b\[(\d+(?:;\d+)*)m/g, function(m, seq) {
+        const codes = seq.split(';').map(Number);
+        if (codes.includes(0)) return '</span>';
+        let style = '';
+        codes.forEach(function(c) {
+          if (c === 1) style += 'font-weight:bold;';
+          else if (c === 3) style += 'font-style:italic;';
+          else if (c === 4) style += 'text-decoration:underline;';
+          else if (colors[c]) style += colors[c];
+          else if (bg[c]) style += bg[c];
+          else if (c === 39) style += 'color:inherit;';
+          else if (c === 49) style += 'background:transparent;';
+        });
+        return '<span style="' + style + '">';
+      });
+    }
+    // ===== Terminal live =====
+    let polling = null;
+    let didInitialScroll = false;
+    let userScrolledUp = false;
+    function prefill(cmd) {
+      const el = document.getElementById('terminal_cmd');
+      if (el) { el.value = cmd; el.focus(); }
+      const anchor = document.getElementById('terminal_card') || el;
+      if (anchor) anchor.scrollIntoView({behavior:'smooth', block:'center'});
+    }
+    async function pullLog() {
+      try {
+        const r = await fetch('/shell/log?ts=' + Date.now());
+        const txt = await r.text();
+        const out = document.getElementById('terminal_out');
+        const wrap = document.getElementById('terminal_wrap');
+        if (out && wrap) {
+          const atBottom = (wrap.scrollTop + wrap.clientHeight) >= (wrap.scrollHeight - 10);
+          out.innerHTML = ansiToHtml(txt);
+          if (!didInitialScroll) {
+            wrap.scrollTop = wrap.scrollHeight;
+            didInitialScroll = true;
+          } else if (atBottom && !userScrolledUp) {
+            wrap.scrollTop = wrap.scrollHeight;
+          }
+        }
+      } catch (e) {
+        // ignore errors
+      }
+    }
+    function startPolling() {
+      if (polling) clearInterval(polling);
+      pullLog();
+      polling = setInterval(pullLog, 900);
+    }
+    (function() {
+      const wrap = document.getElementById('terminal_wrap');
+      if (!wrap) return;
+      wrap.addEventListener('scroll', function() {
+        const nearBottom = (wrap.scrollTop + wrap.clientHeight) >= (wrap.scrollHeight - 10);
+        userScrolledUp = !nearBottom;
+      });
+    })();
+    async function runCmdFromInput() {
+      const el = document.getElementById('terminal_cmd');
+      const cmd = (el && el.value) ? el.value.trim() : '';
+      if (!cmd) return;
+      await fetch('/shell/run', {
+        method:'POST',
+        headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body: new URLSearchParams({cmd: cmd})
+      });
+      didInitialScroll = false;
+      userScrolledUp = false;
+      startPolling();
+    }
+    async function stopCmd() {
+      await fetch('/shell/stop', {method:'POST'});
+    }
+    async function clearLog() {
+      await fetch('/shell/clear', {method:'POST'});
+      const out = document.getElementById('terminal_out');
+      if (out) out.innerHTML = '';
+      didInitialScroll = false;
+      userScrolledUp = false;
+    }
+    async function rebootConfirm() {
+      if (!confirm('Reiniciar agora?')) return;
+      await fetch('/reboot', {method:'POST'});
+      alert('Reiniciando...');
+    }
+    (function() {
+      const el = document.getElementById('terminal_cmd');
+      if (!el) return;
+      el.addEventListener('keydown', function(ev) {
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          runCmdFromInput();
+        }
+      });
+    })();
+    (function() {
+      const btn = document.getElementById('terminal_run_btn');
+      if (!btn) return;
+      btn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        runCmdFromInput();
+      });
+    })();
+    startPolling();
     </script>
   </body>
 </html>
 """
 
-# ======== Rotas ========
-@app.post("/tcpdump")
-def tcpdump_route():
-    ok, msg = tcpdump_capture(WLAN_IF, seconds=5, count=120)
-    flash(("tcpdump ok" if ok else "Falha tcpdump") + " — exibindo abaixo.")
-    return redirect(url_for("index"))
-
+###############################################################################
+# Routes
+###############################################################################
 @app.route("/", methods=["GET"])
-def index():
+def index() -> Any:
     t = cpu_temp_c()
-    cpu_pct = round(cpu_usage_pct(),1)
+    cpu_pct = round(cpu_usage_pct(), 1)
     mem = mem_stats()
     disk = disk_stats("/")
-    netlist=[net_stats_for(i) for i in list_interfaces(include_virtual=True, include_lo=True)]
+    netlist = [net_stats_for(i) for i in list_interfaces(include_virtual=True, include_lo=True)]
     leases, leases_raw, leases_path = read_dnsmasq_leases()
-    dmesg_txt = get_dmesg()
-
     context = dict(
-        WLAN_IF=WLAN_IF, LAN_IF=LAN_IF, PPP_IF=PPP_IF, PPP_PEER=PPP_PEER,
-        scan=[], scan_dbg=None, wstatus=wpa_status(),
+        WLAN_IF=WLAN_IF,
+        LAN_IF=LAN_IF,
+        PPP_IF=PPP_IF,
+        PPP_PEER=PPP_PEER,
+        scan=[],
+        scan_dbg=None,
         wifi=wifi_status_details(),
-        wlan_ipv4=get_ipv4_list(WLAN_IF), ppp_ipv4=get_ipv4_list(PPP_IF),
-        def_route=default_route(), all_routes=routes(), dns=dns_info(),
-        leases=leases, leases_path=leases_path,
-        dmesg=dmesg_txt,
-        last_tcpdump=read_last_tcpdump(),
-        cpu_temp = (f"{t:.1f} °C" if t is not None else "-"),
-        cpu_pct = cpu_pct,
-        mem_used = human_bytes(mem["used"]), mem_total = human_bytes(mem["total"]), mem_pct = f"{mem['pct']:.1f}",
-        disk_total = human_bytes(disk["total"]), disk_used  = human_bytes(disk["used"]), disk_pct = f"{disk['pct']:.1f}",
-        procs = processes_top(20),
-        netlist = netlist,
+        wlan_ipv4=get_ipv4_list(WLAN_IF),
+        ppp_ipv4=get_ipv4_list(PPP_IF),
+        def_route=default_route(),
+        all_routes=routes(),
+        dns=dns_info(),
+        leases=leases,
+        leases_path=leases_path,
+        cpu_temp=(f"{t:.1f} °C" if t is not None else "-"),
+        cpu_pct=cpu_pct,
+        mem_used=human_bytes(mem["used"]),
+        mem_total=human_bytes(mem["total"]),
+        mem_pct=f"{mem['pct']:.1f}",
+        disk_total=human_bytes(disk["total"]),
+        disk_used=human_bytes(disk["used"]),
+        disk_pct=f"{disk['pct']:.1f}",
+        procs=processes_top(20),
+        netlist=netlist,
+        services=list_services(),
+        last_profile=get_last_profile(),
+        saved_networks=get_saved_networks(),
+        root_files=list_root_files(),
+        auto_dial_enabled=is_auto_dial_enabled(),
     )
     return render_template_string(TEMPLATE, **context)
+
 
 @app.post("/wifi/scan")
 def wifi_scan_route():
     nets, dbg = wifi_scan()
     t = cpu_temp_c()
-    cpu_pct = round(cpu_usage_pct(),1)
+    cpu_pct = round(cpu_usage_pct(), 1)
     mem = mem_stats()
     disk = disk_stats("/")
-    netlist=[net_stats_for(i) for i in list_interfaces(include_virtual=True, include_lo=True)]
+    netlist = [net_stats_for(i) for i in list_interfaces(include_virtual=True, include_lo=True)]
     leases, leases_raw, leases_path = read_dnsmasq_leases()
-    dmesg_txt = get_dmesg()
     context = dict(
-        WLAN_IF=WLAN_IF, LAN_IF=LAN_IF, PPP_IF=PPP_IF, PPP_PEER=PPP_PEER,
-        scan=nets, scan_dbg=dbg, wstatus=wpa_status(),
+        WLAN_IF=WLAN_IF,
+        LAN_IF=LAN_IF,
+        PPP_IF=PPP_IF,
+        PPP_PEER=PPP_PEER,
+        scan=nets,
+        scan_dbg=dbg,
         wifi=wifi_status_details(),
-        wlan_ipv4=get_ipv4_list(WLAN_IF), ppp_ipv4=get_ipv4_list(PPP_IF),
-        def_route=default_route(), all_routes=routes(), dns=dns_info(),
-        leases=leases, leases_path=leases_path,
-        dmesg=dmesg_txt,
-        last_tcpdump=read_last_tcpdump(),
-        cpu_temp = (f"{t:.1f} °C" if t is not None else "-"),
-        cpu_pct = cpu_pct,
-        mem_used = human_bytes(mem["used"]), mem_total = human_bytes(mem["total"]), mem_pct = f"{mem['pct']:.1f}",
-        disk_total = human_bytes(disk["total"]), disk_used  = human_bytes(disk["used"]), disk_pct = f"{mem['pct']:.1f}",
-        procs = processes_top(20),
-        netlist = netlist,
+        wlan_ipv4=get_ipv4_list(WLAN_IF),
+        ppp_ipv4=get_ipv4_list(PPP_IF),
+        def_route=default_route(),
+        all_routes=routes(),
+        dns=dns_info(),
+        leases=leases,
+        leases_path=leases_path,
+        cpu_temp=(f"{t:.1f} °C" if t is not None else "-"),
+        cpu_pct=cpu_pct,
+        mem_used=human_bytes(mem["used"]),
+        mem_total=human_bytes(mem["total"]),
+        mem_pct=f"{mem['pct']:.1f}",
+        disk_total=human_bytes(disk["total"]),
+        disk_used=human_bytes(disk["used"]),
+        disk_pct=f"{disk['pct']:.1f}",
+        procs=processes_top(20),
+        netlist=netlist,
+        services=list_services(),
+        last_profile=get_last_profile(),
+        auto_dial_enabled=is_auto_dial_enabled(),
+        saved_networks=get_saved_networks(),
+        root_files=list_root_files(),
     )
     return render_template_string(TEMPLATE, **context)
 
@@ -1417,7 +1903,7 @@ def wifi_scan_route():
 @app.post("/wifi/connect")
 def wifi_connect_route():
     ssid = (request.form.get("ssid") or "").strip()
-    psk  = (request.form.get("psk") or "").strip()
+    psk = (request.form.get("psk") or "").strip()
     if not ssid:
         flash("Informe um SSID.")
         return redirect(url_for("index"))
@@ -1425,27 +1911,31 @@ def wifi_connect_route():
     flash(("Conectado" if ok else "Falha") + f" ({msg})")
     return redirect(url_for("index"))
 
+
 @app.post("/wifi/disconnect")
 def wifi_disconnect_route():
     ok, msg = wifi_disconnect()
     flash(("Desconectado" if ok else "Falha") + f" ({msg})")
     return redirect(url_for("index"))
 
+
 @app.post("/setprofile")
 def setprofile():
-    profile = request.form.get("profile","").strip()
+    profile = request.form.get("profile", "").strip()
     rc, out = profile_set(profile)
-    # salva o último perfil se rodou (independente do rc)
+    # Save last profile regardless of rc
     try:
         os.makedirs("/var/lib/mirako", exist_ok=True)
-        with open("/var/lib/mirako/last_profile","w",encoding="utf-8") as f:
+        with open("/var/lib/mirako/last_profile", "w", encoding="utf-8") as f:
             f.write(profile.strip() or "ap")
-            f.flush(); os.fsync(f.fileno())
+            f.flush()
+            os.fsync(f.fileno())
             os.sync()
-    except Exception as e:
+    except Exception:
         pass
-    flash(out if out else ("ok" if rc==0 else "erro"))
+    flash(out if out else ("ok" if rc == 0 else "erro"))
     return redirect(url_for("index"))
+
 
 @app.post("/modem/connect")
 def modem_connect_route():
@@ -1453,77 +1943,109 @@ def modem_connect_route():
     flash(("pon enviado" if ok else "Falha") + f" ({msg})")
     return redirect(url_for("index"))
 
+
 @app.post("/modem/disconnect")
 def modem_disconnect_route():
     ok, msg = modem_disconnect()
     flash(("poff enviado" if ok else "Falha") + f" ({msg})")
     return redirect(url_for("index"))
-    
-# -------- Lista de interfaces dinâmicas --------
-def list_interfaces(include_virtual=True, include_lo=True):
+
+@app.post("/modem/auto_dial")
+def modem_auto_dial_route():
+    """Toggle automatic PPP dialing.
+
+    If the form field 'auto_dial' equals '1', enable auto dial; otherwise disable.
+    The setting is persisted in AUTO_DIAL_FILE, read by mirako-ppp-keepalive.sh.
     """
-    Retorna a lista de interfaces reais do sistema.
-    - include_virtual=False oculta coisas como veth/docker/virbr/bridge.
-    - include_lo=False oculta a loopback.
-    Mantém tun/tap/ppp e enx/end/wlan, que costumam ser úteis.
-    """
+    val = (request.form.get("auto_dial") or "").strip()
+    enabled = val == "1"
+    set_auto_dial(enabled)
+    flash("Discagem automática " + ("habilitada" if enabled else "desabilitada"))
+    return redirect(url_for("index"))
+
+# File upload route for the root directory file manager
+@app.post("/file/upload")
+def file_upload_route():
+    """Handle file uploads to the /root directory."""
+    uploaded = request.files.get("file")
+    if uploaded and uploaded.filename:
+        filename = os.path.basename(uploaded.filename)
+        save_path = os.path.join("/root", filename)
+        try:
+            uploaded.save(save_path)
+            flash(f"Arquivo '{filename}' enviado para /root")
+        except Exception as e:
+            flash(f"Erro ao salvar arquivo: {e}")
+    else:
+        flash("Nenhum arquivo selecionado.")
+    return redirect(url_for("index"))
+
+
+@app.post("/svc_action")
+def svc_action_route():
+    svc = (request.form.get("svc") or "").strip()
+    action = (request.form.get("action") or "").strip()
+    if not svc or not action:
+        flash("Ação ou serviço inválido.")
+        return redirect(url_for("index"))
+    ok, msg = service_action(svc, action)
+    flash(("Sucesso" if ok else "Falha") + f" ({msg})")
+    return redirect(url_for("index"))
+
+
+# ---------------------------------------------------------------------------
+# Shell & Terminal routes
+# These endpoints allow the front‑end to start/stop commands, fetch log
+# output and clear logs.  They return JSON for ease of use with fetch().
+
+@app.post("/shell/run")
+def shell_run_route():
+    cmd = (
+        request.form.get("cmd")
+        or (request.json.get("cmd") if request.is_json else "")
+        or ""
+    ).strip()
+    if not cmd:
+        return {"ok": False, "err": "comando vazio"}, 400
+    start_command(cmd)
+    return {"ok": True}
+
+
+@app.get("/shell/log")
+def shell_log_route():
+    data = read_log_tail()
+    return app.response_class(data, mimetype="text/plain; charset=utf-8")
+
+
+@app.post("/shell/stop")
+def shell_stop_route():
+    stop_command()
+    return {"ok": True}
+
+
+@app.post("/shell/clear")
+def shell_clear_route():
+    clear_log()
+    return {"ok": True}
+
+
+@app.post("/reboot")
+def shell_reboot_route():
+    # Attempt to reboot the machine.  Try shutdown first, fall back to reboot.
     try:
-        names = sorted(os.listdir("/sys/class/net"))
+        subprocess.Popen(["/sbin/shutdown", "-r", "now"])
     except Exception:
-        names = []
-    skip_prefix = ("veth", "br-", "docker", "virbr", "vmnet", "vnet", "zt")
-    out = []
-    for n in names:
-        if not include_lo and n == "lo":
-            continue
-        if not include_virtual and n.startswith(skip_prefix):
-            continue
-        out.append(n)
-    return out
-    
-def parse_dhclient_lease(iface):
-    path = f"/var/lib/dhcp/dhclient.{iface}.leases"
-    routers, dns = [], []
-    try:
-        import re
-        if os.path.exists(path):
-            txt = open(path, "r", encoding="utf-8", errors="ignore").read()
-            # pega a ÚLTIMA ocorrência
-            m_dns = re.findall(r'option\s+domain-name-servers\s+([^;]+);', txt)
-            m_rtr = re.findall(r'option\s+routers\s+([^;]+);', txt)
-            if m_dns:
-                # separa por vírgula/espaço
-                dns = [i.strip() for i in re.split(r'[,\s]+', m_dns[-1].strip()) if i.strip()]
-            if m_rtr:
-                routers = [i.strip() for i in re.split(r'[,\s]+', m_rtr[-1].strip()) if i.strip()]
-    except Exception:
-        pass
-    return routers, dns
-
-def apply_dns(nameservers):
-    try:
-        # se for symlink do NetworkManager, substitui por arquivo real
-        if os.path.islink("/etc/resolv.conf"):
-            os.unlink("/etc/resolv.conf")
-        with open("/etc/resolv.conf","w",encoding="utf-8") as f:
-            f.write("# Generated by Mirako client-wifi\n")
-            for ns in nameservers:
-                if ns:
-                    f.write(f"nameserver {ns}\n")
-        return True, "resolv.conf atualizado"
-    except Exception as e:
-        return False, f"erro ao escrever resolv.conf: {e}"
-
-def ensure_default_via(gw, dev):
-    # força a rota default a ter 'via <gw>'
-    if gw:
-        run([IP_BIN,"route","replace","default","via",gw,"dev",dev])
-    
-    
+        try:
+            subprocess.Popen(["/sbin/reboot"])
+        except Exception as e:
+            return {"ok": False, "err": str(e)}, 500
+    return {"ok": True}
 
 
+###############################################################################
+# Application entrypoint
+###############################################################################
 if __name__ == "__main__":
-    # Rodando como root: sem sudo/sudoers e sem capabilities extras
     app.run(host="0.0.0.0", port=80)
 EOF
 
@@ -1531,18 +2053,6 @@ sudo systemctl restart mirako-web
 
 
 
-
-
-
-sudo tee /etc/wpa_supplicant/wpa_supplicant-wlan0.conf >/dev/null <<'EOF'
-ctrl_interface=/var/run/wpa_supplicant
-update_config=1
-country=BR
-ap_scan=1
-# redes serão adicionadas pela sua UI via wpa_cli (save_config grava aqui)
-EOF
-
-sudo systemctl enable --now wpa_supplicant@wlan0.service
 
 
 
@@ -1580,10 +2090,11 @@ sudo systemctl restart mirako-web
 
 
 
-
 sudo tee /usr/local/bin/mirako-autoboot.sh >/dev/null <<'EOF'
 #!/usr/bin/env bash
-set -Eeuo pipefail
+# mirako-autoboot.sh — aplica o último perfil salvo sem reiniciar em loop
+# e sem falhar por pequenos erros. Mantém AP estável no boot.
+set -uo pipefail
 
 PROFILE_FILE=/var/lib/mirako/last_profile
 DEF=ap
@@ -1595,56 +2106,106 @@ export PPP_IF="${PPP_IF:-ppp0}"
 export PPP_PEER="${PPP_PEER:-3g}"
 export PROFILES_SCRIPT="${PROFILES_SCRIPT:-/usr/local/bin/profiles.sh}"
 
+log(){ echo "[autoboot] $*"; }
+
 lan_has_link(){
-  [ -r "/sys/class/net/$LAN_IF/carrier" ] && [ "$(cat /sys/class/net/$LAN_IF/carrier 2>/dev/null)" = "1" ]
+  [ -r "/sys/class/net/$LAN_IF/carrier" ] && [ "$(cat "/sys/class/net/$LAN_IF/carrier" 2>/dev/null)" = "1" ]
 }
 
-wifi_connected_quick(){
-  command -v wpa_cli >/dev/null 2>&1 || return 1
-  for i in {1..12}; do
-    st="$(wpa_cli -i "$WLAN_IF" status 2>/dev/null | sed -n 's/^wpa_state=//p')"
-    [ "$st" = "COMPLETED" ] && return 0
-    sleep 1
+ensure_wpa_running(){
+  systemctl start "wpa_supplicant@${WLAN_IF}.service" >/dev/null 2>&1 || true
+}
+
+wifi_state(){
+  command -v wpa_cli >/dev/null 2>&1 || { echo "DOWN"; return; }
+  wpa_cli -i "$WLAN_IF" status 2>/dev/null | sed -n 's/^wpa_state=//p'
+}
+
+wlan_has_ipv4(){
+  ip -4 addr show dev "$WLAN_IF" | grep -q 'inet '
+}
+
+try_dhcp_wlan(){
+  command -v dhclient >/dev/null 2>&1 || return 0
+  dhclient -r "$WLAN_IF" >/dev/null 2>&1 || true
+  dhclient "$WLAN_IF"  >/dev/null 2>&1 || true
+}
+
+wait_wifi_connected(){
+  local timeout="${1:-75}"
+  local end=$((SECONDS+timeout))
+  local associated=0
+  while [ $SECONDS -lt $end ]; do
+    st="$(wifi_state)"
+    if [ "$st" = "COMPLETED" ]; then
+      associated=1
+      wlan_has_ipv4 && return 0
+      try_dhcp_wlan
+      sleep 2
+      wlan_has_ipv4 && return 0
+    else
+      sleep 1
+    fi
   done
-  return 1
+  [ "$associated" = "1" ]
 }
 
-ppp_connectivity(){
-  ip -4 addr show dev "$PPP_IF" | grep -q 'inet ' || return 1
-  ping -I "$PPP_IF" -c2 -W3 8.8.8.8 >/dev/null 2>&1
+ppp_has_ipv4(){ ip -4 addr show dev "$PPP_IF" 2>/dev/null | grep -q 'inet '; }
+
+ppp_ok(){
+  ppp_has_ipv4 && ping -I "$PPP_IF" -c2 -W3 8.8.8.8 >/dev/null 2>&1
 }
 
 case "$want" in
   ap)
-    exec "$PROFILES_SCRIPT" ap
+    log "Aplicando perfil AP"
+    "$PROFILES_SCRIPT" ap || true
+    exit 0
     ;;
+
   3g|ppp|ppp3g)
-    # Tenta configurar 3G (profiles.sh já disca). Se falhar, cai para AP.
-    if /usr/local/bin/profiles.sh 3g; then
-      exit 0
-    else
-      /usr/local/bin/profiles.sh ap
-      exit 0
-    fi
+    log "Aplicando perfil 3G/PPP (AP fica ativo mesmo sem IPv4 ainda)"
+    "$PROFILES_SCRIPT" 3g || true
+    # Não falhar aqui; keepalive cuidará de rediscagem
+    exit 0
     ;;
+
   client-lan|lan-client)
     if lan_has_link; then
-      exec "$PROFILES_SCRIPT" client-lan
+      log "Aplicando cliente LAN"
+      "$PROFILES_SCRIPT" client-lan || true
     else
-      exec "$PROFILES_SCRIPT" ap
+      log "Sem link em LAN — fallback AP"
+      "$PROFILES_SCRIPT" ap || true
     fi
+    exit 0
     ;;
+
   client-wifi|wifi-client|sta)
-    if wifi_connected_quick; then
-      exec "$PROFILES_SCRIPT" client-wifi
-    else
-      exec "$PROFILES_SCRIPT" ap
-    fi
+    log "Aplicando cliente Wi-Fi com até 10 tentativas; fallback AP"
+    ensure_wpa_running
+    attempts=0
+    while [ $attempts -lt 10 ]; do
+      "$PROFILES_SCRIPT" client-wifi || true
+      if wait_wifi_connected 30; then
+        log "Wi-Fi conectado/associado. Mantendo client-wifi."
+        exit 0
+      fi
+      attempts=$((attempts+1))
+      log "Tentativa Wi-Fi ${attempts}/10 falhou; tentando novamente…"
+    done
+    log "Sem sucesso no Wi-Fi — fallback AP"
+    "$PROFILES_SCRIPT" ap || true
+    exit 0
     ;;
+
   *)
-    exec "$PROFILES_SCRIPT" ap
+    log "Perfil desconhecido '$want' — usando AP"
+    "$PROFILES_SCRIPT" ap || true
+    exit 0
     ;;
 esac
+
 EOF
 
 sudo chmod +x /usr/local/bin/mirako-autoboot.sh
@@ -1656,14 +2217,8 @@ sudo chmod +x /usr/local/bin/mirako-autoboot.sh
 sudo tee /etc/systemd/system/mirako-profile.service >/dev/null <<'UNIT'
 [Unit]
 Description=Aplicar perfil Mirako na inicialização (auto-seletor)
-After=local-fs.target systemd-udev-settle.service
-After=sys-subsystem-net-devices-wlan0.device
-Wants=sys-subsystem-net-devices-wlan0.device
-# hostapd/dnsmasq não devem competir
-Conflicts=hostapd.service dnsmasq.service
-# >>> mantenha wpa_supplicant/NM atrás e em conflito <<<
-Before=network.target wpa_supplicant@wlan0.service NetworkManager.service
-Conflicts=wpa_supplicant@wlan0.service NetworkManager.service
+After=local-fs.target systemd-udev-settle.service network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
@@ -1675,39 +2230,214 @@ Environment=PPP_IF=ppp0
 Environment=PPP_PEER=3g
 Environment=PROFILES_SCRIPT=/usr/local/bin/profiles.sh
 ExecStartPre=/bin/udevadm settle -t 20
-ExecStart=/bin/bash -lc '/usr/local/bin/mirako-autoboot.sh'
-Restart=on-failure
-RestartSec=7s
-TimeoutStartSec=120
-StandardOutput=journal
-StandardError=journal
-StartLimitIntervalSec=0
+ExecStart=/usr/local/bin/mirako-autoboot.sh
+
+[Install]
+WantedBy=multi-user.target
+
+
+UNIT
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now mirako-profile.service
+sudo systemctl restart mirako-profile.service
+
+
+
+
+
+
+
+
+
+
+
+
+sudo tee /usr/local/bin/mirako-ppp-keepalive.sh >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# PPP keep‑alive daemon.
+# Monitors PPP interface connectivity and re-applies the 3G profile if the
+# connection drops. This script is intended to run continuously under
+# mirako-ppp-keepalive.service.
+
+PROFILE_FILE=/var/lib/mirako/last_profile
+PROFILES_SCRIPT=${PROFILES_SCRIPT:-/usr/local/bin/profiles.sh}
+PPP_IF=${PPP_IF:-ppp0}
+CHECK_IP=${PPP_CONNECT_CHECK_HOST:-8.8.8.8}
+# Toggle auto dial via file. If the file exists, auto dial is enabled.
+AUTO_DIAL_FILE=${AUTO_DIAL_FILE:-/var/lib/mirako/auto_dial_enabled}
+
+log(){ echo "[ppp-keepalive] $*"; logger -t mirako-ppp-keepalive "$*"; }
+
+# AP está ativo?
+ap_is_up(){ iw dev "$WLAN_IF" info 2>/dev/null | grep -q "type AP"; }
+
+# Rediscagem "suave" do PPP (sem mexer no AP)
+redial_ppp(){
+  pkill -x pppd 2>/dev/null || true
+  rm -f /var/lock/LCK..ttyUSB* 2>/dev/null || true
+  (pppd call "$PPP_PEER" >/dev/null 2>&1 &) || true
+}
+
+
+
+# Determine if PPP interface has an IPv4 address.
+ppp_has_ipv4(){ ip -4 addr show dev "$PPP_IF" 2>/dev/null | grep -q 'inet '; }
+
+# Determine if PPP connectivity is OK by pinging a known IP.
+ppp_ok(){ ppp_has_ipv4 && ping -I "$PPP_IF" -c2 -W3 "$CHECK_IP" >/dev/null 2>&1; }
+
+# Ensure 3G profile is applied via profiles.sh (activates NAT & AP).
+ensure_3g(){
+  # Só reaplica o perfil 3G se o AP não estiver de pé.
+  if ! ap_is_up; then
+    "$PROFILES_SCRIPT" 3g || true
+  fi
+}
+
+
+while :; do
+  # Skip auto dial unless explicitly enabled
+  if [ ! -f "$AUTO_DIAL_FILE" ]; then
+    sleep 30
+    continue
+  fi
+  WANT="$(cat "$PROFILE_FILE" 2>/dev/null || echo '')"
+  if [[ "$WANT" != "3g" && "$WANT" != "ppp" && "$WANT" != "ppp3g" ]]; then
+    log "last_profile='$WANT' não é 3G. Aguardando 15s…"
+    sleep 15
+    continue
+  fi
+
+  # Guarantee 3G profile is active.
+  # Garanta que o AP 3G está ativo (sem flapar se já estiver)
+  ensure_3g
+
+  # Se PPP ok, apenas monitore
+  if ppp_ok; then
+    log "PPP ok (conectividade via $PPP_IF). Monitorando…"
+    for j in {1..60}; do
+      if ! ppp_ok; then
+        log "Conectividade PPP perdida — tentando rediscagem…"
+        break
+      fi
+      sleep 5
+    done
+  else
+    # PPP não está OK. Se discagem automática estiver habilitada, rediscamos.
+    if [ -f "$AUTO_DIAL_FILE" ]; then
+      log "PPP sem conectividade; iniciando rediscagem (sem reiniciar AP)…"
+      redial_ppp
+      # janela curta para o PPP nascer
+      for i in {1..20}; do
+        if ppp_has_ipv4; then break; fi
+        sleep 1
+      done
+    else
+      log "PPP sem conectividade e discagem automática desabilitada; mantendo AP."
+    fi
+  fi
+
+  sleep 3
+
+  # Wait briefly for PPP to obtain IPv4.
+  for i in {1..20}; do
+    if ppp_has_ipv4; then break; fi
+    sleep 1
+  done
+
+  if ppp_ok; then
+    log "PPP ok (conectividade via $PPP_IF). Monitorando…"
+    # Monitor in 5s intervals, break if connectivity lost.
+    for j in {1..60}; do
+      if ! ppp_ok; then
+        log "Conectividade perdida — tentando reerguer perfil 3G…"
+        break
+      fi
+      sleep 5
+    done
+  else
+    log "PPP sem conectividade; reerguendo perfil 3G…"
+  fi
+
+  # Small delay before next cycle.
+  sleep 3
+done
+EOF
+sudo chmod +x /usr/local/bin/mirako-ppp-keepalive.sh
+
+
+
+
+
+
+
+sudo tee /etc/systemd/system/mirako-ppp-keepalive.service >/dev/null <<'UNIT'
+[Unit]
+Description=Mirako PPP keep-alive (auto-redial 3G + AP)
+After=network-online.target mirako-profile.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=WLAN_IF=wlan0
+Environment=LAN_IF=end0
+Environment=PPP_IF=ppp0
+Environment=PPP_PEER=3g
+Environment=PROFILES_SCRIPT=/usr/local/bin/profiles.sh
+ExecStart=/usr/local/bin/mirako-ppp-keepalive.sh
+Restart=always
+RestartSec=5s
+# Provide a safe PATH for scripts
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now mirako-profile.service
+sudo systemctl enable --now mirako-ppp-keepalive.service
 
 
 
 
 
-# ip-down: voltou a cair? vai pro AP
+
+
+
+
 sudo tee /etc/ppp/ip-down.d/99-mirako >/dev/null <<'EOF'
 #!/bin/sh
+# PPP ip-down hook for Mirako. Handles fallback when PPP drops.
+# If the last profile was 3G, do not force AP: allow pppd to redial.
+LP="/var/lib/mirako/last_profile"
+if [ -r "$LP" ]; then
+  LAST="$(cat "$LP" 2>/dev/null)"
+else
+  LAST=""
+fi
+
+if [ "$LAST" = "3g" ] || [ "$LAST" = "ppp" ] || [ "$LAST" = "ppp3g" ]; then
+  logger -t mirako "PPP caiu; mantendo perfil 3G para rediscagem automática (persist)."
+  exit 0
+fi
+
+# For other profiles, fallback to AP.
 logger -t mirako "PPP caiu; comutando para perfil AP (fallback)"
 exec /usr/local/bin/profiles.sh ap
 EOF
 sudo chmod +x /etc/ppp/ip-down.d/99-mirako
 
 
+
+
 sudo tee /etc/ppp/ip-up.d/00-mirako-dns >/dev/null <<'SH'
 #!/bin/sh
-# Usa os DNS aprendidos pelo pppd (usepeerdns)
+# PPP ip-up hook for Mirako. Applies DNS settings learned via pppd (usepeerdns).
 if [ -r /etc/ppp/resolv.conf ]; then
-  # se for symlink, substitui por arquivo real
+  # If /etc/resolv.conf is a symlink, replace it with a regular file.
   [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
   cp -f /etc/ppp/resolv.conf /etc/resolv.conf
 fi
@@ -1737,8 +2467,8 @@ sudo sysctl --system
 
 
 sudo journalctl -u mirako-web -f
-
-
+sudo journalctl -u mirako-profile.service -f
+sudo journalctl -f
 
 
 
