@@ -37,7 +37,7 @@ figlet "SantoCyber"
 
 
 sudo apt update
-sudo apt install -y hostapd dnsmasq ppp usb-modeswitch wpasupplicant iptables-persistent python3-flask python3-systemd traceroute tcpdump isc-dhcp-client iptables pppoeconf rfkill nftables python3-pip
+sudo apt install -y hostapd dnsmasq ppp usb-modeswitch wpasupplicant iptables-persistent python3-flask python3-systemd traceroute tcpdump isc-dhcp-client iptables pppoeconf rfkill nftables
 
 
 
@@ -1894,7 +1894,6 @@ TEMPLATE = """
           <span>Terminal ao vivo</span>
           <div class="btn-group">
             <button type="button" class="btn small outline" onclick="prefill('dmesg -wT')">dmesg</button>
-            <button type="button" class="btn small outline" onclick="prefill('journalctl -f')">journalctl</button>
             <button type="button" class="btn small outline" onclick="prefill('top -b')">top</button>
             <button type="button" class="btn small outline" onclick="prefill('tcpdump -i {{WLAN_IF}} -n -vv -s 120')">tcpdump</button>
             <button type="button" class="btn small warn" onclick="stopCmd()">Ctrl+C</button>
