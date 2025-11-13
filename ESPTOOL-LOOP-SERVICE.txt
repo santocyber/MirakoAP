@@ -219,25 +219,26 @@ log "=== Serviço ESP32 Auto Flasher iniciado ==="
 
 while true; do
   # Qualquer ttyUSB/ttyACM?
-  if ls /dev/ttyUSB* /dev/ttyACM* >/dev/null 2>&1; then
-    log "Dispositivo serial detectado."
+trap 'log "SIGTERM recebido; limpando lock e saindo"; rm -f "$LOCK_FILE"; exit 0' SIGTERM SIGINT
 
-    if [ -f "$LOCK_FILE" ] && kill -0 "$(cat "$LOCK_FILE")" 2>/dev/null; then
-      log "Flash já em andamento (PID $(cat "$LOCK_FILE")). Aguardando..."
-    else
-      ( echo $$ > "$LOCK_FILE"
-        log "Executando flash automático..."
-        if bash "$FLASH_SCRIPT" >> "$LOG_FILE" 2>&1; then
-          log "Flash automático finalizado."
-        else
-          log "Flash automático terminou com erro. Consulte os logs."
-        fi
-        rm -f "$LOCK_FILE"
-      ) &
-    fi
+if ls /dev/ttyUSB* /dev/ttyACM* >/dev/null 2>&1; then
+  log "Dispositivo serial detectado."
+  if [ -f "$LOCK_FILE" ] && kill -0 "$(cat "$LOCK_FILE")" 2>/dev/null; then
+    log "Flash já em andamento (PID $(cat "$LOCK_FILE")). Aguardando..."
   else
-    log "Nenhuma porta serial encontrada."
+    echo $$ > "$LOCK_FILE"
+    log "Executando flash automático..."
+    if bash "$FLASH_SCRIPT" >> "$LOG_FILE" 2>&1; then
+      log "Flash automático finalizado."
+    else
+      log "Flash automático terminou com erro. Consulte os logs."
+    fi
+    rm -f "$LOCK_FILE"
   fi
+else
+  log "Nenhuma porta serial encontrada."
+fi
+
 
   sleep "$CHECK_INTERVAL"
 done
@@ -256,10 +257,13 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/esp32-auto-flasher.sh
-Restart=always
+Restart=on-failure
 RestartSec=10
+KillMode=control-group
+TimeoutStopSec=15
+ExecStop=/bin/kill -s TERM $MAINPID
 User=root
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 StandardOutput=append:/var/log/esp32_auto_flasher.log
 StandardError=append:/var/log/esp32_auto_flasher.log
 
@@ -267,8 +271,11 @@ StandardError=append:/var/log/esp32_auto_flasher.log
 WantedBy=multi-user.target
 EOF
 
+
 sudo systemctl daemon-reload
-sudo systemctl enable --now esp32-auto-flasher.service
+sudo systemctl restart esp32-auto-flasher.service
+sudo systemctl status esp32-auto-flasher.service --no-pager
+
 
 
 
