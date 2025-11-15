@@ -1,0 +1,1580 @@
+tee /usr/local/bin/netstatus.py >/dev/null <<'PY'
+#!/usr/bin/env python3
+import json, os, re, socket, subprocess, time, math, shutil, urllib.parse
+import glob 
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HOST   = os.environ.get("NETSTATUS_HOST", "0.0.0.0")
+PORT   = int(os.environ.get("NETSTATUS_PORT", "80"))
+WIFIIF = os.environ.get("NETSTATUS_WIFI_IF", "wlan0")
+
+# ------------------ helpers ------------------
+def sh(cmd, timeout=2.5):
+    try:
+        out = subprocess.run(cmd, shell=True, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=timeout, check=False)
+        return out.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return ""
+
+def read_first(path):
+    try:
+        with open(path, "r") as f:
+            return f.read()
+    except:
+        return ""
+
+def _meminfo():
+    kv = {}
+    for line in (read_first("/proc/meminfo") or "").splitlines():
+        if ":" in line:
+            k,v = line.split(":",1)
+            nums = re.findall(r"\d+", v)
+            kv[k.strip()] = int(nums[0]) if nums else 0
+    return kv  # KiB
+
+def _cpu_sample():
+    l = (read_first("/proc/stat") or "").splitlines()
+    if not l: return None
+    parts = l[0].split()
+    if parts[0] != "cpu": return None
+    nums = list(map(int, parts[1:8]))
+    return nums
+
+def cpu_usage_pct(sample_ms=150):
+    a = _cpu_sample()
+    if not a: return None
+    time.sleep(sample_ms/1000.0)
+    b = _cpu_sample()
+    if not b: return None
+    idle_a = a[3] + (a[4] if len(a)>4 else 0)
+    idle_b = b[3] + (b[4] if len(b)>4 else 0)
+    tot_a  = sum(a); tot_b = sum(b)
+    dt, didle = (tot_b - tot_a), (idle_b - idle_a)
+    if dt <= 0: return None
+    pct = 100.0 * (dt - didle) / dt
+    return round(pct, 1)
+
+def cpu_freq_mhz():
+    v = read_first("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
+    if v.strip().isdigit():
+        return round(int(v)/1000.0, 1)
+    for line in (read_first("/proc/cpuinfo") or "").splitlines():
+        if "cpu MHz" in line:
+            try: return round(float(line.split(":")[1]), 1)
+            except: pass
+    return None
+
+def cpu_cores():
+    try: return os.cpu_count()
+    except: return None
+
+def cpu_model():
+    for line in (read_first("/proc/cpuinfo") or "").splitlines():
+        if "model name" in line or "Hardware" in line:
+            return line.split(":",1)[1].strip()
+    return None
+
+def soc_temp_c():
+    base = "/sys/class/thermal"
+    best = None
+    if os.path.isdir(base):
+        for z in os.listdir(base):
+            if not z.startswith("thermal_zone"): continue
+            tpath = os.path.join(base, z, "type")
+            vpath = os.path.join(base, z, "temp")
+            typ = (read_first(tpath) or "").strip().lower()
+            val = read_first(vpath).strip()
+            if not val or not val.isdigit(): continue
+            c = int(val)
+            c = (c/1000.0) if c>300 else float(c)
+            rank = 0
+            if "cpu" in typ: rank = 3
+            elif "soc" in typ or "ap" in typ: rank = 2
+            elif "board" in typ: rank = 1
+            candidate = (rank, c)
+            if (best is None) or (candidate > best):
+                best = candidate
+    return round(best[1],1) if best else None
+
+def disk_root_usage():
+    st = os.statvfs("/")
+    total = st.f_frsize * st.f_blocks
+    free  = st.f_frsize * st.f_bfree
+    used  = total - free
+    def fmt(b):
+        gb = b/1024/1024/1024
+        if gb >= 1: return round(gb,2), "GB"
+        mb = b/1024/1024
+        return round(mb,1), "MB"
+    tot_val, tot_unit = fmt(total)
+    used_val, used_unit = fmt(used)
+    pct = round(100.0*used/total,1) if total>0 else None
+    return {"total": total, "used": used, "free": free, "pct": pct,
+            "total_h": f"{tot_val} {tot_unit}",
+            "used_h": f"{used_val} {used_unit}",
+            "free_h": f"{fmt(free)[0]} {fmt(free)[1]}"}
+
+def uptime_info():
+    up = (read_first("/proc/uptime") or "").split()
+    secs = int(float(up[0])) if up else 0
+    load = (read_first("/proc/loadavg") or "").split()[:3]
+    mem  = _meminfo()  # KiB
+    mem_total_mb = mem.get("MemTotal",0)//1024
+    mem_avail_mb = mem.get("MemAvailable",0)//1024
+    swap_total_mb = mem.get("SwapTotal",0)//1024
+    swap_free_mb  = mem.get("SwapFree",0)//1024
+    mem_used_mb = max(mem_total_mb - mem_avail_mb, 0)
+    mem_pct = round(100.0*mem_used_mb/max(mem_total_mb,1),1) if mem_total_mb>0 else None
+    swap_used_mb = max(swap_total_mb - swap_free_mb, 0)
+    swap_pct = round(100.0*swap_used_mb/max(swap_total_mb,1),1) if swap_total_mb>0 else 0.0
+    return {
+        "hostname": socket.gethostname(),
+        "uptime_s": secs,
+        "loadavg": [float(x) for x in load] if load else [],
+        "mem_total_mb": mem_total_mb,
+        "mem_avail_mb": mem_avail_mb,
+        "mem_used_mb": mem_used_mb,
+        "mem_pct": mem_pct,
+        "swap_total_mb": swap_total_mb,
+        "swap_free_mb": swap_free_mb,
+        "swap_used_mb": swap_used_mb,
+        "swap_pct": swap_pct,
+        "cpu_pct": cpu_usage_pct() or None,
+        "cpu_freq_mhz": cpu_freq_mhz(),
+        "cpu_cores": cpu_cores(),
+        "cpu_model": cpu_model(),
+        "temp_c": soc_temp_c(),
+        "disk_root": disk_root_usage(),
+        "time": int(time.time())
+    }
+
+def default_route():
+    j = sh("ip -j route show default")
+    try:
+        arr = json.loads(j) if j else []
+        if arr:
+            r = arr[0]
+            return {"dev": r.get("dev"), "via": r.get("gateway"),
+                    "src": r.get("prefsrc"), "metric": r.get("metric")}
+    except Exception:
+        pass
+    t = sh("ip route | awk '/default/ {print $0; exit}'")
+    m = re.search(r"default via ([0-9a-fA-F\.:]+)\s+dev\s+(\S+)", t or "")
+    return {"dev": (m.group(2) if m else None), "via": (m.group(1) if m else None)}
+
+def ip_addrs():
+    res = {}
+    j = sh("ip -j addr")
+    try:
+        arr = json.loads(j) if j else []
+        for iface in arr:
+            name = iface.get("ifname")
+            addrs = []
+            for a in iface.get("addr_info", []):
+                addrs.append({"family": a.get("family"),
+                              "local": a.get("local"),
+                              "prefixlen": a.get("prefixlen")})
+            res[name] = {
+                "up": "UP" in (iface.get("flags") or []),
+                "mac": iface.get("address"),
+                "addrs": addrs
+            }
+    except Exception:
+        pass
+    return res
+
+def dns_servers():
+    lines = [l.strip() for l in (read_first("/etc/resolv.conf") or "").splitlines()]
+    ns = [l.split()[1] for l in lines if l.startswith("nameserver")]
+    return ns
+
+# ------------------ Wi-Fi ------------------
+def wifi_info():
+    info = {"if": WIFIIF, "mode": None, "channel": None, "freq_mhz": None, "txpower_dbm": None, "country": None, "ssid": None}
+    t = sh(f"iw dev {WIFIIF} info")
+    if t:
+        mtype = re.search(r"type\s+(\S+)", t)
+        ch    = re.search(r"channel\s+(\d+)", t)
+        fq    = re.search(r"channel\s+\d+\s+\(\s*(\d+)\s+MHz", t)
+        txp   = re.search(r"txpower\s+([\d\.]+)\s*dBm", t)
+        ssid  = re.search(r"ssid\s+(.+)", t)
+        info["mode"]     = mtype.group(1) if mtype else None
+        info["channel"]  = int(ch.group(1)) if ch else None
+        info["freq_mhz"] = int(fq.group(1)) if fq else None
+        info["txpower_dbm"] = float(txp.group(1)) if txp else None
+        info["ssid"] = (ssid.group(1).strip() if ssid else None)
+    reg = sh("iw reg get")
+    mcc = re.search(r"country\s+([A-Z]{2})", reg or "")
+    if mcc: info["country"] = mcc.group(1)
+    return info
+
+def wifi_stations():
+    t = sh(f"iw dev {WIFIIF} station dump", timeout=3.0)
+    stations, cur = [], None
+    for line in t.splitlines():
+        m = re.match(r"Station\s+([0-9a-f:]{17})", line.strip())
+        if m:
+            if cur: stations.append(cur)
+            cur = {"mac": m.group(1), "rssi": None, "tx_bitrate": None, "rx_bitrate": None,
+                   "inactive_ms": None, "connected_ms": None, "tx_failed": None, "tx_bytes": None, "rx_bytes": None}
+        if not cur: continue
+        r = re.search(r"signal:\s*(-?\d+)\s*dBm", line);            cur["rssi"] = int(r.group(1)) if r else cur["rssi"]
+        tb= re.search(r"tx bitrate:\s*([0-9\.]+\s*\S+(?:\s+\S+)*)", line); cur["tx_bitrate"] = tb.group(1) if tb else cur["tx_bitrate"]
+        rb= re.search(r"rx bitrate:\s*([0-9\.]+\s*\S+(?:\s+\S+)*)", line); cur["rx_bitrate"] = rb.group(1) if rb else cur["rx_bitrate"]
+        im= re.search(r"inactive time:\s*(\d+)\s*ms", line);        cur["inactive_ms"] = int(im.group(1)) if im else cur["inactive_ms"]
+        cm= re.search(r"connected time:\s*(\d+)\s*s", line);        cur["connected_ms"] = int(cm.group(1))*1000 if cm else cur["connected_ms"]
+        tf= re.search(r"tx failed:\s*(\d+)", line);                 cur["tx_failed"] = int(tf.group(1)) if tf else cur["tx_failed"]
+        tx= re.search(r"tx bytes:\s*(\d+)", line);                  cur["tx_bytes"] = int(tx.group(1)) if tx else cur["tx_bytes"]
+        rx= re.search(r"rx bytes:\s*(\d+)", line);                  cur["rx_bytes"] = int(rx.group(1)) if rx else cur["rx_bytes"]
+    if cur: stations.append(cur)
+    return stations
+
+
+
+def _create_ap_leasefiles():
+    """
+    Descobre arquivos de leases usados pelo dnsmasq do create_ap
+    lendo a linha de comando do processo (-l/--dhcp-leasefile) e
+    também via globs em /tmp.
+    """
+    files = []
+
+    # 1) Tenta ler do processo dnsmasq do create_ap
+    procs = sh("ps -o args= -C dnsmasq | grep create_ap || true")
+    for line in (procs or "").splitlines():
+        m = re.search(r"(?:--dhcp-leasefile=|-l\s+)(\S+)", line)
+        if m:
+            p = m.group(1)
+            if os.path.isfile(p) and p not in files:
+                files.append(p)
+
+    # 2) Globs mais abrangentes (pastas temporárias do create_ap)
+    #    Exemplos:
+    #    /tmp/create_ap.wlan0.conf.XXXX/dnsmasq.leases
+    #    /tmp/create_ap.*/*.leases
+    patterns = [
+        f"/tmp/create_ap.{WIFIIF}.leases",
+        "/tmp/create_ap.*.leases",
+        "/tmp/create_ap*/dnsmasq.leases",
+        "/tmp/create_ap*/*.leases",
+    ]
+    for pat in patterns:
+        for p in glob.glob(pat):
+            if os.path.isfile(p) and p not in files:
+                files.append(p)
+
+    return files
+
+def dhcp_leases():
+    """
+    Agrega leases do dnsmasq de locais típicos, incluindo os do create_ap.
+    Formato dnsmasq: <expira_ts> <mac> <ip> <host> <client-id>
+    """
+    files = _create_ap_leasefiles()
+    # dnsmasq “padrão”
+    fallback = [
+        "/run/dnsmasq/dnsmasq.leases",
+        "/var/lib/misc/dnsmasq.leases",
+        "/var/lib/NetworkManager/dnsmasq.leases",
+    ]
+    for p in fallback:
+        if os.path.isfile(p) and p not in files:
+            files.append(p)
+
+    rows = {}  # dedup por IP (ou MAC)
+    for fpath in files:
+        txt = read_first(fpath) or ""
+        for line in txt.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            # dnsmasq: ts mac ip host [clientid]
+            ts_raw, mac, ip, host = parts[0], parts[1], parts[2], parts[3]
+            try:
+                ts = int(ts_raw)
+            except:
+                ts = 0  # “infinite/forever”
+            key = ip or mac
+            cur = rows.get(key)
+            if (cur is None) or (ts >= cur.get("ts", 0)):
+                rows[key] = {"ip": ip, "mac": mac, "host": host, "ts": ts}
+
+    return sorted(rows.values(), key=lambda x: x.get("ts", 0), reverse=True)
+
+
+
+# ------------------ Modem detection (USB/PPP) ------------------
+MODEM_DRIVERS = {
+    "rndis_host", "qmi_wwan", "cdc_mbim", "cdc_ncm", "huawei_cdc_ncm",
+    "cdc_ether", "option", "cdc_acm"
+}
+
+def sys_read(path, default=""):
+    try:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except:
+        return default
+
+def iface_driver_sys(ifn):
+    p = f"/sys/class/net/{ifn}/device/driver"
+    if os.path.islink(p):
+        try:
+            return os.path.basename(os.readlink(p))
+        except:
+            return None
+    return None
+
+def is_usb_iface(ifn):
+    dev = os.path.realpath(f"/sys/class/net/{ifn}/device")
+    return "/usb" in dev
+
+def modem_candidates():
+    nets = sorted(os.listdir("/sys/class/net"))
+    out = []
+    # 1) PPP primeiro
+    out += [n for n in nets if n.startswith("ppp")]
+    # 2) WWAN
+    out += [n for n in nets if n.startswith("wwan")]
+    # 3) USB com drivers de modem
+    for n in nets:
+        if n.startswith(("enx","usb","eth")) and is_usb_iface(n):
+            drv = iface_driver_sys(n)
+            if drv in MODEM_DRIVERS:
+                out.append(n)
+    # 4) fallback: primeiro enx* USB
+    for n in nets:
+        if n.startswith("enx") and is_usb_iface(n) and n not in out:
+            out.append(n)
+    # remover duplicados preservando ordem
+    seen, uniq = set(), []
+    for n in out:
+        if n not in seen:
+            seen.add(n); uniq.append(n)
+    return uniq
+
+# ------------------ Interfaces detalhadas ------------------
+def iface_details(name, addrs_cache=None):
+    if not name: return {"if": None, "exists": False}
+    d = {"if": name, "exists": False}
+    if not os.path.exists(f"/sys/class/net/{name}"):
+        return d
+    d["exists"] = True
+    d["operstate"] = (read_first(f"/sys/class/net/{name}/operstate") or "").strip()
+    d["carrier"]    = (read_first(f"/sys/class/net/{name}/carrier") or "").strip() == "1"
+    try: d["mtu"]   = int((read_first(f"/sys/class/net/{name}/mtu") or "0"))
+    except: d["mtu"] = None
+    def _i(p):
+        try: return int(read_first(p) or "0")
+        except: return 0
+    d["rx_bytes"] = _i(f"/sys/class/net/{name}/statistics/rx_bytes")
+    d["tx_bytes"] = _i(f"/sys/class/net/{name}/statistics/tx_bytes")
+    d["rx_pkts"]  = _i(f"/sys/class/net/{name}/statistics/rx_packets")
+    d["tx_pkts"]  = _i(f"/sys/class/net/{name}/statistics/tx_packets")
+    addrs = (addrs_cache or {}).get(name, {})
+    d["mac"]   = addrs.get("mac")
+    d["up"]    = addrs.get("up")
+    d["addrs"] = addrs.get("addrs", [])
+    # ethtool (pode falhar em algumas USB)
+    et = sh(f"ethtool {name}")
+    if et:
+        sp = re.search(r"Speed:\s*([0-9A-Za-z/]+)", et); d["speed"]  = sp.group(1) if sp else None
+        dp = re.search(r"Duplex:\s*([A-Za-z]+)", et);    d["duplex"] = dp.group(1) if dp else None
+        lk = re.search(r"Link detected:\s*(yes|no)", et);d["link_detected"] = (lk and lk.group(1)=="yes")
+    di = sh(f"ethtool -i {name}")
+    if di:
+        drv = re.search(r"driver:\s*(\S+)", di);      d["driver"] = drv.group(1) if drv else None
+    if not d.get("driver"):
+        d["driver"] = iface_driver_sys(name)
+    d["usb"] = is_usb_iface(name)
+    return d
+
+# ------------------ Upstream/NAT/Tests ------------------
+def has_masquerade():
+    r = sh("iptables -t nat -S | grep -i MASQUERADE || true")
+    if r: return True
+    r2 = sh("nft list ruleset 2>/dev/null | grep -i masquerade || true")
+    return bool(r2.strip())
+
+def _has(cmd): return shutil.which(cmd) is not None
+
+def iface_tests(iface):
+    """Testes focados em uma interface (ex.: modem ppp0/enx..)."""
+    if not iface: return None
+    ping_ok = (subprocess.run(f"ping -I {iface} -c1 -W1 1.1.1.1",
+                              shell=True, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0)
+    resolv = dns_servers()
+    dns_ip = resolv[0] if resolv else "1.1.1.1"
+    dns_ok = None
+    if _has("drill"):
+        dns_ok = (subprocess.run(f"drill -Q -t 2 example.com @{dns_ip}",
+                                 shell=True, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL).returncode == 0)
+    elif _has("dig"):
+        out = sh(f"dig +time=1 +tries=1 +short example.com @{dns_ip}")
+        dns_ok = bool(out.strip())
+    elif _has("nslookup"):
+        dns_ok = (subprocess.run(f"nslookup -timeout=1 example.com {dns_ip}",
+                                 shell=True, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL).returncode == 0)
+    else:
+        dns_ok = (subprocess.run(f"ping -I {iface} -c1 -W1 {dns_ip}",
+                                 shell=True, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL).returncode == 0)
+    return {"ping_internet": ping_ok, "dns_ok": bool(dns_ok), "tested_dns": dns_ip}
+
+def net_tests():
+    ping_ok = (subprocess.run("ping -c1 -W1 1.1.1.1",
+                              shell=True, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0)
+    dns_ok  = (subprocess.run("getent hosts example.com",
+                              shell=True, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0)
+    return {"ping_internet": ping_ok, "dns_resolve": dns_ok, "masquerade": has_masquerade()}
+
+def upstream_dev():
+    dr = default_route()
+    dev = dr.get("dev")
+    if dev and dev != WIFIIF:
+        return dev
+    cand = sh("ls /sys/class/net | grep -E '^(ppp|enx|eth|enp|ens|usb|wwan)' || true").splitlines()
+    for c in cand:
+        if c == WIFIIF: continue
+        st = (read_first(f"/sys/class/net/{c}/operstate") or "").strip()
+        if st == "up": return c
+    return None
+
+def guess_lan_if(addrs_cache, exclude=None):
+    exclude = exclude or set()
+    for c in ["end0","eth0"]:
+        if c in addrs_cache and c not in exclude: return c
+    for n in addrs_cache.keys():
+        if n in exclude: continue
+        if n.startswith(("enp","ens","eno","eth")):
+            return n
+    return None
+
+# ------------------ Wi-Fi Scan / Connect (NOVO) ------------------
+def _wifi_mode():
+    t = sh(f"iw dev {WIFIIF} info")
+    m = re.search(r"type\s+(\S+)", t or "")
+    return (m.group(1) if m else None) or ""
+
+def _ap_stop():
+    subprocess.run("systemctl stop create_ap.service", shell=True)
+    # matar wpa_supplicant para liberar a IF (evita conflitos)
+    subprocess.run(f"wpa_cli -i {WIFIIF} terminate >/dev/null 2>&1 || pkill -f 'wpa_supplicant.*{WIFIIF}' || true", shell=True)
+
+def _ap_start():
+    subprocess.run("systemctl restart create_ap.service", shell=True)
+
+def _if_set_managed():
+    subprocess.run(f"ip link set {WIFIIF} down", shell=True)
+    subprocess.run(f"iw dev {WIFIIF} set type managed", shell=True)
+    subprocess.run(f"ip link set {WIFIIF} up", shell=True)
+
+def _if_set_ap():
+    # Alguns drivers falham com "__ap"; "ap" é amplamente aceito
+    subprocess.run(f"ip link set {WIFIIF} down", shell=True)
+    subprocess.run(f"iw dev {WIFIIF} set type ap", shell=True)
+    subprocess.run(f"ip link set {WIFIIF} up", shell=True)
+
+def _client_stop():
+    # encerra supplicant, solta DHCP e limpa IP na IF cliente
+    subprocess.run(f"wpa_cli -i {WIFIIF} terminate >/dev/null 2>&1 || pkill -f 'wpa_supplicant.*{WIFIIF}' || true", shell=True)
+    subprocess.run(f"dhclient -r {WIFIIF} >/dev/null 2>&1 || true", shell=True)
+    subprocess.run(f"ip addr flush dev {WIFIIF}", shell=True)
+
+def set_boot_mode(mode):
+    mode = (mode or "").lower()
+    os.makedirs("/etc/mirako", exist_ok=True)
+    with open("/etc/mirako/boot_mode","w") as f:
+        f.write(mode+"\n")
+    if mode == "client":
+        subprocess.run("systemctl disable --now create_ap.service", shell=True)
+        subprocess.run(f"systemctl enable --now wifi-client@{WIFIIF}.service", shell=True)
+    elif mode == "ap":
+        subprocess.run(f"systemctl disable --now wifi-client@{WIFIIF}.service", shell=True)
+        subprocess.run("systemctl enable --now create_ap.service", shell=True)
+    return {"ok": True, "mode": mode}
+
+def get_boot_mode():
+    m  = (read_first("/etc/mirako/boot_mode") or "").strip() or None
+    ca = sh("systemctl is-enabled create_ap.service || true").strip()
+    wc = sh(f"systemctl is-enabled wifi-client@{WIFIIF}.service || true").strip()
+    return {
+        "mode": m,
+        "enabled": {"create_ap": ca, f"wifi-client@{WIFIIF}": wc},
+        "services": {
+            "create_ap": svc_state("create_ap.service"),
+            f"wifi-client@{WIFIIF}": svc_state(f"wifi-client@{WIFIIF}.service")
+        }
+    }
+
+
+def wifi_client_reset():
+    _client_stop()
+    _if_set_managed()
+    # Opcional: não levanta AP aqui, é só um reset do cliente
+    return {"ok": True, "msg": "cliente resetado"}
+
+def switch_to_ap(persist=False):
+    _client_stop()
+    _if_set_ap()
+    _ap_start()
+    if persist:
+        set_boot_mode("ap")
+    return {"ok": True, "msg": "modo AP ativo", "persist": bool(persist)}
+
+def wifi_client_status():
+    mode = (_wifi_mode() or "").lower()
+    link = sh(f"iw dev {WIFIIF} link", timeout=2.0)
+    connected = ("Connected to" in link)
+
+    def _m(pat, cast=str):
+        m = re.search(pat, link or "")
+        try:
+            return cast(m.group(1)) if m else None
+        except:
+            return None
+
+    bssid  = _m(r"Connected to ([0-9a-f:]{17})")
+    ssid   = _m(r"SSID: (.+)")
+    sigdbm = _m(r"signal: ([\-0-9\.]+) dBm", float)
+    txbr   = _m(r"tx bitrate: ([0-9\.]+\s*\S+(?:\s+\S+)*)")
+    rxbr   = _m(r"rx bitrate: ([0-9\.]+\s*\S+(?:\s+\S+)*)")
+
+    ip4 = sh(f"ip -4 addr show {WIFIIF} | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){{3}}' | head -n1") or None
+    gw4 = sh(f"ip route show dev {WIFIIF} 0.0.0.0/0 | awk '/default/ {{print $3; exit}}'") or None
+
+    def _i(p):
+        try: return int(read_first(p) or "0")
+        except: return 0
+    rx_bytes = _i(f"/sys/class/net/{WIFIIF}/statistics/rx_bytes")
+    tx_bytes = _i(f"/sys/class/net/{WIFIIF}/statistics/tx_bytes")
+
+    conf_persist = os.path.exists(f"/etc/wpa_supplicant/wpa_supplicant-{WIFIIF}.conf")
+    boot = get_boot_mode()
+
+    return {
+        "if": WIFIIF,
+        "mode": mode or "unknown",
+        "connected": bool(connected),
+        "ssid": ssid or None,
+        "bssid": bssid or None,
+        "signal_dbm": sigdbm if sigdbm is not None else None,
+        "tx_bitrate": txbr or None,
+        "rx_bitrate": rxbr or None,
+        "ip4": ip4,
+        "gw4": gw4,
+        "rx_bytes": rx_bytes,
+        "tx_bytes": tx_bytes,
+        "time": int(time.time()),
+        "persist_client": bool(conf_persist),
+        "boot_mode": boot.get("mode"),
+        "boot_enabled": boot.get("enabled", {}),
+        "services": boot.get("services", {})
+    }
+
+def wifi_scan_networks():
+    """Lista redes Wi-Fi disponíveis, pausando o AP se necessário e restaurando em seguida."""
+    networks = []
+    mode_before = _wifi_mode().lower()
+    ap_was_running = (mode_before in ("ap","__ap","master"))
+    try:
+        if ap_was_running:
+            print("[wifi_scan] Parando AP temporariamente…")
+            _ap_stop()
+            time.sleep(1.2)
+        _if_set_managed()
+        scan_out = sh(f"iw dev {WIFIIF} scan", timeout=10)
+        for block in scan_out.split("\nBSS "):
+            ssid = re.search(r"SSID:\s*(.+)", block)
+            freq = re.search(r"freq:\s*(\d+)", block)
+            signal = re.search(r"signal:\s*([\-0-9\.]+)", block)
+            chan = re.search(r"(?:DS Parameter set: channel|primary channel)\s*(\d+)", block)
+            # segurança
+            sec = "OPEN"
+            if "RSN:" in block: sec = "WPA2/3"
+            elif "WPA:" in block: sec = "WPA"
+            if ssid:
+                s = ssid.group(1).strip()
+                if s == "":  # rede oculta
+                    continue
+                networks.append({
+                    "ssid": s,
+                    "freq_mhz": int(freq.group(1)) if freq else None,
+                    "signal_dbm": float(signal.group(1)) if signal else None,
+                    "channel": int(chan.group(1)) if chan else None,
+                    "security": sec
+                })
+        networks = sorted(networks, key=lambda n: n.get("signal_dbm", -999), reverse=True)
+        return networks
+    finally:
+        if ap_was_running:
+            print("[wifi_scan] Restaurando AP…")
+            # volta tipo AP e serviço
+            try: _if_set_ap()
+            except: pass
+            _ap_start()
+
+def wifi_connect(ssid, password=None, persist=False):
+    """
+    Conecta como cliente (managed) usando wpa_supplicant + dhclient.
+    persist=True grava /etc/wpa_supplicant/wpa_supplicant-{WIFIIF}.conf
+    e ajusta boot para 'client'.
+    Retorna dict com ok, ip4, msg.
+    """
+    ssid = (ssid or "").strip()
+    if not ssid:
+        return {"ok": False, "ip4": None, "msg": "SSID vazio"}
+
+    conf_tmp = f"/tmp/wpa_{WIFIIF}.conf"
+    conf_persist = f"/etc/wpa_supplicant/wpa_supplicant-{WIFIIF}.conf"
+
+    # parar AP e preparar
+    _ap_stop()
+    time.sleep(0.8)
+    _if_set_managed()
+
+    # finalizar instâncias antigas
+    subprocess.run(f"wpa_cli -i {WIFIIF} terminate >/dev/null 2>&1 || pkill -f 'wpa_supplicant.*{WIFIIF}' || true", shell=True)
+    subprocess.run(f"dhclient -r {WIFIIF} >/dev/null 2>&1 || true", shell=True)
+    subprocess.run(f"ip addr flush dev {WIFIIF}", shell=True)
+
+    # gerar config TEMP
+    if password:
+        subprocess.run(f"wpa_passphrase '{ssid}' '{password}' > {conf_tmp}", shell=True)
+    else:
+        cfg = f'network={{\n\tssid="{ssid}"\n\tkey_mgmt=NONE\n}}\n'
+        with open(conf_tmp, "w") as f:
+            f.write(cfg)
+
+    # PERSISTÊNCIA: cria diretório, copia e ajusta permissão
+    if persist:
+        try:
+            os.makedirs("/etc/wpa_supplicant", exist_ok=True)
+            shutil.copy(conf_tmp, conf_persist)
+            os.chmod(conf_persist, 0o600)
+        except Exception as e:
+            return {"ok": False, "ip4": None, "msg": f"erro salvando wpa_supplicant: {e}"}
+
+    # iniciar wpa_supplicant em FOREGROUND (aqui como daemon -B, pois é CLI controlada)
+    subprocess.run(f"wpa_supplicant -B -i {WIFIIF} -c {conf_tmp}", shell=True)
+
+    # obter IP
+    subprocess.run(f"dhclient -v {WIFIIF}", shell=True)
+    time.sleep(2.0)
+    ip = sh(f"ip -4 addr show {WIFIIF} | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){{3}}' | head -n1")
+    ok = bool(ip)
+    msg = "Conectado" if ok else "Falha ao conectar (sem IP)"
+
+    # Se persistiu e conectou, já configura boot mode 'client'
+    if persist and ok:
+        try:
+            set_boot_mode("client")
+        except Exception as e:
+            msg += f" (boot não ajustado: {e})"
+
+    return {"ok": ok, "ip4": (ip or None), "msg": msg}
+
+
+# ------------------ Coleta ------------------
+def collect_status():
+    routes = default_route()
+    addrs  = ip_addrs()
+    upif   = upstream_dev()
+
+    # modem: independente do cabo
+    modif = None
+    for cand in modem_candidates():
+        if cand in addrs:
+            modif = cand
+            break
+
+    # LAN: evite confundir o modem USB com LAN
+    lanif = guess_lan_if(addrs, exclude={modif} if modif else set())
+
+    lan   = iface_details(lanif, addrs) if lanif else {"if": None, "exists": False}
+    modem = iface_details(modif, addrs) if modif else {"if": None, "exists": False}
+    if modem.get("exists"):
+        modem["tests"] = iface_tests(modif)
+
+    data = {
+        "system": uptime_info(),
+        "interfaces": addrs,
+        "default_route": routes,
+        "upstream_dev": upif,
+        "wifi": wifi_info(),
+        "wifi_clients": wifi_stations(),
+        "dhcp_leases": dhcp_leases(),
+        "dns_servers": dns_servers(),
+        "services": {
+            "create_ap": svc_state("create_ap.service"),
+            "server":    svc_state("server.service"),
+            "NetworkManager": svc_state("NetworkManager.service"),
+            "dnsmasq":   svc_state("dnsmasq.service"),
+            "chrony":    svc_state("chrony.service") if os.path.exists("/lib/systemd/system/chrony.service") else "n/a",
+        },
+        "tests": net_tests(),
+        "lan": lan,
+        "modem": modem,
+        "upstream": iface_details(upif, addrs) if upif else {"if": None, "exists": False},
+        "counts": {
+            "wifi_clients": len(wifi_stations()),
+            "dhcp_leases": len(dhcp_leases())
+        }
+    }
+    return data
+
+def svc_state(name):
+    s = sh(f"systemctl is-active {name}")
+    return s if s else "unknown"
+
+# ------------------ Logs & Debug (NOVO) ------------------
+def get_logs(kind="all", n=200):
+    """
+    Retorna logs (string) de:
+      - netstatus.service
+      - create_ap.service
+      - dmesg
+    kind: 'all' | 'netstatus' | 'create_ap' | 'dmesg'
+    """
+    n = max(10, min(int(n or 200), 2000))
+    parts = []
+    def _run(label, cmd):
+        out = sh(cmd, timeout=3.0)
+        if out:
+            parts.append(f"=== {label} ===\n{out}")
+    if kind in ("all","netstatus"):
+        _run("netstatus.service", f"journalctl -u netstatus.service -n {n} --no-pager -o short-iso 2>/dev/null")
+    if kind in ("all","create_ap"):
+        _run("create_ap.service", f"journalctl -u create_ap.service -n {n} --no-pager -o short-iso 2>/dev/null")
+    if kind in ("all","dmesg"):
+        _run("dmesg", f"dmesg --ctime 2>/dev/null | tail -n {n}")
+    if not parts:
+        return "Sem logs disponíveis (verifique permissões do journald)."
+    return "\n\n".join(parts)
+
+# ------------------ UI ------------------
+HTML = """<!doctype html>
+<html lang="pt-br" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MirakoAP — Status</title>
+<style>
+:root{
+  --bg:#0b0f14; --fg:#e5e7eb; --muted:#9ca3af; --card:#111827; --border:#1f2937;
+  --ok:#065f46; --warn:#854d0e; --err:#7f1d1d; --chip:#374151; --link:#93c5fd;
+}
+@media (prefers-color-scheme: light){
+  :root[data-theme="auto"]{
+    --bg:#ffffff; --fg:#111827; --muted:#6b7280; --card:#ffffff; --border:#e5e7eb;
+    --ok:#10b981; --warn:#fbbf24; --err:#ef4444; --chip:#f3f4f6; --link:#1d4ed8;
+  }
+}
+:root[data-theme="light"]{
+  --bg:#ffffff; --fg:#111827; --muted:#6b7280; --card:#ffffff; --border:#e5e7eb;
+  --ok:#10b981; --warn:#fbbf24; --err:#ef4444; --chip:#f3f4f6; --link:#1d4ed8;
+}
+:root[data-theme="dark"]{
+  --bg:#0b0f14; --fg:#e5e7eb; --muted:#9ca3af; --card:#111827; --border:#1f2937;
+  --ok:#065f46; --warn:#854d0e; --err:#7f1d1d; --chip:#374151; --link:#93c5fd;
+}
+*{box-sizing:border-box}
+body{margin:20px;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,sans-serif;line-height:1.35}
+h1{margin:.2rem 0}
+h3{margin:.2rem 0 .6rem 0}
+.muted{color:var(--muted)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;margin-top:14px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;overflow:hidden}
+.kv{display:grid;grid-template-columns:150px 1fr;gap:6px 10px;font-size:14px}
+.kv > div:nth-child(2n){min-width:0}
+.val{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wrap{overflow-wrap:anywhere;word-break:break-word}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--chip);margin-left:6px;font-size:12px;vertical-align:middle}
+.ok{background:rgba(16,185,129,.18)} .warn{background:rgba(251,191,36,.18)} .err{background:rgba(239,68,68,.18)}
+table{width:100%;border-collapse:collapse;font-size:14px;display:block;overflow:auto;max-width:100%}
+th,td{padding:6px;border-bottom:1px solid var(--border);white-space:nowrap}
+small{color:var(--muted)}
+.topbar{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+.btn{border:1px solid var(--border);background:var(--card);color:var(--fg);padding:6px 10px;border-radius:8px;cursor:pointer}
+a{color:var(--link);text-decoration:none}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{background:var(--chip);border-radius:6px;padding:2px 6px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media (max-width:480px){ .kv{grid-template-columns:120px 1fr} }
+
+/* Logs card */
+.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+select, input[type="number"]{background:var(--card);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:6px 8px}
+pre.logbox{background:#0c0f14;border:1px solid var(--border);border-radius:10px;padding:10px;max-height:380px;overflow:auto;white-space:pre-wrap}
+:root[data-theme="light"] pre.logbox{background:#f9fafb}
+select, input[type="number"], input[type="text"], input[type="password"]{
+  background:var(--card); color:var(--fg); border:1px solid var(--border);
+  border-radius:8px; padding:6px 8px
+}
+
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>MirakoAP <span class="muted" id="host"></span></h1>
+    <div>
+      <button class="btn" id="toggleTheme">Tema: auto</button>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Sistema</h3>
+      <div class="kv">
+        <div>Uptime</div><div class="val" id="uptime"></div>
+        <div>Load</div><div class="val" id="load"></div>
+        <div>CPU</div><div class="val" id="cpu"></div>
+        <div>Temp</div><div class="val" id="temp"></div>
+        <div>Memória</div><div class="val" id="mem"></div>
+        <div>Swap</div><div class="val" id="swap"></div>
+        <div>Disco (/)</div><div class="val" id="disk"></div>
+        <div>Hora</div><div class="val" id="time"></div>
+      </div>
+      <small id="cpu_model" class="muted"></small>
+    </div>
+
+    <div class="card">
+      <h3>Rede</h3>
+      <div class="kv">
+        <div>Rota padrão</div><div class="val" id="defrt"></div>
+        <div>Upstream</div><div class="val" id="updev"></div>
+        <div>DNS</div><div class="val" id="dns"></div>
+        <div>Testes</div><div class="val" id="tests"></div>
+        <div>NAT</div><div class="val" id="nat"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Wi-Fi (AP)</h3>
+      <div class="kv">
+        <div>IF</div><div class="val" id="w_if"></div>
+        <div>SSID</div><div class="val wrap" id="w_ssid"></div>
+        <div>País</div><div class="val" id="w_cc"></div>
+        <div>Canal/Freq</div><div class="val" id="w_chan"></div>
+        <div>Tx Power</div><div class="val" id="w_txp"></div>
+        <div>Clientes</div><div class="val" id="w_clients"></div>
+      </div>
+      <h4>Clientes</h4>
+      <table id="sta"><thead><tr><th>MAC</th><th>RSSI</th><th>TX</th><th>RX</th><th>Idle</th></tr></thead><tbody></tbody></table>
+    </div>
+
+    <div class="card">
+      <h3>LAN</h3>
+      <div class="kv" id="lan_kv"></div>
+    </div>
+
+    <div class="card">
+      <h3>Modem / USB / PPP</h3>
+      <div class="kv" id="modem_kv"></div>
+    </div>
+
+    <div class="card">
+      <h3>DHCP Leases</h3>
+      <table id="leases"><thead><tr><th>IP</th><th>MAC</th><th>Host</th><th>TS</th></tr></thead><tbody></tbody></table>
+    </div>
+
+    <div class="card">
+      <h3>Serviços</h3>
+      <div id="svcs"></div>
+    </div>
+
+    <div class="card">
+      <h3>Interfaces</h3>
+      <div id="ifs"></div>
+    </div>
+
+    <!-- NOVO: Logs & Debug -->
+    <div class="card">
+      <h3>Logs & Debug</h3>
+      <div class="controls">
+        <label>Fonte:
+          <select id="logKind">
+            <option value="all">all</option>
+            <option value="netstatus">netstatus</option>
+            <option value="create_ap">create_ap</option>
+            <option value="dmesg">dmesg</option>
+          </select>
+        </label>
+        <label>Linhas:
+          <input id="logLines" type="number" min="10" max="2000" value="200">
+        </label>
+        <button class="btn" id="btnLogRefresh">Atualizar</button>
+      </div>
+      <pre class="logbox" id="logbox">Carregando…</pre>
+    </div>
+  
+  
+  <!-- NOVO: Wi-Fi Cliente -->
+<div class="card" id="wifiClient">
+  <h3>Wi-Fi Cliente</h3>
+
+<div class="controls">
+  <button class="btn" id="btnWifiScan">Buscar redes</button>
+  <input id="wifiFilter" type="text" placeholder="filtrar SSID..." style="min-width:180px">
+  <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="wifiPersist"> Salvar no sistema</label>
+  <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="wifiRemember"> Lembrar no navegador</label>
+  <button class="btn" id="btnWifiConnect">Conectar</button>
+  <button class="btn" id="btnWifiReset">Reset cliente</button>
+  <button class="btn" id="btnWifiAP">Voltar ao modo AP</button>
+</div>
+
+<h4>Status da conexão</h4>
+<div class="kv" id="wifiStatusKv">
+  <div>Modo</div><div class="val" id="ws_mode">—</div>
+  <div>SSID/BSSID</div><div class="val" id="ws_ids">—</div>
+  <div>IP/GW</div><div class="val" id="ws_ip">—</div>
+  <div>Sinal</div><div class="val" id="ws_sig">—</div>
+  <div>Bitrates</div><div class="val" id="ws_rates">—</div>
+  <div>Tráfego</div><div class="val" id="ws_traffic">—</div>
+  <div>Persistência</div><div class="val" id="ws_persist">—</div>
+  <div>Boot</div><div class="val" id="ws_boot">—</div>
+</div>
+
+
+  <table id="wifiList">
+    <thead>
+      <tr><th>SSID</th><th>Sinal</th><th>Canal</th><th>Segurança</th></tr>
+    </thead>
+    <tbody>
+      <tr><td colspan="4">Sem redes. Clique em “Buscar redes”.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="kv" style="margin-top:8px">
+    <div>SSID</div>
+    <div><input id="wifiSsid" type="text" placeholder="nome da rede (SSID)"></div>
+
+    <div>Senha</div>
+    <div><input id="wifiPass" type="password" placeholder="senha (deixe vazio p/ rede aberta)"></div>
+
+    <div></div>
+    <div><small id="wifiMsg" class="muted" style="margin-left:8px"></small></div>
+
+
+  <small class="muted">
+    Dica: “Salvar no sistema” grava a rede em <code>wpa_supplicant</code>. “Lembrar no navegador” só preenche SSID/senha automaticamente aqui na página.
+  </small>
+</div>
+
+  
+  
+  
+  
+  
+  
+  
+  </div>
+
+<script>
+(function themeInit(){
+  const html = document.documentElement;
+  const btn  = ()=>document.getElementById('toggleTheme');
+  const apply = (mode)=>{
+    html.setAttribute('data-theme', mode);
+    localStorage.setItem('theme', mode);
+    if(btn()) btn().textContent = 'Tema: '+mode;
+  };
+  const saved = localStorage.getItem('theme') || 'auto';
+  apply(saved);
+  document.addEventListener('click', (e)=>{
+    if(e.target && e.target.id==='toggleTheme'){
+      const cur = localStorage.getItem('theme') || 'auto';
+      apply(cur==='auto' ? 'dark' : (cur==='dark' ? 'light' : 'auto'));
+    }
+  });
+})();
+
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
+}
+function fmtUptime(s){
+  var d=Math.floor(s/86400); s%=86400;
+  var h=Math.floor(s/3600); s%=3600;
+  var m=Math.floor(s/60); s%=60;
+  return (d?d+"d ":"")+h+"h "+m+"m "+s+"s";
+}
+function badge(txt,cls){return '<span class="badge '+cls+'">'+escapeHtml(txt)+'</span>'}
+function chips(list){
+  if(!list||!list.length) return '—';
+  return '<div class="chips">'+list.map(x=>`<span class="chip" title="${escapeHtml(x)}">${escapeHtml(x)}</span>`).join('')+'</div>';
+}
+function kv(htmlId, obj){
+  const el = document.getElementById(htmlId);
+  if(!el) return;
+  const rows = [];
+  const push = (k,v,{cls='val',html=false}={})=>{
+    rows.push('<div>'+escapeHtml(k)+'</div><div class="'+cls+'">'+(html?v:escapeHtml(String(v)))+'</div>');
+  };
+  if(!obj || !obj.exists){
+    el.innerHTML = '<div>—</div><div class="val">Sem dados</div>';
+    return;
+  }
+  const addrs = (obj.addrs||[]).map(a=>a.local);
+  const link = (obj.link_detected===true || obj.carrier===true || obj.operstate==='up');
+
+  push('Interface', (obj.if || '—') + ' ' + (obj.up?badge('up','ok'):badge('down','err')), {html:true});
+  if(obj.mac) push('MAC', obj.mac);
+  push('Endereços', chips(addrs), {cls:'wrap', html:true});
+  let linktxt = (obj.speed||'?') + (obj.duplex?(' • '+obj.duplex):'');
+  push('Link', linktxt + ' ' + (link?badge('link','ok'):badge('no-link','err')), {html:true});
+  if(obj.mtu) push('MTU', obj.mtu+'');
+  push('RX/TX bytes', (obj.rx_bytes||0)+' / '+(obj.tx_bytes||0));
+  push('RX/TX pkts', (obj.rx_pkts||0)+' / '+(obj.tx_pkts||0));
+  if(obj.driver) push('Driver', obj.driver);
+  if(obj.usb) push('USB', obj.usb ? 'sim' : 'não');
+
+  if(obj.tests){
+    let t = obj.tests, tb=[];
+    tb.push('Ping '+(t.ping_internet?badge('ok','ok'):badge('falhou','err')));
+    tb.push('DNS '+(t.dns_ok?badge('ok','ok'):badge('falhou','err')));
+    if(t.tested_dns) tb.push('<small class="muted">('+escapeHtml(t.tested_dns)+')</small>');
+    push('Testes', tb.join(' '), {html:true});
+  }
+  el.innerHTML = rows.join('');
+}
+
+function render(data){
+  // Sistema
+  document.getElementById('host').textContent = "— "+data.system.hostname;
+  document.getElementById('uptime').textContent = fmtUptime(data.system.uptime_s);
+  document.getElementById('load').textContent   = (data.system.loadavg||[]).join(' / ');
+  const cpuBits = [];
+  if(data.system.cpu_pct!=null) cpuBits.push(data.system.cpu_pct+'%');
+  if(data.system.cpu_freq_mhz!=null) cpuBits.push(data.system.cpu_freq_mhz+' MHz');
+  if(data.system.cpu_cores!=null) cpuBits.push(data.system.cpu_cores+' cores');
+  document.getElementById('cpu').textContent = cpuBits.join(' • ') || '—';
+  document.getElementById('cpu_model').textContent = data.system.cpu_model || '';
+  document.getElementById('temp').textContent = (data.system.temp_c!=null ? data.system.temp_c+' °C' : '—');
+
+  const mem = data.system;
+  const memTxt = `${mem.mem_used_mb} / ${mem.mem_total_mb} MB${mem.mem_pct!=null?` (${mem.mem_pct}%)`:''}`;
+  document.getElementById('mem').textContent = memTxt;
+  const swpTxt = `${mem.swap_used_mb} / ${mem.swap_total_mb} MB${mem.swap_pct!=null?` (${mem.swap_pct}%)`:''}`;
+  document.getElementById('swap').textContent = swpTxt;
+  const d = mem.disk_root||{};
+  document.getElementById('disk').textContent = `${d.used_h||'?'} / ${d.total_h||'?'}${d.pct!=null?` (${d.pct}%)`:''}`;
+
+  document.getElementById('time').textContent = new Date(data.system.time*1000).toLocaleString();
+
+  // Rede
+  document.getElementById('defrt').textContent =
+    (data.default_route.dev||'?') + " via " + (data.default_route.via||'?');
+  document.getElementById('updev').textContent = data.upstream_dev || '—';
+  document.getElementById('dns').innerHTML   = chips(data.dns_servers||[]);
+
+  let tBadges = [];
+  tBadges.push('Ping '+(data.tests.ping_internet?badge('ok','ok'):badge('falhou','err')));
+  tBadges.push('DNS '+(data.tests.dns_resolve?badge('ok','ok'):badge('falhou','err')));
+  document.getElementById('tests').innerHTML = tBadges.join(' ');
+  document.getElementById('nat').innerHTML   = data.tests.masquerade? badge('MASQUERADE','ok') : badge('sem NAT','warn');
+
+  // Wi-Fi
+  let wi = data.wifi || {};
+  document.getElementById('w_if').textContent    = wi.if || 'wlan0';
+  document.getElementById('w_ssid').textContent  = wi.ssid || '(hostapd)';
+  document.getElementById('w_cc').textContent    = wi.country || '—';
+  document.getElementById('w_chan').textContent  = (wi.channel||'?') + ' (' + (wi.freq_mhz||'?') + ' MHz)';
+  document.getElementById('w_txp').textContent   = (wi.txpower_dbm!=null ? wi.txpower_dbm+' dBm' : '—');
+  var wc = (data.counts && data.counts.wifi_clients!=null)?data.counts.wifi_clients:((data.wifi_clients||[]).length);
+  document.getElementById('w_clients').textContent = wc;
+
+  let st = data.wifi_clients||[], tbody='';
+  st.forEach(s=>{
+    const idle = (s.inactive_ms!=null)? (Math.round(s.inactive_ms/1000)+'s') : '';
+    tbody += `<tr><td>${s.mac}</td><td>${s.rssi??''}</td><td>${s.tx_bitrate??''}</td><td>${s.rx_bitrate??''}</td><td>${idle}</td></tr>`;
+  });
+  document.querySelector('#sta tbody').innerHTML = tbody||'<tr><td colspan=5>—</td></tr>';
+
+  // LAN & Modem
+  kv('lan_kv', data.lan);
+  kv('modem_kv', data.modem);
+
+  // Leases DHCP
+  let ls = data.dhcp_leases||[], lhtml='';
+  ls.forEach(l=>{
+    let dt = new Date(l.ts*1000).toLocaleTimeString();
+    lhtml += `<tr><td>${l.ip}</td><td>${l.mac}</td><td>${l.host}</td><td>${dt}</td></tr>`;
+  });
+  document.querySelector('#leases tbody').innerHTML = lhtml||'<tr><td colspan=4>—</td></tr>';
+
+  // Serviços
+  let svcs = data.services, html='';
+  Object.keys(svcs).forEach(k=>{
+    let st=svcs[k];
+    let cls = (st==='active')?'ok':(st==='inactive'||st==='n/a')?'warn':'err';
+    html += `<div>${k}${badge(st,cls)}</div>`;
+  });
+  document.getElementById('svcs').innerHTML = html;
+
+  // Interfaces
+  let ifs = data.interfaces, ifhtml='';
+  Object.keys(ifs).forEach(n=>{
+    let i=ifs[n], up = i.up?'up':'down';
+    let addrs=(i.addrs||[]).map(a=>a.local);
+    ifhtml += `<div class="kv"><div>${escapeHtml(n)}</div><div class="wrap">${chips(addrs)} ${badge(up, i.up?'ok':'err')}</div></div>`;
+  });
+  document.getElementById('ifs').innerHTML = ifhtml;
+}
+
+// Logs & Debug
+async function loadLogs(){
+  const kind  = document.getElementById('logKind').value;
+  const lines = document.getElementById('logLines').value || 200;
+  const box   = document.getElementById('logbox');
+  try{
+    box.textContent = 'Carregando…';
+    const r = await fetch(`/api/logs?kind=${encodeURIComponent(kind)}&n=${encodeURIComponent(lines)}`, {cache:'no-store'});
+    const j = await r.json();
+    box.textContent = j.logs || '(sem dados)';
+  }catch(e){
+    box.textContent = 'Erro ao carregar logs: '+e;
+  }
+}
+
+document.addEventListener('click',(e)=>{
+  if(e.target && e.target.id==='btnLogRefresh'){ loadLogs(); }
+});
+
+
+
+
+
+
+
+let wifiPrevBytes = null;
+
+function humanBytes(n){
+  if(n==null) return '—';
+  if(n<1024) return n+' B';
+  if(n<1024*1024) return (n/1024).toFixed(1)+' KB';
+  if(n<1024*1024*1024) return (n/1024/1024).toFixed(1)+' MB';
+  return (n/1024/1024/1024).toFixed(2)+' GB';
+}
+function humanRate(bytesPerSec){
+  if(bytesPerSec==null) return '—';
+  if(bytesPerSec<1024) return bytesPerSec.toFixed(0)+' B/s';
+  if(bytesPerSec<1024*1024) return (bytesPerSec/1024).toFixed(1)+' KB/s';
+  return (bytesPerSec/1024/1024).toFixed(2)+' MB/s';
+}
+
+
+
+function num(n, def=0){ n = Number(n); return isFinite(n) ? n : def; }
+
+async function wifiLoadStatus(){
+  try{
+    const r = await fetch('/api/wifi_status',{cache:'no-store'});
+    const s = await r.json();
+    document.getElementById('ws_mode').textContent = s.mode||'—';
+    document.getElementById('ws_ids').textContent  = (s.ssid||'—') + (s.bssid? (' / '+s.bssid):'');
+    document.getElementById('ws_ip').textContent   = (s.ip4||'—') + (s.gw4? (' via '+s.gw4):'');
+    document.getElementById('ws_sig').textContent  = (s.signal_dbm!=null? (s.signal_dbm+' dBm'):'—');
+    document.getElementById('ws_rates').textContent = [(s.tx_bitrate||'—'), (s.rx_bitrate||'—')].join(' • ');
+
+    const now = num(s.time, Math.floor(Date.now()/1000));
+    const rx = num(s.rx_bytes, 0), tx = num(s.tx_bytes, 0);
+    let rateTxt = '—';
+    if(wifiPrevBytes){
+      const dt = Math.max(1, now - wifiPrevBytes.time);
+      const rxps = (rx - wifiPrevBytes.rx)/dt;
+      const txps = (tx - wifiPrevBytes.tx)/dt;
+      rateTxt = `↓ ${humanRate(Math.max(0, rxps))} • ↑ ${humanRate(Math.max(0, txps))}`;
+    }
+    wifiPrevBytes = {rx, tx, time: now};
+    document.getElementById('ws_traffic').textContent =
+      `${rateTxt}  (${humanBytes(rx)} ↓ / ${humanBytes(tx)} ↑)`;
+
+    const persist = s.persist_client ? 'wpa_supplicant: salvo' : 'wpa_supplicant: não salvo';
+    document.getElementById('ws_persist').textContent = persist;
+
+    const en = s.boot_enabled || {};
+    const ifn = s.if || 'wlan0';
+    document.getElementById('ws_boot').textContent =
+      `modo: ${s.boot_mode||'—'} • create_ap: ${en.create_ap||'?'} • wifi-client@${ifn}: ${en['wifi-client@'+ifn]||'?'}`;
+  }catch(e){
+    document.getElementById('ws_mode').textContent = 'erro';
+  }
+}
+
+document.getElementById('btnWifiConnect')?.addEventListener('click', wifiConnect);
+
+
+// botões novos
+document.getElementById('btnWifiAP')?.addEventListener('click', async ()=>{
+  const persist = confirm('Também definir AP como modo de boot?');
+  try{
+    await fetch('/api/wifi_ap_mode', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({persist})});
+    setWifiMsg('AP reativado'+(persist?' e salvo para boot.':'.'), true);
+    setTimeout(()=>location.reload(), 1200);
+  }catch(e){ setWifiMsg('Falha ao voltar ao AP: '+e); }
+});
+
+document.getElementById('btnWifiReset')?.addEventListener('click', async ()=>{
+  try{
+    await fetch('/api/wifi_client_reset', {method:'POST', headers:{'Content-Type':'application/json'}, body: '{}'});
+    setWifiMsg('Cliente Wi-Fi resetado.', true);
+    wifiPrevBytes=null;
+    wifiLoadStatus();
+  }catch(e){ setWifiMsg('Falha ao resetar: '+e); }
+});
+
+// seletor de boot (opcional UI rápido)
+async function bootModeSave(mode){
+  try{
+    await fetch('/api/boot_mode', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mode})});
+    setWifiMsg('Modo de boot atualizado para '+mode, true);
+    wifiLoadStatus();
+  }catch(e){ setWifiMsg('Falha ao salvar boot: '+e); }
+}
+
+// atualiza status periodicamente
+setInterval(wifiLoadStatus, 3000);
+wifiLoadStatus();
+
+
+
+// ===== Wi-Fi Cliente (UI) =====
+let wifiScanCache = [];
+
+function setWifiMsg(txt, ok=false){
+  const el = document.getElementById('wifiMsg');
+  if(!el) return;
+  el.textContent = txt || '';
+  el.style.color = ok ? 'var(--ok)' : 'var(--muted)';
+}
+
+function renderWifiTable(list){
+  const tb = document.querySelector('#wifiList tbody');
+  if(!tb) return;
+  if(!list || !list.length){
+    tb.innerHTML = '<tr><td colspan="4">Sem redes encontradas.</td></tr>';
+    return;
+  }
+  tb.innerHTML = list.map(n=>{
+    const sig = (n.signal_dbm!=null? `${n.signal_dbm} dBm` : '—');
+    const ch  = (n.channel!=null? n.channel : '—');
+    const sec = n.security || '—';
+    const ssidEsc = (n.ssid||'').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return `<tr data-ssid="${ssidEsc}">
+              <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis">${ssidEsc}</td>
+              <td>${sig}</td><td>${ch}</td><td>${sec}</td>
+            </tr>`;
+  }).join('');
+
+  // seleção por clique
+  tb.querySelectorAll('tr[data-ssid]').forEach(tr=>{
+    tr.addEventListener('click', ()=>{
+      const ssid = tr.getAttribute('data-ssid');
+      document.getElementById('wifiSsid').value = ssid;
+      setWifiMsg(`Selecionado: ${ssid}`);
+    });
+  });
+}
+
+function applyWifiFilter(){
+  const q = (document.getElementById('wifiFilter').value || '').toLowerCase().trim();
+  if(!q){ renderWifiTable(wifiScanCache); return; }
+  const filtered = wifiScanCache.filter(n => (n.ssid||'').toLowerCase().includes(q));
+  renderWifiTable(filtered);
+}
+
+async function wifiScan(){
+  const btn = document.getElementById('btnWifiScan');
+  if(btn){ btn.disabled = true; btn.textContent = 'Buscando...'; }
+  setWifiMsg('Escaneando redes (o AP pausa por alguns segundos)...');
+
+  try{
+    const r = await fetch('/api/wifi_scan', {cache:'no-store'});
+    const j = await r.json();
+    wifiScanCache = (j.networks||[]);
+    renderWifiTable(wifiScanCache);
+    setWifiMsg(`Encontradas ${wifiScanCache.length} rede(s).`, true);
+  }catch(e){
+    setWifiMsg('Falha ao escanear: '+e);
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = 'Buscar redes'; }
+  }
+}
+
+async function wifiConnect(){
+  const ssid = (document.getElementById('wifiSsid').value || '').trim();
+  const pass = (document.getElementById('wifiPass').value || '');
+  const persist = !!document.getElementById('wifiPersist').checked;
+  const remember = !!document.getElementById('wifiRemember').checked;
+
+  if(!ssid){ setWifiMsg('Informe o SSID.'); return; }
+
+  setWifiMsg('Conectando...');
+  try{
+    const r = await fetch('/api/wifi_connect', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ ssid, pass, persist })
+    });
+    const j = await r.json();
+
+    if(remember){
+      localStorage.setItem('wifiClientSsid', ssid);
+      localStorage.setItem('wifiClientPass', pass);
+    }else{
+      localStorage.removeItem('wifiClientSsid');
+      localStorage.removeItem('wifiClientPass');
+    }
+
+    if(j.ok){
+      setWifiMsg(`Conectado a ${ssid} (IP ${j.ip4||'n/d'}).`, true);
+    }else{
+      setWifiMsg(`Falha: ${j.msg||'não foi possível conectar'}`);
+    }
+  }catch(e){
+    setWifiMsg('Erro: '+e);
+  }
+}
+
+// init Wi-Fi Cliente
+(function wifiClientInit(){
+  const f = document.getElementById('wifiFilter');
+  if(f) f.addEventListener('input', applyWifiFilter);
+
+  const bScan = document.getElementById('btnWifiScan');
+  if(bScan) bScan.addEventListener('click', wifiScan);
+
+  const bConn = document.getElementById('btnWifiConnect');
+  if(bConn) bConn.addEventListener('click', wifiConnect);
+
+  // preencher com lembrados no navegador
+  const lsSsid = localStorage.getItem('wifiClientSsid');
+  const lsPass = localStorage.getItem('wifiClientPass');
+  if(lsSsid) document.getElementById('wifiSsid').value = lsSsid;
+  if(lsPass) document.getElementById('wifiPass').value = lsPass;
+  if(lsSsid || lsPass) document.getElementById('wifiRemember').checked = true;
+})();
+
+
+
+
+
+// Inicialização
+(async function loop(){
+  async function refresh(){
+    try{
+      const r = await fetch('/api/status',{cache:'no-store'});
+      const j = await r.json();
+      render(j);
+    }catch(e){ console.error(e); }
+  }
+  await refresh();
+  await loadLogs();
+  setInterval(refresh, 3000);
+})();
+</script>
+</body>
+</html>
+"""
+
+class H(BaseHTTPRequestHandler):
+    def _json_headers(self):
+        self.send_header("Cache-Control","no-store")
+        self.send_header("Content-Type","application/json; charset=utf-8")
+
+    def _send_json(self, obj, status=200):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self._json_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        try:
+            if self.path.startswith("/api/status"):
+                data = collect_status()
+                self._send_json(data); return
+
+            elif self.path.startswith("/api/wifi_scan"):
+                data = wifi_scan_networks()
+                self._send_json({"networks": data}); return
+
+            elif self.path.startswith("/api/wifi_connect"):
+                qs = {}
+                if "?" in self.path:
+                    qs = urllib.parse.parse_qs(self.path.split("?",1)[1])
+                ssid = (qs.get("ssid",[None])[0] or "")
+                pw   = (qs.get("pass",[None])[0] or None)
+                persist = (qs.get("persist",["0"])[0] in ("1","true","yes","on"))
+                res = wifi_connect(ssid, pw, persist=persist)
+                self._send_json(res); return
+
+            elif self.path.startswith("/api/logs"):
+                qs = {}
+                if "?" in self.path:
+                    qs = urllib.parse.parse_qs(self.path.split("?",1)[1])
+                kind = (qs.get("kind",["all"])[0] or "all")
+                n    = (qs.get("n",["200"])[0] or "200")
+                logs = get_logs(kind, n)
+                self._send_json({"kind": kind, "n": int(n), "logs": logs}); return
+
+            elif self.path == "/" or self.path.startswith("/index.html"):
+                b = HTML.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type","text/html; charset=utf-8")
+                self.send_header("Cache-Control","no-store")
+                self.end_headers()
+                self.wfile.write(b); return
+            
+            elif self.path.startswith("/api/wifi_status"):
+                self._send_json(wifi_client_status()); return
+
+            elif self.path.startswith("/api/boot_mode"):
+                self._send_json(get_boot_mode()); return
+
+
+            else:
+                self.send_response(404); self.end_headers()
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get('Content-Length','0') or 0)
+            body = self.rfile.read(length) if length>0 else b""
+            ctype = (self.headers.get('Content-Type') or "").lower()
+            data = {}
+            if "application/json" in ctype:
+                try: data = json.loads(body.decode("utf-8") or "{}")
+                except: data = {}
+            # endpoints
+            if self.path.startswith("/api/wifi_connect"):
+                ssid = (data.get("ssid") or "")
+                pw   = data.get("pass")
+                persist = bool(data.get("persist", False))
+                res = wifi_connect(ssid, pw, persist=persist)
+                self._send_json(res); return
+                
+            if self.path.startswith("/api/wifi_ap_mode"):
+                try:
+                    persist = bool(data.get("persist", False))
+                except: persist = False
+                self._send_json(switch_to_ap(persist=persist)); return
+
+            elif self.path.startswith("/api/wifi_client_reset"):
+                self._send_json(wifi_client_reset()); return
+
+            elif self.path.startswith("/api/boot_mode"):
+                mode = (data.get("mode") or "")
+                self._send_json(set_boot_mode(mode)); return
+
+            else:
+                self._send_json({"error":"endpoint inválido"}, status=404)
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+
+if __name__ == "__main__":
+    srv = ThreadingHTTPServer((HOST, PORT), H)
+    print(f"[netstatus] ouvindo em http://{HOST}:{PORT}  (wifi_if={WIFIIF})")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+PY
+
+chmod +x /usr/local/bin/netstatus.py
+systemctl restart netstatus.service
+
+
+
+
+
+
+
+
+
+
+
+tee /etc/systemd/system/netstatus.service >/dev/null <<'UNIT'
+[Unit]
+Description=NetStatus - página de status do AP/Orange Pi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/netstatus.py
+# Para porta alternativa, descomente:
+# Environment=NETSTATUS_PORT=8080
+# Environment=NETSTATUS_WIFI_IF=wlan0
+Restart=on-failure
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now netstatus.service
+
+
+
+
+
+
+
+
+tee /etc/systemd/system/wifi-client@.service >/dev/null <<'UNIT'
+[Unit]
+Description=WiFi Client on %I
+After=network-pre.target
+Wants=network-online.target
+Conflicts=create_ap.service
+
+[Service]
+Type=forking
+Environment="PATH=/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Garante que a IF esteja em modo managed e derruba o AP antes
+ExecStartPre=/bin/systemctl stop create_ap.service
+ExecStartPre=/sbin/ip link set %I down
+ExecStartPre=/sbin/iw dev %I set type managed
+ExecStartPre=/sbin/ip link set %I up
+
+# Sobe supplicant usando o arquivo persistente gerado pelo netstatus.py
+ExecStart=/sbin/wpa_supplicant -B -i %I -c /etc/wpa_supplicant/wpa_supplicant-%I.conf
+
+# Pega IP
+ExecStartPost=/sbin/dhclient %I
+ExecStopPost=/sbin/dhclient -r %I || true
+
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+
+UNIT
+
+
+
+systemctl daemon-reload
+systemctl enable --now wifi-client@wlan0.service
+
+
+
+
+
+
+
+
+
+
+

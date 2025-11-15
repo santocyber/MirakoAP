@@ -1,10 +1,10 @@
 sudo apt update
- sudo apt-get install -y python3-requests  ffmpeg v4l-utils libgl1-mesa-glx libglib2.0-0
-
+ sudo apt-get install -y python3-requests  ffmpeg v4l-utils 
+ sudo apt install libgl1-mesa-glx libglib2.0-0
 
  
  
-
+ linux-image-current-sunxi64 linux-headers-current-sunxi64 
 
 
 
@@ -33,15 +33,13 @@ from datetime import datetime, date
 from flask import Flask, Response, jsonify, render_template_string, request, send_from_directory, abort
 from werkzeug.middleware.proxy_fix import ProxyFix
 import requests, base64, mimetypes
-from collections import deque
-
 
 # ----------------- Pastas -----------------
 MEDIA = {"photos": "photos", "videos": "videos", "thumbs": "thumbs"}
 for d in MEDIA.values():
     os.makedirs(d, exist_ok=True)
 
-# === EVO: Credenciais via ENV
+# === EVO: Credenciais via ENV (com defaults sugeridos por você)
 EVO_API_URL      = os.environ.get("EVO_API_URL",      "https://evolution.mirako.org").rstrip("/")
 EVO_API_INSTANCE = os.environ.get("EVO_API_INSTANCE", "Mirako")
 EVO_API_KEY      = os.environ.get("EVO_API_KEY",      "f2824a60ab1042f1144fd1e3c83ea5e3b8f8645884a035609782c287401bafbe")
@@ -68,6 +66,7 @@ DEFAULT_CFG = {
 CFG = json.loads(json.dumps(DEFAULT_CFG))  # cópia
 
 def _cfg_save():
+    """Salva CFG em disco de forma atômica."""
     with CFG_LOCK:
         tmp = CONFIG_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -75,12 +74,14 @@ def _cfg_save():
         os.replace(tmp, CONFIG_FILE)
 
 def _cfg_reset_defaults():
+    """Reseta CFG para o padrão e grava em disco."""
     global CFG
     with CFG_LOCK:
         CFG = json.loads(json.dumps(DEFAULT_CFG))
     _cfg_save()
 
 def _cfg_normalize_loaded(loaded: dict) -> dict:
+    """Garante chaves obrigatórias e defaults em um dict carregado do JSON."""
     loaded = loaded if isinstance(loaded, dict) else {}
     loaded.setdefault("cameras", {})
     loaded.setdefault("ui", {})
@@ -96,26 +97,12 @@ def _cfg_normalize_loaded(loaded: dict) -> dict:
         c.setdefault("name", "")
         c.setdefault("mic", "default")
         c.setdefault("rotate", 0)
-        c.setdefault("capture", {
-            "format": "auto",
-            "width": 0, "height": 0, "fps": 0
+        c.setdefault("capture", {          # <<< NOVO
+            "format": "auto",              # "auto" | "MJPG" | "YUYV" | "H264"
+            "width": 0,
+            "height": 0,
+            "fps": 0
         })
-        # bloco live (RTMP) – mantido
-        c.setdefault("live", {
-            "url": "",
-            "audio": True,
-    # novos
-            "width": 800,      # 0 = manter da câmera
-            "height": 600,      # 0 = manter da câmera
-            "fps": 15,          # 0 = manter da câmera
-            "vbitrate": 1500,   # kbps (CBR)
-            "abitrate": 90,    # kbps
-            "encoder": "x264",  # x264 | nvenc
-            "preset": "veryfast",   # x264: ultrafast..placebo | nvenc: p1..p7 (usaremos p4)
-            "latency": "ultra",    # normal | ultra  (ultra = menor latência, menos qualidade)
-            "denoise": False        # vídeo: hqdn3d leve
-        })
-
         c.setdefault("timelapse", {"enable": False, "interval": 5})
         c.setdefault("motion", {
             "enable": False, "sensitivity": 50, "min_area_pct": 3,
@@ -124,14 +111,17 @@ def _cfg_normalize_loaded(loaded: dict) -> dict:
     return loaded
 
 def _cfg_load():
+    """Carrega config; se não existir ou estiver inválido, cria uma nova."""
     global CFG
     if not os.path.exists(CONFIG_FILE):
         _cfg_reset_defaults()
         return
+
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             loaded = json.load(f)
     except json.JSONDecodeError:
+        # backup do arquivo corrompido
         try:
             os.replace(CONFIG_FILE, f"{CONFIG_FILE}.bad-{int(time.time())}")
         except Exception:
@@ -139,14 +129,17 @@ def _cfg_load():
         _cfg_reset_defaults()
         return
     except Exception:
+        # erro genérico de leitura -> recria
         _cfg_reset_defaults()
         return
 
+    # normaliza, aplica em memória e persiste (corrige/insere defaults)
     loaded = _cfg_normalize_loaded(loaded)
     with CFG_LOCK:
         CFG = loaded
     _cfg_save()
 
+    # auto-seleção inicial se não houver selecionadas
     try:
         with CFG_LOCK:
             sel = CFG.setdefault("ui", {}).setdefault("selected_devs", [])
@@ -159,28 +152,31 @@ def _cfg_load():
     except Exception:
         pass
 
+
 def get_cam_cfg(dev):
     dev = str(dev)
     with CFG_LOCK:
         c = CFG.setdefault("cameras", {}).setdefault(dev, {})
-        c.setdefault("name", dev)
+        c.setdefault("name", dev)  # === EVO
         c.setdefault("mic", "default")
-        c.setdefault("rotate", 0)
-        c.setdefault("capture", {"format":"auto","width":0,"height":0,"fps":0})
-        c.setdefault("live", {"url":"","audio":True})
+        c.setdefault("rotate", 0)  # default rotação
+        c.setdefault("capture", {  # <<< NOVO
+            "format": "auto",
+            "width": 0, "height": 0, "fps": 0
+        })
         c.setdefault("timelapse", {"enable": False, "interval": 5})
         c.setdefault("motion", {
             "enable": False, "sensitivity": 50, "min_area_pct": 3,
             "action": "photo", "overlay": True, "cooldown": 10, "clip_len": 30
         })
-        return json.loads(json.dumps(c))
+        return json.loads(json.dumps(c))  # cópia
 
 def set_cam_cfg(dev, updates: dict):
     dev = str(dev)
     with CFG_LOCK:
         c = CFG.setdefault("cameras", {}).setdefault(dev, {})
         for k, v in (updates or {}).items():
-            if k in ("timelapse", "motion", "capture", "live") and isinstance(v, dict):
+            if k in ("timelapse", "motion", "capture") and isinstance(v, dict):
                 tgt = c.setdefault(k, {})
                 tgt.update(v)
             else:
@@ -199,6 +195,7 @@ def set_evo_cfg(updates: dict):
         if "phones" in updates:
             ph = updates["phones"]
             if isinstance(ph, str):
+                # aceita linha única/textarea (vírgula/linha)
                 arr = re.split(r"[\n,;]+", ph)
                 evo["phones"] = [p.strip() for p in arr if p.strip()]
             elif isinstance(ph, (list, tuple)):
@@ -212,7 +209,7 @@ def sanitize_dev(dev: str) -> str:
 # === EVO: Fila/envio assíncrono
 class EvoSender:
     def __init__(self):
-        self.q = []
+        self.q = []           # fila de tarefas {"kind","file_path","dev","ts"}
         self.lock = threading.Lock()
         self.evt = threading.Event()
         self.th = threading.Thread(target=self._loop, daemon=True)
@@ -229,16 +226,18 @@ class EvoSender:
             evo = (CFG.get("evo") or {})
             enabled = bool(evo.get("enable"))
             phones  = evo.get("phones") or []
-            base    = (evo.get("base") or "").strip()
+            base    = (evo.get("base") or "").strip()  # pode estar vazia
         return enabled, [str(p).strip() for p in phones if str(p).strip()], base
 
     def _build_abs_url(self, rel_url: str, base: str):
+        """Monta URL absoluta caso base tenha sido configurada; senão retorna None."""
         base = (base or "").strip()
         if not base:
             return None
         rel = rel_url[1:] if rel_url.startswith("/") else rel_url
         return f"{base.rstrip('/')}/{rel}"
 
+    # --- texto simples (para /api/evo/ping) ---
     def _send_text(self, phone: str, text: str):
         try:
             endpoint = f"{EVO_API_URL}/message/sendText/{EVO_API_INSTANCE}"
@@ -264,6 +263,7 @@ class EvoSender:
                     print("[EVO] erro no envio:", e)
 
     def _send_via_url(self, media_type: str, media_url: str, caption: str, phones: list):
+        """Usa endpoint por URL (recomendado para vídeo)."""
         endpoint = f"{EVO_API_URL}/message/{media_type}/{EVO_API_INSTANCE}"
         headers = {"apikey": EVO_API_KEY, "Content-Type": "application/json"}
         for phone in phones:
@@ -278,28 +278,39 @@ class EvoSender:
                 print(f"[EVO] Erro URL {phone}: {e}")
 
     def _send_via_base64(self, media_type: str, file_path: str, caption: str, phones: list):
+        """Sem Base URL → envia como Base64."""
         endpoint = f"{EVO_API_URL}/message/sendMedia/{EVO_API_INSTANCE}"
         headers = {"apikey": EVO_API_KEY, "Content-Type": "application/json"}
+
+        # inferir mimetype
         mime, _ = mimetypes.guess_type(file_path)
         if not mime:
             mime = "image/jpeg" if media_type == "image" else "video/mp4"
+
+        # alerta amigável p/ vídeos grandes
         try:
             sz = os.path.getsize(file_path)
             if media_type == "video" and sz > 15*1024*1024:
                 print("[EVO] Aviso: vídeo >15MB via Base64 pode falhar; prefira configurar Base URL pública.")
         except Exception:
             pass
+
         try:
             with open(file_path, "rb") as f:
                 b64 = base64.b64encode(f.read()).decode("ascii")
         except Exception as e:
             print("[EVO] Erro lendo arquivo para Base64:", e)
             return
+
         for phone in phones:
             payload = {
-                "number": phone, "mediatype": media_type, "mimetype": mime,
-                "caption": caption or "", "media": b64,
-                "fileName": os.path.basename(file_path), "delay": 0
+                "number": phone,
+                "mediatype": media_type,         # "image" ou "video"
+                "mimetype": mime,
+                "caption": caption or "",
+                "media": b64,
+                "fileName": os.path.basename(file_path),
+                "delay": 0
             }
             try:
                 r = requests.post(endpoint, headers=headers, json=payload, timeout=60)
@@ -311,7 +322,7 @@ class EvoSender:
                 print(f"[EVO] Erro B64 {phone}: {e}")
 
     def _send_task(self, task):
-        kind = task["kind"]
+        kind = task["kind"]         # "photo" | "video"
         file_path = task["file_path"]
         dev = task["dev"]
         ts = datetime.fromtimestamp(task["ts"]).strftime("%d/%m/%Y %H:%M:%S")
@@ -319,6 +330,8 @@ class EvoSender:
         enabled, phones, base = self._cfg_evo()
         if not enabled or not phones:
             return
+
+        # nome amigável da câmera
         ccfg = get_cam_cfg(dev)
         cam_name = ccfg.get("name", dev)
         caption = f"🎯 Movimento na câmera {cam_name}\n⏱ {ts}"
@@ -331,12 +344,14 @@ class EvoSender:
             rel = f"/media/videos/{fname}"
             media_type = "video"
 
+        # Se houver Base URL → envia por link; se não houver → envia em Base64
         media_url = self._build_abs_url(rel, base)
         if media_url:
             self._send_via_url(media_type, media_url, caption, phones)
         else:
             self._send_via_base64(media_type, file_path, caption, phones)
 
+# instanciar
 EVO_SENDER = EvoSender()
 
 # ----------------- HTML -----------------
@@ -346,8 +361,15 @@ HTML = """<!doctype html>
 <meta name="x-basepath" content="{{ basepath|e }}">
 <style>
 :root{
-  --bg:#0f0f0f; --fg:#eee; --card:#181818; --line:#2a2a2a;
-  --tile:320px; --radius:14px; --btn:#2a2a2a; --btn-hover:#333; --input:#202020;
+  --bg:#0f0f0f;
+  --fg:#eee;
+  --card:#181818;
+  --line:#2a2a2a;
+  --tile:320px;
+  --radius:14px;
+  --btn:#2a2a2a;
+  --btn-hover:#333;
+  --input:#202020;
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,Segoe UI,Arial}
@@ -360,10 +382,15 @@ main{display:grid;grid-template-columns:300px 1fr;gap:16px;padding:16px}
 .stream header{display:flex;justify-content:space-between;align-items:center;background:#141414;padding:6px 8px}
 .stream img{width:100%;display:block;border-bottom-left-radius:var(--radius);border-bottom-right-radius:var(--radius)}
 button,select,input,textarea{
-  background:var(--btn); color:var(--fg); border:1px solid var(--line); padding:8px 10px; border-radius:12px;
+  background:var(--btn);
+  color:var(--fg);
+  border:1px solid var(--line);
+  padding:8px 10px;
+  border-radius:12px;
 }
-button{cursor:pointer} button:hover{background:var(--btn-hover)}
-select, input, textarea{background:var(--input)}
+button{cursor:pointer}
+button:hover{background:var(--btn-hover)}
+select, input, textarea{background:var(--input')}
 .thumb{display:flex;gap:8px;align-items:center}
 .thumb img{width:96px;height:64px;object-fit:cover;border-radius:10px;border:1px solid var(--line)}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
@@ -380,7 +407,6 @@ small.muted{color:#aaa}
 .selbox{position:absolute;top:6px;left:6px;background:#0009;border:1px solid var(--line);padding:4px 6px;border-radius:10px}
 .selcount{margin-left:8px;color:#aaa}
 .badge{background:#1f2937; padding:4px 8px; border-radius:10px; color:#cbd5e1}
-audio.vvAudio{height:28px; vertical-align:middle}
 </style>
 </head>
 <body>
@@ -407,6 +433,7 @@ audio.vvAudio{height:28px; vertical-align:middle}
       <button id="applyUi">Aplicar</button>
     </div>
 
+    <!-- === EVO: Bloco Evolution API (WhatsApp) -->
     <h3 style="margin-top:16px">Evolution API (WhatsApp)</h3>
     <div class="row">
       <label><input id="evoEnable" type="checkbox"> Motion ZAP</label>
@@ -455,7 +482,7 @@ audio.vvAudio{height:28px; vertical-align:middle}
 </main>
 
 <script>
-// Helpers
+// Helpers de basepath/URL/fetch
 function _basepath(){
   const m = document.querySelector('meta[name="x-basepath"]');
   const b = (m && m.content) ? m.content : "";
@@ -468,7 +495,9 @@ function url(p){
   const b = _basepath();
   return (b ? (b + '/') : '/') + p;
 }
-function jfetch(p, init){ return fetch(url(p), init); }
+function jfetch(p, init){
+  return fetch(url(p), init);
+}
 window.addEventListener('error', (e)=>{
   try { console.error('JS Error:', e.message, e.error); } catch(_) {}
   const msg = 'Erro JS: ' + (e.message || 'desconhecido');
@@ -477,10 +506,11 @@ window.addEventListener('error', (e)=>{
 });
 const $ = s => document.querySelector(s);
 function setStatus(t){ $('#status').textContent = ' '+t; setTimeout(()=>$('#status').textContent='', 3000); }
-const sanitize = dev => dev.replaceAll('/','_');
 
-// seleção de câmeras
+// Helpers
+const sanitize = dev => dev.replaceAll('/','_');
 const selected = new Set();
+
 async function persistSelected(){
   const arr = [...selected];
   localStorage.setItem('selectedDevs', JSON.stringify(arr));
@@ -537,6 +567,7 @@ function applyPreviewSize(sz){
 function libMode(){ return $('#libMode').value === 'list' ? 'list' : 'grid'; }
 
 // Dispositivos
+
 async function listDevices(){
   const j = await (await jfetch('api/devices', {cache:'no-store'})).json();
   const wrap = $('#devs'); 
@@ -605,38 +636,15 @@ async function listDevices(){
 }
 $('#refresh').onclick = listDevices;
 
-// helpers Viva-voz
-function startVivaVoz(dev, controls){
-  const mic = controls.querySelector('.micSel')?.value || 'default';
-  if(!mic || mic.toLowerCase()==='none'){ setStatus('Sem microfone para viva-voz'); return; }
-  const a = controls.querySelector('.vvAudio');
-  a.src = url('audio/live?dev='+encodeURIComponent(dev)+'&mic='+encodeURIComponent(mic)+'&r='+Date.now());
-  a.style.display='inline-block';
-  a.play().catch(()=>{});
-}
-function stopVivaVoz(controls){
-  const a = controls.querySelector('.vvAudio');
-  if(a){
-    try{ a.pause(); }catch(_){}
-    a.removeAttribute('src');
-    a.load();
-    a.style.display='none';
-  }
-}
-
 // Pré-visualizações
 function addStream(dev){
   const id = 'stream-'+sanitize(dev);
   if(document.getElementById(id)) return;
 
   const ccfg   = (GLOBAL_CFG && GLOBAL_CFG.cameras && GLOBAL_CFG.cameras[dev]) || {};
-  const micSelVal = ccfg.mic || 'default';
+  const micSel = ccfg.mic || 'default';
   const rotVal = parseInt(ccfg.rotate || 0, 10);
   const capCfg = ccfg.capture || {format:'auto', width:0, height:0, fps:0};
-
-  const liveCfg = ccfg.live || {};
-  const liveUrl = liveCfg.url || '';
-  const liveAud = (typeof liveCfg.audio === 'undefined') ? true : !!liveCfg.audio;
 
   const tlCfg  = (ccfg.timelapse || {});
   const tlOn   = !!tlCfg.enable;
@@ -667,7 +675,7 @@ function addStream(dev){
   controls.style.padding = '6px 8px';
   controls.innerHTML = `
     <label>Mic</label>
-    <select class="micSel">${micOptionsHtml(micSelVal)}</select>
+    <select class="micSel">${micOptionsHtml(micSel)}</select>
 
     <label>Girar</label>
     <select class="rotSel">
@@ -677,18 +685,7 @@ function addStream(dev){
       <option value="270" ${rotVal===270?'selected':''}>270°</option>
     </select>
 
-    <!-- Viva-voz -->
-    <label><input type="checkbox" class="vvToggle"> Viva-voz</label>
-    <audio class="vvAudio vv-${sanitize(dev)}" controls style="display:none"></audio>
-
-    <!-- Live RTMP -->
-    <label>Live RTMP</label>
-    <input class="liveUrl" type="text" placeholder="rtmp(s)://.../live2/CHAVE" style="min-width:340px">
-    <label><input type="checkbox" class="liveAudio"${liveAud?' checked':''}> Áudio no live</label>
-    <button class="liveStart">Iniciar Live</button>
-    <button class="liveStop">Parar Live</button>
-
-    <!-- Vídeo -->
+    <!-- >>> NOVO: formato/res/fps -->
     <label>Formato</label>
     <select class="fmtSel">
       <option value="auto"${(capCfg.format||'auto').toLowerCase()==='auto'?' selected':''}>Auto</option>
@@ -703,6 +700,7 @@ function addStream(dev){
     <select class="fpsSel">
       <option value="0"${(capCfg.fps||0)===0?' selected':''}>Auto</option>
     </select>
+    <!-- <<< NOVO -->
 
     <label><input type="checkbox" class="tlToggle"${tlOn?' checked':''}> Timelapse</label>
     <input type="number" class="tlInt" min="1" value="${tlInt}" style="width:90px">
@@ -728,64 +726,18 @@ function addStream(dev){
     <button class="applyCam">Aplicar</button>
   `;
 
-  // preencher valores Live & VV
-  controls.querySelector('.liveUrl').value = liveUrl;
-  const vvToggle = controls.querySelector('.vvToggle');
-  const micSelect = controls.querySelector('.micSel');
-
-  // desabilita viva-voz se mic == none
-  const updateVVEnabled = ()=>{
-    const v = (micSelect.value||'').toLowerCase();
-    vvToggle.disabled = (v==='none');
-    if (vvToggle.disabled && vvToggle.checked){
-      vvToggle.checked = false;
-      stopVivaVoz(controls);
-    }
-  };
-  updateVVEnabled();
-
-  vvToggle.onchange = (e)=>{
-    if(e.target.checked) startVivaVoz(dev, controls);
-    else stopVivaVoz(controls);
-  };
-
-  // autosave nos controles
-  ['.micSel','.rotSel','.fmtSel','.resSel','.fpsSel','.tlToggle','.tlInt','.mdToggle','.mdSens','.mdAction','.mdCooldown','.mdClip','.mdOverlay','.liveUrl','.liveAudio']
+  ['.micSel','.rotSel','.fmtSel','.resSel','.fpsSel','.tlToggle','.tlInt','.mdToggle','.mdSens','.mdAction','.mdCooldown','.mdClip','.mdOverlay']
   .forEach(sel=>{
     const el = controls.querySelector(sel);
     if(el){
-      el.addEventListener('change', ()=> { autosaveCam(dev, controls); if (sel==='.micSel' && vvToggle.checked){ stopVivaVoz(controls); startVivaVoz(dev, controls); } updateVVEnabled(); });
+      el.addEventListener('change', ()=> autosaveCam(dev, controls));
       el.addEventListener('input',  ()=> autosaveCam(dev, controls));
     }
   });
 
-  // botões live
-  controls.querySelector('.liveStart').onclick = async ()=>{
-    try{
-      const urlLive = controls.querySelector('.liveUrl').value.trim();
-      const withAud = !!controls.querySelector('.liveAudio').checked;
-      if(!urlLive){ setStatus('Informe a URL RTMP'); return; }
-      const r = await jfetch('api/live/start', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({dev, url: urlLive, audio: withAud})
-      });
-      const j = await r.json();
-      setStatus(j.ok ? 'Live iniciado' : ('Erro Live: '+(j.error||'')));
-    }catch(e){ setStatus('Erro JS: '+e); }
-  };
-  controls.querySelector('.liveStop').onclick = async ()=>{
-    try{
-      const r = await jfetch('api/live/stop', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({dev})
-      });
-      const j = await r.json();
-      setStatus(j.ok ? 'Live parado' : ('Erro Live: '+(j.error||'')));
-    }catch(e){ setStatus('Erro JS: '+e); }
-  };
-
   const img = document.createElement('img');
   img.src = url('video_feed?dev='+encodeURIComponent(dev)+'&r='+Date.now());
+
 
   box.appendChild(h);
   box.appendChild(controls);
@@ -795,7 +747,6 @@ function addStream(dev){
   // Preencher selects de captura com capacidades reais
   populateCaptureSelectors(dev, controls);
 
-  // Aplicar botão principal
   controls.querySelector('.applyCam').onclick = async ()=>{
     const btn = controls.querySelector('.applyCam');
     btn.disabled = true;
@@ -811,7 +762,6 @@ function addStream(dev){
           dev: p.dev, mic: p.mic,
           rotate: p.rot,
           capture: { format: p.fmt, width: p.w, height: p.h, fps: p.fps },
-          live: { url: p.liveUrl, audio: p.liveAud },
           timelapse:{enable: p.tlE, interval: p.tlI},
           motion:{enable: p.mdE, sensitivity: p.mdS, action: p.mdA, overlay: p.mdO, cooldown: p.mdC, clip_len: p.mdL}
         })
@@ -828,9 +778,13 @@ function addStream(dev){
       const j2 = await r2.json();
       if(!j2.ok){ throw new Error(j2.error || 'falha no restart'); }
 
+      // 3) Pequeno delay para o backend reabrir o device
       await new Promise(res=>setTimeout(res, 350));
+
+      // 4) Recarrega config do servidor para atualizar GLOBAL_CFG
       await loadConfig();
 
+      // 5) Refaz o preview com cache-busting
       removeStream(dev);
       setTimeout(()=>addStream(dev), 150);
 
@@ -843,6 +797,7 @@ function addStream(dev){
       btn.textContent = 'Aplicar';
     }
   };
+
 }
 
 async function populateCaptureSelectors(dev, controls){
@@ -909,16 +864,10 @@ async function populateCaptureSelectors(dev, controls){
 function removeStream(dev){
   const id = 'stream-'+sanitize(dev);
   const el = document.getElementById(id);
-  if(el){
-    try{
-      const a = el.querySelector('.vvAudio');
-      if(a){ a.pause(); a.removeAttribute('src'); a.load(); }
-    }catch(_){}
-    el.remove();
-  }
+  if(el) el.remove();
 }
 
-// Ações fotos/vídeos
+// Ações
 async function photo(dev){
   try{
     const r = await jfetch('api/photo', {
@@ -1092,7 +1041,7 @@ $('#applyLib').onclick = async ()=>{
   loadMedia();
 };
 
-// Evolution UI
+// === EVO: salvar/recuperar config
 $('#evoSave').onclick = async ()=>{
   try{
     const enable = !!$('#evoEnable').checked;
@@ -1115,17 +1064,22 @@ $('#evoSave').onclick = async ()=>{
     setStatus('Erro JS: '+e);
   }
 };
+
 $('#evoTest').onclick = async ()=>{
   const r = await jfetch('api/evo/test', { method:'POST' });
   const j = await r.json();
   setStatus(j.ok? ('Teste enviado: '+j.kind+' '+j.name) : ('Erro teste: '+(j.error||'')));
 };
+
 $('#evoTestVideo').onclick = async ()=>{
   try{
     const r = await jfetch('api/evo/test_video', { method:'POST' });
     const j = await r.json();
-    if (j.ok) setStatus('Teste de vídeo iniciado em '+ j.targets +' câmera(s). Vou enviar quando terminar.');
-    else setStatus('Erro teste vídeo: '+ (j.error || ''));
+    if (j.ok) {
+      setStatus('Teste de vídeo iniciado em '+ j.targets +' câmera(s). Vou enviar quando terminar.');
+    } else {
+      setStatus('Erro teste vídeo: '+ (j.error || ''));
+    }
   }catch(e){
     console.error('evoTestVideo', e);
     setStatus('Erro JS: '+e);
@@ -1172,7 +1126,7 @@ async function init(){
 }
 init();
 
-// autosave/apply helpers
+// --- autosave/apply helpers (com capture) ---
 function gatherCamConfig(dev, controls){
   const mic = controls.querySelector('.micSel')?.value?.trim() || (GLOBAL_CFG?.cameras?.[dev]?.mic || 'default');
   const rot = parseInt(controls.querySelector('.rotSel')?.value,10) || 0;
@@ -1181,9 +1135,6 @@ function gatherCamConfig(dev, controls){
   const wh  = controls.querySelector('.resSel')?.value || '0x0';
   const fps = parseInt(controls.querySelector('.fpsSel')?.value,10) || 0;
   const [w,h] = wh.split('x').map(v=>parseInt(v,10)||0);
-
-  const liveUrl = (controls.querySelector('.liveUrl')?.value || '').trim();
-  const liveAud = !!controls.querySelector('.liveAudio')?.checked;
 
   const tlE = !!controls.querySelector('.tlToggle')?.checked;
   const tlI = parseInt(controls.querySelector('.tlInt')?.value,10)||5;
@@ -1194,7 +1145,7 @@ function gatherCamConfig(dev, controls){
   const mdO = !!controls.querySelector('.mdOverlay')?.checked;
   const mdC = Math.max(0, parseInt(controls.querySelector('.mdCooldown')?.value,10)||0);
   const mdL = Math.max(5, parseInt(controls.querySelector('.mdClip')?.value,10)||30);
-  return {dev, mic, rot, fmt, w, h, fps, liveUrl, liveAud, tlE, tlI, mdE, mdS, mdA, mdO, mdC, mdL};
+  return {dev, mic, rot, fmt, w, h, fps, tlE, tlI, mdE, mdS, mdA, mdO, mdC, mdL};
 }
 
 let saveTimer = null;
@@ -1210,7 +1161,6 @@ async function autosaveCam(dev, controls){
           dev: p.dev, mic: p.mic,
           rotate: p.rot,
           capture: { format: p.fmt, width: p.w, height: p.h, fps: p.fps },
-          live: { url: p.liveUrl, audio: p.liveAud },
           timelapse:{enable: p.tlE, interval: p.tlI},
           motion:{enable: p.mdE, sensitivity: p.mdS, action: p.mdA, overlay: p.mdO, cooldown: p.mdC, clip_len: p.mdL}
         })
@@ -1255,7 +1205,9 @@ def make_thumb_from_frame(frame, video_path):
     cv2.imwrite(tpath, frame)
 
 def rotate_image(img, angle):
-    if img is None: return img
+    """Rotaciona imagem em 0/90/180/270 graus."""
+    if img is None:
+        return img
     if angle == 90:
         return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
     if angle == 180:
@@ -1312,7 +1264,7 @@ def scan_linux_cams():
         devs.append(p)
     return devs
 
-# ----------------- Motion detector -----------------
+# ----------------- Motion detector (boxes) -----------------
 class MotionDetector:
     def __init__(self):
         self.bg = None
@@ -1371,7 +1323,7 @@ class MotionDetector:
         with self.lock:
             return self.last_boxes[:]
 
-# ----------------- Recorder -----------------
+# ----------------- Recorder e afins -----------------
 def list_alsa_capture_devices():
     try:
         r = subprocess.run(["arecord","-l"], capture_output=True, text=True)
@@ -1477,106 +1429,37 @@ class Recorder:
         return int(w), int(h), float(fps)
 
     def _ffmpeg_cmd(self, w, h, fps, mic, out_path, audio_backend):
-        # hardcodes para reduzir carga e evitar aceleração (dropa frames p/ acompanhar o áudio)
-        OUT_W, OUT_H, OUT_FPS = 480, 270, 15
-        VB, AB = 700, 48  # kbps
-        IN_FPS = int(round(float(fps or 30.0)))
-
         base = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-fflags", "+genpts",
-
-            # vídeo cru via stdin
-            "-f", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "-video_size", f"{w}x{h}",
-            "-framerate", str(IN_FPS),
-            "-i", "-",
+            "ffmpeg","-loglevel","error","-y",
+            "-f","rawvideo","-pix_fmt","bgr24","-s",f"{w}x{h}","-r",str(fps),"-i","-",
         ]
-
-        have_audio = (audio_backend is not None) and (audio_backend.lower() != "none")
-        if have_audio:
-            base += ["-f", audio_backend, "-thread_queue_size", "8192", "-i", mic]
-
-        # força CFR e derruba frames para manter ritmo (sem tentar re-sincronizar complexo)
-        vf = [
-            f"scale={OUT_W}:{OUT_H}:flags=fast_bilinear",
-            f"fps={OUT_FPS}:round=down"
-        ]
-        base += ["-vf", ",".join(vf), "-vsync", "1"]
-
-        # streams
-        base += ["-map", "0:v:0"]
-        if have_audio:
-            base += ["-map", "1:a:0"]
-        else:
+        if audio_backend == "none":
             base += ["-an"]
-
-        # vídeo: x264 bem leve e constante
-        gop = OUT_FPS * 2
-        base += [
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "28",
-            "-pix_fmt", "yuv420p",
-            "-profile:v", "baseline", "-level", "3.1",
-            "-g", str(gop), "-keyint_min", str(gop),
-            "-bf", "0",
-            "-maxrate", f"{VB}k", "-bufsize", f"{VB*2}k",
-        ]
-
-        # áudio simples (sem filtros de sync; vídeo que se ajusta por drop)
-        if have_audio:
-            base += [
-                "-c:a", "aac",
-                "-ar", "44100", "-ac", "1",
-                "-b:a", f"{AB}k",
-            ]
-
-        # muxer mais previsível
-        base += ["-max_muxing_queue_size", "1024", "-max_interleave_delta", "0"]
-        if out_path.lower().endswith(".mp4"):
-            base += ["-movflags", "+faststart"]
-
-        base += [out_path]
+        else:
+            base += ["-f", audio_backend, "-thread_queue_size", "1024", "-i", mic]
+        base += ["-c:v","libx264","-preset","veryfast","-crf","23","-pix_fmt","yuv420p"]
+        if audio_backend != "none":
+            base += ["-c:a","aac","-b:a","128k"]
+        base += ["-movflags","+faststart", out_path]
         return base
 
-
-
-
     def _writer_loop(self, dev, cam, proc, fps):
-        period = 1.0 / max(1.0, float(fps or 30.0))
-        next_t = time.monotonic()
-        last = None
+        period = 1.0 / max(1.0, float(fps))
+        next_t = time.time()
         try:
             while self.run_by_dev.get(dev, False):
                 if proc.poll() is not None:
                     break
-
                 frm = cam.last_frame()
                 if frm is not None:
-                    last = frm
-
-                if last is None:
-                    # ainda sem frame algum: espera um tick e segue
-                    time.sleep(period)
-                    continue
-
-                now = time.monotonic()
-                if now < next_t:
-                    time.sleep(next_t - now)
-
-                try:
-                    # repete o último frame se não chegou um novo no tick,
-                    # preservando CFR e evitando aceleração
-                    proc.stdin.write(last.tobytes())
-                except (BrokenPipeError, ValueError, OSError):
-                    break
-
+                    try:
+                        proc.stdin.write(frm.tobytes())
+                    except (BrokenPipeError, ValueError, OSError):
+                        break
                 next_t += period
-                # se ficou MUITO atrasado, apenas resincroniza o relógio, sem pular escrita
-                if next_t < time.monotonic() - (period * 4):
-                    next_t = time.monotonic()
+                delay = next_t - time.time()
+                if delay > 0: time.sleep(delay)
+                else: next_t = time.time()
         finally:
             try:
                 if proc.stdin:
@@ -1584,8 +1467,6 @@ class Recorder:
                     proc.stdin.close()
             except Exception:
                 pass
-
-
 
     def _start_ffmpeg(self, dev, w, h, fps, mic, out_path):
         if not have_cmd("ffmpeg"):
@@ -1684,278 +1565,6 @@ class Recorder:
 
 REC = Recorder()
 
-# ----------------- Live RTMP (stream ao YouTube etc.) -----------------
-# ----------------- Live RTMP (stream ao YouTube etc.) -----------------
-# ----------------- Live RTMP (stream leve p/ Orange Pi) -----------------
-class LiveStreamer:
-    def __init__(self):
-        self.proc_by_dev = {}
-        self.thread_by_dev = {}
-        self.run_by_dev = {}
-        self.stderr_buf = {}
-        self.lock = threading.Lock()
-
-    def _stderr_tail(self, dev, limit=4000):
-        try:
-            buf = self.stderr_buf.get(dev, "")
-            return buf[-limit:]
-        except Exception:
-            return ""
-
-    def _spawn_stderr_drain(self, dev, proc):
-        from collections import deque
-        dq = deque(maxlen=4000)
-        self.stderr_buf[dev] = ""
-        def _drain():
-            try:
-                while True:
-                    if proc.poll() is not None and not proc.stderr:
-                        break
-                    chunk = proc.stderr.readline()
-                    if not chunk:
-                        if proc.poll() is not None:
-                            break
-                        time.sleep(0.05)
-                        continue
-                    try:
-                        s = chunk.decode("utf-8", "ignore")
-                    except Exception:
-                        s = repr(chunk)
-                    dq.extend(s)
-                    self.stderr_buf[dev] = "".join(dq)
-            except Exception:
-                pass
-        th = threading.Thread(target=_drain, daemon=True)
-        th.start()
-
-    def _probe_cam_dims(self, cam):
-        w = int(cam.cap.get(cv2.CAP_PROP_FRAME_WIDTH)  or 0)
-        h = int(cam.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        fps = float(cam.cap.get(cv2.CAP_PROP_FPS) or 0) or 30.0
-        if not w or not h:
-            frm = None
-            for _ in range(15):
-                frm = cam.last_frame()
-                if frm is not None: break
-                time.sleep(0.1)
-            if frm is None:
-                return 1280, 720, fps
-            h, w = frm.shape[:2]
-        return int(w), int(h), float(fps)
-
-    def _ffmpeg_cmd(self, in_w, in_h, in_fps, mic, url, audio_backend,
-                    *, out_w=None, out_h=None, out_fps=None, encoder="x264",
-                    vbitrate=3500, abitrate=160, preset="veryfast",
-                    latency="normal", denoise=False):
-        # taxa efetiva de entrada e saída (CFR)
-        eff_in_fps = float(in_fps or 30.0)
-        out_fps_i = int(round(out_fps or eff_in_fps))
-        out_fps_i = max(5, min(out_fps_i, 60))   # sanidade
-        g = int(max(1, out_fps_i) * 2)           # GOP ~2s
-
-        base = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            # Pacing e timestamps em tempo real
-            "-re",
-            "-fflags", "+genpts",
-            "-use_wallclock_as_timestamps", "1",
-
-            # Vídeo cru vindo do stdin
-            "-f", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "-video_size", f"{in_w}x{in_h}",
-            "-framerate", str(int(round(eff_in_fps))),
-            "-i", "-",
-        ]
-
-        # Áudio
-        if audio_backend == "none":
-            base += ["-an"]
-        else:
-            base += ["-f", audio_backend, "-thread_queue_size", "2048", "-i", mic]
-
-        # Filtros de vídeo (escala + QUEDA de frames p/ CFR)
-        vf = []
-        if out_w and out_h:
-            vf.append(f"scale={out_w}:{out_h}:flags=lanczos")
-        vf.append(f"fps={out_fps_i}:round=down")   # drop > dup
-        if denoise:
-            vf.append("hqdn3d=1.2:1.2:6:6")
-        base += ["-vf", ",".join(vf), "-vsync", "1"]  # CFR
-
-        # Encoder de vídeo
-        if encoder == "nvenc":
-            base += [
-                "-c:v", "h264_nvenc",
-                "-preset", "p4",
-                "-tune", "hq",
-                "-rc", "vbr_hq",
-                "-b:v", f"{vbitrate}k",
-                "-maxrate", f"{vbitrate}k",
-                "-bufsize", f"{vbitrate*2}k",
-                "-g", str(g), "-keyint_min", str(g),
-                "-bf", "2",
-                "-pix_fmt", "yuv420p",
-                "-profile:v", "high", "-level", "4.1",
-            ]
-            if latency == "ultra":
-                base += ["-tune", "ll", "-bf", "0"]
-        else:
-            base += [
-                "-c:v", "libx264",
-                "-preset", preset,
-                "-pix_fmt", "yuv420p",
-                "-profile:v", "high", "-level", "4.1",
-                "-b:v", f"{vbitrate}k",
-                "-maxrate", f"{vbitrate}k",
-                "-bufsize", f"{vbitrate*2}k",
-                "-g", str(g), "-keyint_min", str(g),
-            ]
-            if latency == "ultra":
-                base += ["-tune", "zerolatency", "-bf", "0"]
-            else:
-                base += ["-bf", "2"]
-
-        # Áudio (AAC + resync leve)
-        if audio_backend != "none":
-            base += [
-                "-c:a", "aac", "-ar", "48000", "-ac", "2",
-                "-b:a", f"{abitrate}k",
-                "-af", "aresample=async=1:min_hard_comp=0.100:first_pts=0,highpass=f=80,lowpass=f=12000",
-            ]
-
-        # RTMP
-        base += ["-f", "flv", url]
-        return base
-
-
-    def _writer_loop(self, dev, cam, proc, target_fps):
-        min_period = 1.0 / max(1.0, float(target_fps or 30.0))
-        last_seq = -1
-        last_sent = 0.0
-        try:
-            while self.run_by_dev.get(dev, False):
-                if proc.poll() is not None:
-                    break
-
-                frame, seq, ts = cam.last_frame_info()
-                if seq is None or seq == last_seq:
-                    time.sleep(0.003)
-                    continue
-
-                now = time.time()
-                # cap simples para não enviar mais do que o target_fps
-                elapsed = now - last_sent
-                if elapsed < (min_period * 0.95):
-                    time.sleep((min_period * 0.95) - elapsed)
-
-                try:
-                    proc.stdin.write(frame.tobytes())
-                except (BrokenPipeError, ValueError, OSError):
-                    break
-
-                last_seq = seq
-                last_sent = time.time()
-        finally:
-            try:
-                if proc.stdin:
-                    proc.stdin.flush()
-                    proc.stdin.close()
-            except Exception:
-                pass
-
-    def start(self, dev, url, want_audio=True):
-        dev = str(dev)
-        cam = get_cam(dev)
-        with self.lock:
-            if self.proc_by_dev.get(dev) and self.proc_by_dev[dev].poll() is None:
-                return True
-
-        in_w, in_h, in_fps = self._probe_cam_dims(cam)
-        mic = get_cam_cfg(dev).get("mic","default")
-        lcfg = get_cam_cfg(dev).get("live", {}) or {}
-
-        # Override de saída (0 = manter da câmera)
-        out_w   = int(lcfg.get("width", 640))   or None
-        out_h   = int(lcfg.get("height", 360))  or None
-        out_fps = int(lcfg.get("fps", 10))     or None
-
-        encoder  = (lcfg.get("encoder") or "x264").lower()
-        preset   = (lcfg.get("preset")  or "superfast").lower()
-        latency  = (lcfg.get("latency") or "ultra").lower()
-        vbitrate = int(lcfg.get("vbitrate", 600))
-        abitrate = int(lcfg.get("abitrate", 64))
-        denoise  = bool(lcfg.get("denoise", True))
-
-        # Decidir backend
-        if not want_audio or (not mic) or mic.lower() == 'none':
-            backends = [("none", mic)]
-        elif mic.lower().startswith("pulse"):
-            backends = [("pulse", mic), ("alsa", mic), ("none", mic)]
-        else:
-            backends = [("alsa", mic), ("none", mic)]
-
-        tried = []
-        p = None
-        for backend, micname in backends:
-            cmd = self._ffmpeg_cmd(
-                in_w, in_h, in_fps, micname, url, backend,
-                out_w=out_w, out_h=out_h, out_fps=out_fps,
-                encoder=encoder, vbitrate=vbitrate, abitrate=abitrate,
-                preset=preset, latency=latency, denoise=denoise
-            )
-            p = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                bufsize=0
-            )
-            self._spawn_stderr_drain(dev, p)
-            time.sleep(0.8)
-            if p.poll() is None:
-                with self.lock:
-                    self.proc_by_dev[dev] = p
-                    self.run_by_dev[dev] = True
-                pace = float(out_fps or in_fps or 30.0)
-                th = threading.Thread(target=self._writer_loop, args=(dev, cam, p, pace), daemon=True)
-                th.start()
-                with self.lock:
-                    self.thread_by_dev[dev] = th
-                return True
-            tried.append(f"[{backend}] {self._stderr_tail(dev)}")
-
-        raise RuntimeError("ffmpeg (live) não iniciou.\n" + "\n".join(tried))
-
-    def stop(self, dev):
-        dev = str(dev)
-        with self.lock:
-            p  = self.proc_by_dev.get(dev)
-            th = self.thread_by_dev.get(dev)
-            self.run_by_dev[dev] = False
-        if not p:
-            return True
-        if th:
-            th.join(timeout=3.5)
-        try:
-            p.terminate(); p.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            p.kill()
-            try: p.wait(timeout=2)
-            except Exception: pass
-        with self.lock:
-            self.proc_by_dev.pop(dev, None)
-            self.thread_by_dev.pop(dev, None)
-            self.run_by_dev.pop(dev, None)
-        return True
-
-
-
-LIVE = LiveStreamer()
-
-
-
-
 # ----------------- Timelapse -----------------
 class Timelapser:
     def __init__(self, dev, interval=5):
@@ -2015,7 +1624,7 @@ class MotionController:
         self.enable = bool(cfg.get("enable", False))
         self.sens = int(cfg.get("sensitivity", 50))
         self.min_area = int(cfg.get("min_area_pct", 3))
-        self.action = cfg.get("action", "photo")
+        self.action = cfg.get("action", "photo")  # photo|video
         self.overlay = bool(cfg.get("overlay", True))
         self.cooldown = int(cfg.get("cooldown", 10))
         self.clip_len = int(cfg.get("clip_len", 30))
@@ -2106,11 +1715,12 @@ CAMS = {}
 CAM_LOCK = threading.Lock()
 
 def _frame_has_signal(frame) -> bool:
+    """Heurística simples para detectar 'imagem viva'."""
     try:
         if frame is None or frame.size == 0:
             return False
         import numpy as np
-        if np.all(frame == frame.flat[0]):
+        if np.all(frame == frame.flat[0]):  # tudo igual (preto/branco sólido)
             return False
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         _, std = cv2.meanStdDev(gray)
@@ -2124,8 +1734,6 @@ class CameraStream:
         self.q = int(jpeg_quality)
         self.lock = threading.Lock()
         self.frame = None
-        self.frame_ts = 0.0
-        self.seq = 0
         self.running = True
         self.cap = self._open(device, width, height, fps)
         self.mdet = MotionDetector()
@@ -2156,6 +1764,7 @@ class CameraStream:
                 time.sleep(0.03)
             return False
 
+        # 1) tentar com a configuração do usuário
         ccfg = get_cam_cfg(dev).get("capture", {})
         want_fmt = (ccfg.get("format") or "auto").upper()
         want_w   = int(ccfg.get("width") or 0)
@@ -2172,6 +1781,7 @@ class CameraStream:
         except Exception:
             pass
 
+        # 2) fallback: varrer capacidades via v4l2-ctl
         try:
             caps = _v4l2_caps(dev).get("formats", [])
         except Exception:
@@ -2195,6 +1805,7 @@ class CameraStream:
                             pass
                         return cap
 
+        # 3) último recurso: combos comuns
         for four in ["MJPG", "YUYV", None]:
             for (W,H) in [(1920,1080),(1280,720),(640,480)]:
                 for F in [30, 15]:
@@ -2214,9 +1825,6 @@ class CameraStream:
 
                 with self.lock:
                     self.frame = img2
-                    self.frame_ts = time.time()
-                    self.seq += 1
-
                 cfg = get_cam_cfg(self.device).get("motion", {})
                 do_proc = bool(cfg.get("enable")) or bool(cfg.get("overlay"))
                 boxes = []
@@ -2255,19 +1863,12 @@ class CameraStream:
         with self.lock:
             return None if self.frame is None else self.frame.copy()
 
-    def last_frame_info(self):
-        with self.lock:
-            if self.frame is None:
-                return None, None, None
-            return self.frame.copy(), self.seq, self.frame_ts
-
     def stop(self):
         self.running = False
         try: self.th.join(timeout=1)
         except: pass
         try: self.cap.release()
         except: pass
-
 
 def get_cam(dev):
     with CAM_LOCK:
@@ -2276,6 +1877,7 @@ def get_cam(dev):
         return CAMS[dev]
 
 def restart_cam(dev):
+    """Fecha e remove a stream para ser reaberta com nova config."""
     with CAM_LOCK:
         c = CAMS.pop(dev, None)
     if c:
@@ -2286,11 +1888,14 @@ def restart_cam(dev):
 def parse_info_from_name(name: str):
     base = os.path.basename(name)
     m = re.match(r"^(?:video|rec)-(user|motion)-(.+?)-\d{8}-\d{6}\.(?:mp4|mkv|mov)$", base, re.IGNORECASE)
-    if m: return m.group(1).lower(), m.group(2)
+    if m:
+        return m.group(1).lower(), m.group(2)
     m = re.match(r"^photo-(user|motion)-(.+?)-\d{8}-\d{6}\.jpg$", base, re.IGNORECASE)
-    if m: return m.group(1).lower(), m.group(2)
+    if m:
+        return m.group(1).lower(), m.group(2)
     m = re.match(r"^tl-(.+?)-\d{8}-\d{6}\.jpg$", base, re.IGNORECASE)
-    if m: return "timelapse", m.group(1)
+    if m:
+        return "timelapse", m.group(1)
     m = re.match(r"^(rec|photo|tl)-(.+?)-\d{8}-\d{6}\.(mp4|jpg)$", base, re.IGNORECASE)
     if m:
         kind, cam = m.group(1).lower(), m.group(2)
@@ -2310,6 +1915,10 @@ def in_date_range(path, start_d: date=None, end_d: date=None):
 
 # ----------------- v4l2 caps helper/endpoint -----------------
 def _v4l2_caps(dev: str):
+    """
+    Retorna capacidades do device via v4l2-ctl:
+    {"formats":[{"fourcc":"MJPG","sizes":[{"w":640,"h":480,"fps":[30,15]}, ...]}, ...]}
+    """
     try:
         r = subprocess.run(
             ["v4l2-ctl", "-d", dev, "--list-formats-ext"],
@@ -2347,6 +1956,7 @@ def _v4l2_caps(dev: str):
     return {"formats": formats}
 
 # ----------------- Flask -----------------
+
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
 
@@ -2414,74 +2024,6 @@ def video_feed():
                    b"Content-Length: "+str(len(jpg)).encode()+b"\r\n\r\n"+jpg+b"\r\n")
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
-# -------- Viva-voz: stream MP3 do microfone selecionado --------
-def _pick_audio_backend_and_device(mic_value: str):
-    """
-    Retorna (backend, device) para ffmpeg.
-    mic_value exemplos:
-      - "pulse" -> ("pulse", "default")
-      - "pulse:alsa_input.xxx" -> ("pulse", "alsa_input.xxx")
-      - "hw:CARD=...,DEV=..." -> ("alsa", "hw:CARD=...,DEV=...")
-      - "default" -> tenta pulse, senão alsa "default"
-    """
-    s = (mic_value or "").strip()
-    if not s or s.lower() == "none":
-        return "none", ""
-    low = s.lower()
-    if low == "pulse":
-        return "pulse", "default"
-    if low.startswith("pulse:"):
-        return "pulse", s.split(":",1)[1]
-    if low == "default":
-        # prefere pulse se houver
-        try:
-            if list_pulse_sources():
-                return "pulse", "default"
-        except Exception:
-            pass
-        return "alsa", "default"
-    # ALSA típico
-    return "alsa", s
-
-@app.get("/audio/live")
-def audio_live():
-    dev = request.args.get("dev","")
-    mic = request.args.get("mic","default")
-    backend, device = _pick_audio_backend_and_device(mic)
-    if backend == "none":
-        return Response("mic none", status=400)
-    if not have_cmd("ffmpeg"):
-        return Response("ffmpeg não encontrado", status=500)
-
-    # inicia ffmpeg que envia mp3 para stdout
-    cmd = [
-        "ffmpeg","-hide_banner","-loglevel","error",
-        "-f", backend, "-thread_queue_size","1024", "-i", device,
-        "-ac","1","-ar","44100","-c:a","libmp3lame","-b:a","96k","-f","mp3","-"
-    ]
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-    except Exception as e:
-        return Response(f"erro ffmpeg: {e}", status=500)
-
-    def gen():
-        try:
-            while True:
-                chunk = proc.stdout.read(4096)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            try:
-                proc.terminate(); proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                try: proc.wait(timeout=1)
-                except Exception: pass
-    headers = {"Cache-Control":"no-store"}
-    return Response(gen(), mimetype="audio/mpeg", headers=headers)
-
-# -------- Foto/Vídeo manuais --------
 @app.post("/api/photo")
 def api_photo():
     data = request.get_json(silent=True) or {}
@@ -2526,35 +2068,6 @@ def api_rec_stop():
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 400
 
-# -------- Live RTMP endpoints --------
-@app.post("/api/live/start")
-def api_live_start():
-    data = request.get_json(silent=True) or {}
-    dev = data.get("dev","")
-    url = (data.get("url") or "").strip()
-    want_audio = bool(data.get("audio", True))
-    if not dev or not url:
-        return jsonify(ok=False, error="faltam dev/url"), 400
-    try:
-        set_cam_cfg(dev, {"live":{"url":url, "audio": want_audio}})
-        ok = LIVE.start(dev, url, want_audio=want_audio)
-        return jsonify(ok=True)
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
-
-@app.post("/api/live/stop")
-def api_live_stop():
-    data = request.get_json(silent=True) or {}
-    dev = data.get("dev","")
-    if not dev:
-        return jsonify(ok=False, error="falta dev"), 400
-    try:
-        LIVE.stop(dev)
-        return jsonify(ok=True)
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
-
-# -------- Biblioteca --------
 @app.get("/api/media")
 def api_media():
     def _parse_d(s):
@@ -2607,7 +2120,8 @@ def api_media_delete():
         path = os.path.join(base_dir, name)
         try:
             if os.path.isfile(path):
-                os.remove(path); deleted += 1
+                os.remove(path)
+                deleted += 1
                 if kind == "photos":
                     t = os.path.join(MEDIA["thumbs"], name if name.lower().endswith(".jpg") else os.path.splitext(name)[0]+".jpg")
                     if os.path.isfile(t): os.remove(t)
@@ -2635,13 +2149,16 @@ def api_config_get():
 def api_config_post():
     data = request.get_json(silent=True) or {}
 
-    # Evolution
+    # === EVO: atualizar bloco evo ===
     if "evo" in data and isinstance(data["evo"], dict):
         evo = data["evo"]
         with CFG_LOCK:
             CFG.setdefault("evo", {})
             evo_cfg = CFG["evo"]
-            if "enable" in evo: evo_cfg["enable"] = bool(evo["enable"])
+
+            if "enable" in evo:
+                evo_cfg["enable"] = bool(evo["enable"])
+
             if "phones" in evo:
                 if isinstance(evo["phones"], str):
                     phones = [p.strip() for p in evo["phones"].replace(",", "\n").splitlines() if p.strip()]
@@ -2650,25 +2167,34 @@ def api_config_post():
                 else:
                     phones = []
                 evo_cfg["phones"] = phones
-            if "base" in evo: evo_cfg["base"] = str(evo["base"]).strip()
+
+            if "base" in evo:
+                evo_cfg["base"] = str(evo["base"]).strip()
+
         _cfg_save()
         return jsonify(ok=True)
 
-    # Câmera
+    # === Câmera individual ===
     dev = data.get("dev")
     if dev:
         updates = {}
-        if "name" in data: updates["name"] = str(data["name"]).strip()
-        if "mic" in data:  updates["mic"] = data["mic"]
+        if "name" in data:
+            updates["name"] = str(data["name"]).strip()
+        if "mic" in data:
+            updates["mic"] = data["mic"]
 
         if "rotate" in data:
-            try: rot = int(data["rotate"])
-            except Exception: rot = 0
-            if rot not in (0, 90, 180, 270): rot = 0
+            try:
+                rot = int(data["rotate"])
+            except Exception:
+                rot = 0
+            if rot not in (0, 90, 180, 270):
+                rot = 0
             updates["rotate"] = rot
 
         if "capture" in data and isinstance(data["capture"], dict):
-            cap_in = data["capture"]; cap_out = {}
+            cap_in = data["capture"]
+            cap_out = {}
             if "format" in cap_in:
                 fmt = str(cap_in["format"]).upper()
                 if fmt not in ("AUTO","MJPG","YUYV","H264"):
@@ -2679,50 +2205,35 @@ def api_config_post():
             if "fps" in cap_in:    cap_out["fps"]    = int(cap_in["fps"] or 0)
             updates["capture"] = cap_out
 
-        if "live" in data and isinstance(data["live"], dict):
-            lv_in = data["live"]; lv = {}
-            if "url" in lv_in:      lv["url"] = str(lv_in["url"]).strip()
-            if "audio" in lv_in:    lv["audio"] = bool(lv_in["audio"])
-            for k in ("width","height","fps","vbitrate","abitrate"):
-                if k in lv_in:
-                    try: lv[k] = max(0, int(lv_in[k]))
-                    except: pass
-            if "encoder" in lv_in:
-                enc = str(lv_in["encoder"]).lower().strip()
-                if enc not in ("x264", "nvenc"): enc = "x264"
-                lv["encoder"] = enc
-            if "preset" in lv_in:
-                lv["preset"] = str(lv_in["preset"]).lower().strip()
-            if "latency" in lv_in:
-                lat = str(lv_in["latency"]).lower().strip()
-                if lat not in ("normal","ultra"): lat = "normal"
-                lv["latency"] = lat
-            if "denoise" in lv_in:
-                lv["denoise"] = bool(lv_in["denoise"])
-            updates["live"] = lv
-
-
         if "timelapse" in data and isinstance(data["timelapse"], dict):
             t = {}
-            if "enable" in data["timelapse"]:  t["enable"]  = bool(data["timelapse"]["enable"])
-            if "interval" in data["timelapse"]:t["interval"]= int(data["timelapse"]["interval"])
+            if "enable" in data["timelapse"]:
+                t["enable"] = bool(data["timelapse"]["enable"])
+            if "interval" in data["timelapse"]:
+                t["interval"] = int(data["timelapse"]["interval"])
             updates["timelapse"] = t
 
         if "motion" in data and isinstance(data["motion"], dict):
             m = {}
-            if "enable" in data["motion"]:       m["enable"] = bool(data["motion"]["enable"])
-            if "sensitivity" in data["motion"]:  m["sensitivity"] = int(data["motion"]["sensitivity"])
-            if "min_area_pct" in data["motion"]: m["min_area_pct"] = int(data["motion"]["min_area_pct"])
+            if "enable" in data["motion"]:
+                m["enable"] = bool(data["motion"]["enable"])
+            if "sensitivity" in data["motion"]:
+                m["sensitivity"] = int(data["motion"]["sensitivity"])
+            if "min_area_pct" in data["motion"]:
+                m["min_area_pct"] = int(data["motion"]["min_area_pct"])
             if "action" in data["motion"]:
-                m["action"] = data["motion"]["action"] if data["motion"]["action"] in ("photo","video") else "photo"
-            if "overlay" in data["motion"]:      m["overlay"] = bool(data["motion"]["overlay"])
-            if "cooldown" in data["motion"]:     m["cooldown"] = int(data["motion"]["cooldown"])
-            if "clip_len" in data["motion"]:     m["clip_len"] = int(data["motion"]["clip_len"])
+                m["action"] = data["motion"]["action"] if data["motion"]["action"] in ("photo", "video") else "photo"
+            if "overlay" in data["motion"]:
+                m["overlay"] = bool(data["motion"]["overlay"])
+            if "cooldown" in data["motion"]:
+                m["cooldown"] = int(data["motion"]["cooldown"])
+            if "clip_len" in data["motion"]:
+                m["clip_len"] = int(data["motion"]["clip_len"])
             updates["motion"] = m
 
         set_cam_cfg(dev, updates)
 
-        # timelapse
+        # aplicar timelapse
         tl = get_timer(dev)
         tcfg = get_cam_cfg(dev).get("timelapse", {})
         if tcfg.get("enable"):
@@ -2730,11 +2241,11 @@ def api_config_post():
         else:
             tl.stop()
 
-        # motion
+        # atualizar motion controller
         get_motion_ctrl(dev).update_cfg()
         return jsonify(ok=True)
 
-    # UI
+    # === UI global ===
     ui = data.get("ui")
     if isinstance(ui, dict):
         updates = {}
@@ -2780,7 +2291,7 @@ def api_tl_stop():
     get_timer(dev).stop()
     return jsonify(ok=True)
 
-# --- restart de câmera
+# --- restart de câmera para aplicar capture/rotate sem reiniciar o app
 @app.post("/api/cam/restart")
 def api_cam_restart():
     data = request.get_json(silent=True) or {}
@@ -2790,7 +2301,7 @@ def api_cam_restart():
     restart_cam(dev)
     return jsonify(ok=True)
 
-# --- Evolution utilitários
+# --- Evolution utilitários menores para /api/evo/ping ---
 def _norm_phone(s: str) -> str:
     if not s: return ""
     s = re.sub(r"\D", "", str(s))
@@ -2822,6 +2333,14 @@ def api_evo_debug():
         "instance": EVO_API_INSTANCE,
     }
     return jsonify(ok=True, evo=info)
+
+# === EVO: testes de envio
+def _active_devs(prefer_selected=True):
+    with CFG_LOCK:
+        sel = (CFG.get("ui", {}) or {}).get("selected_devs") or []
+        cams = list((CFG.get("cameras") or {}).keys())
+    devs = [str(d) for d in (sel if (prefer_selected and sel) else cams)]
+    return devs or ["/dev/video0"]
 
 @app.post("/api/evo/test")
 def api_evo_test():
@@ -2859,17 +2378,6 @@ def api_evo_test():
             results.append({"dev": dev, "ok": False, "error": f"não abriu câmera: {e}"})
 
     return jsonify(ok=sent_total > 0, sent=sent_total, results=results)
-
-@app.get("/api/live/status")
-def api_live_status():
-    dev = request.args.get("dev","")
-    if not dev:
-        return jsonify(ok=False, error="falta dev"), 400
-    running = bool(LIVE.proc_by_dev.get(dev) and LIVE.proc_by_dev[dev].poll() is None)
-    tail = LIVE._stderr_tail(dev, limit=4000)
-    return jsonify(ok=True, running=running, stderr_tail=tail or "")
-
-
 
 @app.post("/api/evo/test_video")
 def api_evo_test_video():
@@ -2917,13 +2425,6 @@ def api_evo_test_video():
 
     return jsonify(ok=started > 0, targets=started, results=results)
 
-def _active_devs(prefer_selected=True):
-    with CFG_LOCK:
-        sel = (CFG.get("ui", {}) or {}).get("selected_devs") or []
-        cams = list((CFG.get("cameras") or {}).keys())
-    devs = [str(d) for d in (sel if (prefer_selected and sel) else cams)]
-    return devs or ["/dev/video0"]
-
 def _cleanup():
     for c in list(CAMS.values()):
         try: c.stop()
@@ -2934,21 +2435,17 @@ def _cleanup():
     for m in list(MOTIONS.values()):
         try: m.stop()
         except: pass
-    for d in list(LIVE.proc_by_dev.keys()):
-        try: LIVE.stop(d)
-        except: pass
 
 import atexit; atexit.register(_cleanup)
 
 if __name__ == "__main__":
     _cfg_load()
+    # timelapse auto-start
     for dev, dat in list(CFG.get("cameras", {}).items()):
         tl = dat.get("timelapse", {})
         if tl.get("enable"):
             get_timer(dev).start(tl.get("interval",5))
     app.run("0.0.0.0", 5000, threaded=True)
-
-
 
 PYEOF
 

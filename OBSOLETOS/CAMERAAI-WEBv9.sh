@@ -1,10 +1,10 @@
 sudo apt update
- sudo apt-get install -y python3-requests  ffmpeg v4l-utils libgl1-mesa-glx libglib2.0-0
-
+ sudo apt-get install -y python3-requests  ffmpeg v4l-utils 
+ sudo apt install libgl1-mesa-glx libglib2.0-0
 
  
  
-
+ linux-image-current-sunxi64 linux-headers-current-sunxi64 
 
 
 
@@ -33,8 +33,6 @@ from datetime import datetime, date
 from flask import Flask, Response, jsonify, render_template_string, request, send_from_directory, abort
 from werkzeug.middleware.proxy_fix import ProxyFix
 import requests, base64, mimetypes
-from collections import deque
-
 
 # ----------------- Pastas -----------------
 MEDIA = {"photos": "photos", "videos": "videos", "thumbs": "thumbs"}
@@ -363,7 +361,7 @@ button,select,input,textarea{
   background:var(--btn); color:var(--fg); border:1px solid var(--line); padding:8px 10px; border-radius:12px;
 }
 button{cursor:pointer} button:hover{background:var(--btn-hover)}
-select, input, textarea{background:var(--input)}
+select, input, textarea{background:var(--input')}
 .thumb{display:flex;gap:8px;align-items:center}
 .thumb img{width:96px;height:64px;object-fit:cover;border-radius:10px;border:1px solid var(--line)}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
@@ -1476,107 +1474,108 @@ class Recorder:
             h, w = frm.shape[:2]
         return int(w), int(h), float(fps)
 
-    def _ffmpeg_cmd(self, w, h, fps, mic, out_path, audio_backend):
-        # hardcodes para reduzir carga e evitar aceleração (dropa frames p/ acompanhar o áudio)
-        OUT_W, OUT_H, OUT_FPS = 480, 270, 15
-        VB, AB = 700, 48  # kbps
-        IN_FPS = int(round(float(fps or 30.0)))
+    def _ffmpeg_cmd(self, in_w, in_h, in_fps, mic, url, audio_backend,
+                    *, out_w=None, out_h=None, out_fps=None, encoder="x264",
+                    vbitrate=3500, abitrate=160, preset="veryfast",
+                    latency="normal", denoise=False):
+        # taxa efetiva de saída (CFR)
+        eff_in_fps = float(in_fps or 30.0)
+        out_fps_i = int(round(out_fps or eff_in_fps))
+        out_fps_i = max(5, min(out_fps_i, 60))  # sanidade
+        g = int(max(1, out_fps_i) * 2)          # GOP ≈ 2s
 
         base = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-fflags", "+genpts",
-
-            # vídeo cru via stdin
-            "-f", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "-video_size", f"{w}x{h}",
-            "-framerate", str(IN_FPS),
-            "-i", "-",
+            "ffmpeg", "-loglevel", "error",
+            "-fflags", "+genpts",                 # gera PTS quando faltam
+            # vídeo cru vindo do stdin
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{in_w}x{in_h}", "-r", str(int(round(eff_in_fps))), "-i", "-",
         ]
 
-        have_audio = (audio_backend is not None) and (audio_backend.lower() != "none")
-        if have_audio:
-            base += ["-f", audio_backend, "-thread_queue_size", "8192", "-i", mic]
-
-        # força CFR e derruba frames para manter ritmo (sem tentar re-sincronizar complexo)
-        vf = [
-            f"scale={OUT_W}:{OUT_H}:flags=fast_bilinear",
-            f"fps={OUT_FPS}:round=down"
-        ]
-        base += ["-vf", ",".join(vf), "-vsync", "1"]
-
-        # streams
-        base += ["-map", "0:v:0"]
-        if have_audio:
-            base += ["-map", "1:a:0"]
-        else:
+        # Áudio
+        if audio_backend == "none":
             base += ["-an"]
+        else:
+            base += ["-f", audio_backend, "-thread_queue_size", "2048", "-i", mic]
 
-        # vídeo: x264 bem leve e constante
-        gop = OUT_FPS * 2
-        base += [
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "28",
-            "-pix_fmt", "yuv420p",
-            "-profile:v", "baseline", "-level", "3.1",
-            "-g", str(gop), "-keyint_min", str(gop),
-            "-bf", "0",
-            "-maxrate", f"{VB}k", "-bufsize", f"{VB*2}k",
-        ]
+        # Filtros de vídeo:
+        # 1) PTS em tempo real (wallclock)
+        # 2) scale (se configurado)
+        # 3) fps com round=down (DROP frames, nunca duplica)
+        vf = ["setpts=RTCTIME/1000000-STARTPTS"]
+        if out_w and out_h:
+            vf.append(f"scale={out_w}:{out_h}:flags=lanczos")
+        vf.append(f"fps={out_fps_i}:round=down")
+        if denoise:
+            vf.append("hqdn3d=1.2:1.2:6:6")
+        base += ["-vf", ",".join(vf), "-vsync", "1"]  # CFR
 
-        # áudio simples (sem filtros de sync; vídeo que se ajusta por drop)
-        if have_audio:
+        # Encoder de vídeo
+        if encoder == "nvenc":
             base += [
-                "-c:a", "aac",
-                "-ar", "44100", "-ac", "1",
-                "-b:a", f"{AB}k",
+                "-c:v", "h264_nvenc",
+                "-preset", "p4",
+                "-tune", "hq",
+                "-rc", "vbr_hq",
+                "-b:v", f"{vbitrate}k",
+                "-maxrate", f"{vbitrate}k",
+                "-bufsize", f"{vbitrate*2}k",
+                "-g", str(g), "-keyint_min", str(g),
+                "-bf", "2",
+                "-pix_fmt", "yuv420p",
+                "-profile:v", "high", "-level", "4.1",
+            ]
+            if latency == "ultra":
+                base += ["-tune", "ll", "-bf", "0"]
+        else:
+            base += [
+                "-c:v", "libx264",
+                "-preset", preset,
+                "-pix_fmt", "yuv420p",
+                "-profile:v", "high", "-level", "4.1",
+                "-b:v", f"{vbitrate}k",
+                "-maxrate", f"{vbitrate}k",
+                "-bufsize", f"{vbitrate*2}k",
+                "-g", str(g), "-keyint_min", str(g),
+            ]
+            if latency == "ultra":
+                base += ["-tune", "zerolatency", "-bf", "0"]
+            else:
+                base += ["-bf", "2"]
+
+        # Áudio (AAC estéreo 48 kHz + resync)
+        if audio_backend != "none":
+            base += [
+                "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                "-b:a", f"{abitrate}k",
+                "-af", "aresample=async=1:min_hard_comp=0.100:first_pts=0,highpass=f=80,lowpass=f=12000",
             ]
 
-        # muxer mais previsível
-        base += ["-max_muxing_queue_size", "1024", "-max_interleave_delta", "0"]
-        if out_path.lower().endswith(".mp4"):
-            base += ["-movflags", "+faststart"]
-
-        base += [out_path]
+        # Saída RTMP
+        base += ["-f", "flv", url]
         return base
 
 
 
 
+
     def _writer_loop(self, dev, cam, proc, fps):
-        period = 1.0 / max(1.0, float(fps or 30.0))
-        next_t = time.monotonic()
-        last = None
+        period = 1.0 / max(1.0, float(fps))
+        next_t = time.time()
         try:
             while self.run_by_dev.get(dev, False):
                 if proc.poll() is not None:
                     break
-
                 frm = cam.last_frame()
                 if frm is not None:
-                    last = frm
-
-                if last is None:
-                    # ainda sem frame algum: espera um tick e segue
-                    time.sleep(period)
-                    continue
-
-                now = time.monotonic()
-                if now < next_t:
-                    time.sleep(next_t - now)
-
-                try:
-                    # repete o último frame se não chegou um novo no tick,
-                    # preservando CFR e evitando aceleração
-                    proc.stdin.write(last.tobytes())
-                except (BrokenPipeError, ValueError, OSError):
-                    break
-
+                    try:
+                        proc.stdin.write(frm.tobytes())
+                    except (BrokenPipeError, ValueError, OSError):
+                        break
                 next_t += period
-                # se ficou MUITO atrasado, apenas resincroniza o relógio, sem pular escrita
-                if next_t < time.monotonic() - (period * 4):
-                    next_t = time.monotonic()
+                delay = next_t - time.time()
+                if delay > 0: time.sleep(delay)
+                else: next_t = time.time()
         finally:
             try:
                 if proc.stdin:
@@ -1584,8 +1583,6 @@ class Recorder:
                     proc.stdin.close()
             except Exception:
                 pass
-
-
 
     def _start_ffmpeg(self, dev, w, h, fps, mic, out_path):
         if not have_cmd("ffmpeg"):
@@ -1685,8 +1682,6 @@ class Recorder:
 REC = Recorder()
 
 # ----------------- Live RTMP (stream ao YouTube etc.) -----------------
-# ----------------- Live RTMP (stream ao YouTube etc.) -----------------
-# ----------------- Live RTMP (stream leve p/ Orange Pi) -----------------
 class LiveStreamer:
     def __init__(self):
         self.proc_by_dev = {}
@@ -1747,24 +1742,18 @@ class LiveStreamer:
                     *, out_w=None, out_h=None, out_fps=None, encoder="x264",
                     vbitrate=3500, abitrate=160, preset="veryfast",
                     latency="normal", denoise=False):
-        # taxa efetiva de entrada e saída (CFR)
-        eff_in_fps = float(in_fps or 30.0)
-        out_fps_i = int(round(out_fps or eff_in_fps))
-        out_fps_i = max(5, min(out_fps_i, 60))   # sanidade
-        g = int(max(1, out_fps_i) * 2)           # GOP ~2s
+        # GOP ~ 2s
+        eff_fps = float(out_fps or in_fps or 30)
+        g = int(max(1.0, eff_fps) * 2)
 
         base = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            # Pacing e timestamps em tempo real
-            "-re",
+            "ffmpeg", "-loglevel", "error",
+            "-re",                              # respeita tempo real do input
             "-fflags", "+genpts",
-            "-use_wallclock_as_timestamps", "1",
-
-            # Vídeo cru vindo do stdin
-            "-f", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "-video_size", f"{in_w}x{in_h}",
-            "-framerate", str(int(round(eff_in_fps))),
+            # vídeo cru vindo do stdin
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{in_w}x{in_h}",
+            "-r", str(int(round(eff_fps))),    # define PTS do rawvideo
             "-i", "-",
         ]
 
@@ -1774,14 +1763,16 @@ class LiveStreamer:
         else:
             base += ["-f", audio_backend, "-thread_queue_size", "2048", "-i", mic]
 
-        # Filtros de vídeo (escala + QUEDA de frames p/ CFR)
+        # Filtros de vídeo (escala/FPS e denoise leve)
         vf = []
         if out_w and out_h:
             vf.append(f"scale={out_w}:{out_h}:flags=lanczos")
-        vf.append(f"fps={out_fps_i}:round=down")   # drop > dup
+        if out_fps:
+            vf.append(f"fps={int(round(out_fps))}")
         if denoise:
             vf.append("hqdn3d=1.2:1.2:6:6")
-        base += ["-vf", ",".join(vf), "-vsync", "1"]  # CFR
+        if vf:
+            base += ["-vf", ",".join(vf)]
 
         # Encoder de vídeo
         if encoder == "nvenc":
@@ -1816,7 +1807,7 @@ class LiveStreamer:
             else:
                 base += ["-bf", "2"]
 
-        # Áudio (AAC + resync leve)
+        # Áudio (AAC + resync + tilt leve)
         if audio_backend != "none":
             base += [
                 "-c:a", "aac", "-ar", "48000", "-ac", "2",
@@ -1824,10 +1815,9 @@ class LiveStreamer:
                 "-af", "aresample=async=1:min_hard_comp=0.100:first_pts=0,highpass=f=80,lowpass=f=12000",
             ]
 
-        # RTMP
+        # Saída RTMP
         base += ["-f", "flv", url]
         return base
-
 
     def _writer_loop(self, dev, cam, proc, target_fps):
         min_period = 1.0 / max(1.0, float(target_fps or 30.0))
@@ -1876,16 +1866,16 @@ class LiveStreamer:
         lcfg = get_cam_cfg(dev).get("live", {}) or {}
 
         # Override de saída (0 = manter da câmera)
-        out_w   = int(lcfg.get("width", 640))   or None
-        out_h   = int(lcfg.get("height", 360))  or None
-        out_fps = int(lcfg.get("fps", 10))     or None
+        out_w   = int(lcfg.get("width", 0))   or None
+        out_h   = int(lcfg.get("height", 0))  or None
+        out_fps = int(lcfg.get("fps", 0))     or None
 
         encoder  = (lcfg.get("encoder") or "x264").lower()
-        preset   = (lcfg.get("preset")  or "superfast").lower()
-        latency  = (lcfg.get("latency") or "ultra").lower()
-        vbitrate = int(lcfg.get("vbitrate", 600))
-        abitrate = int(lcfg.get("abitrate", 64))
-        denoise  = bool(lcfg.get("denoise", True))
+        preset   = (lcfg.get("preset")  or "veryfast").lower()
+        latency  = (lcfg.get("latency") or "normal").lower()
+        vbitrate = int(lcfg.get("vbitrate", 3500))
+        abitrate = int(lcfg.get("abitrate", 160))
+        denoise  = bool(lcfg.get("denoise", False))
 
         # Decidir backend
         if not want_audio or (not mic) or mic.lower() == 'none':
@@ -1952,9 +1942,6 @@ class LiveStreamer:
 
 
 LIVE = LiveStreamer()
-
-
-
 
 # ----------------- Timelapse -----------------
 class Timelapser:
@@ -2859,17 +2846,6 @@ def api_evo_test():
             results.append({"dev": dev, "ok": False, "error": f"não abriu câmera: {e}"})
 
     return jsonify(ok=sent_total > 0, sent=sent_total, results=results)
-
-@app.get("/api/live/status")
-def api_live_status():
-    dev = request.args.get("dev","")
-    if not dev:
-        return jsonify(ok=False, error="falta dev"), 400
-    running = bool(LIVE.proc_by_dev.get(dev) and LIVE.proc_by_dev[dev].poll() is None)
-    tail = LIVE._stderr_tail(dev, limit=4000)
-    return jsonify(ok=True, running=running, stderr_tail=tail or "")
-
-
 
 @app.post("/api/evo/test_video")
 def api_evo_test_video():

@@ -1,815 +1,932 @@
-pip install flask flask-cor
-apt install adb
+
+sudo apt  -y install libusb-1.0-0-dev libudev-dev adb python3-pip
+pip install flask flask-cor pyusb --break-system-packages
 pip install -U OPi.GPIO pyusb --break-system-packages
+
+sudo apt install -y gpiod libgpiod-dev python3-libgpiod
+
+
+adb kill-server
+systemctl stop adb 2>/dev/null || true
+
+
+
 adb logcat *:E | grep -E "AndroidRuntime|ActivityManager|React|JS|usbaccessory"
+adb logcat -v threadtime   UsbAccessoryModule:D ReactNativeJS:D   UsbManager:D UsbHostManager:D UsbDeviceManager:D ActivityManager:D   *:S
 
 sudo tee /etc/udev/rules.d/99-android-accessory.rules >/dev/null <<'EOF'
 SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d01", MODE="0660", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", MODE="0666", GROUP="plugdev"
+
 EOF
+
+
+sudo tee /etc/udev/rules.d/51-android.rules >/dev/null <<'EOF'
+SUBSYSTEM=="usb", ATTR{idVendor}=="2717", MODE="0666"   # Xiaomi
+SUBSYSTEM=="usb", ATTR{idVendor}=="22b8", MODE="0666"   # Motorola
+SUBSYSTEM=="usb", ATTR{idVendor}=="0fce", MODE="0666"   # Sony
+SUBSYSTEM=="usb", ATTR{idVendor}=="12d1", MODE="0666"   # Huawei
+
+# PAX (Android base)
+SUBSYSTEM=="usb", ATTR{idVendor}=="2fb8", ATTR{idProduct}=="2200", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2fb8", ATTR{idProduct}=="2201", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2fb8", ATTR{idProduct}=="2202", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2fb8", ATTR{idProduct}=="2203", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2fb8", ATTR{idProduct}=="2204", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2fb8", ATTR{idProduct}=="2205", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2fb8", ATTR{idProduct}=="2206", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2fb8", ATTR{idProduct}=="2207", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2fb8", ATTR{idProduct}=="2208", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2fb8", ATTR{idProduct}=="2209", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2fb8", ATTR{idProduct}=="2210", MODE="0666", GROUP="plugdev"
+
+# Google AOA
+SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d00", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d01", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d02", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", MODE="0666", GROUP="plugdev"
+
+# Samsung MTP, etc
+SUBSYSTEM=="usb", ATTR{idVendor}=="04e8", ATTR{idProduct}=="6860", MODE="0666", GROUP="plugdev"
+EOF
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
+
+
 
 
 sudo tee /opt/mirako_web/aoa.py >/dev/null <<'PYEOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, json, time, socket, signal, re, traceback, threading, queue
-from datetime import datetime, timedelta
+import os
+import time
+from datetime import datetime
 from collections import deque
-from flask import Flask, request, jsonify, Response, render_template_string
+import threading
+import queue
 
-# =========================
-# DEPENDÊNCIAS (pyusb opcionalmente ausente -> AOA desativa)
-# =========================
+import usb.core
+import usb.util
+from flask import Flask, jsonify, render_template_string, request, send_file
+
+# --- GPIO com libgpiod ---
 try:
-    import usb.core
-    import usb.util
-    HAVE_USB = True
-except Exception:
-    HAVE_USB = False
+    import gpiod
+except ModuleNotFoundError:
+    gpiod = None
+
+# Configuração GPIO (PC9 no Orange Pi)
+PULSO_PIN = 73          # GPIO line para PC9
+CHIP = 'gpiochip0'      # chip padrão
+
 
 # =========================
-# CONFIG AOA
+# Util: timestamp
 # =========================
+def ts():
+    return datetime.now().strftime("%Y-%m-%d %Y-%m-%d %H:%M:%S")  # corrigir duplicata se quiser
+
+
+# =========================
+# Constantes AOA / IDs
+# =========================
+AOA_VENDOR          = 0x18D1
+AOA_PIDS            = {0x2D00, 0x2d01, 0x2D02, 0x2D03, 0x2D04, 0x2D05}
+AOA_GET_PROTOCOL    = 51
+AOA_SEND_IDENT      = 52
+AOA_START           = 53
+AOA_STR_MANUFACTURER= 0
+AOA_STR_MODEL       = 1
+AOA_STR_DESCRIPTION = 2
+AOA_STR_VERSION     = 3
+AOA_STR_URI         = 4
+AOA_STR_SERIAL      = 5
+
+# Device "base" (PAX A910 etc)
+ANDROID_VENDOR = 0x2FB8
+ANDROID_PIDS   = {
+    0x2200, 0x2201, 0x2202, 0x2203, 0x2204,
+    0x2205, 0x2206, 0x2207, 0x2208, 0x2209,
+    0x2210,
+}
+
+# Identidade AOA
 MANUFACTURER = "WEBSYS"
 MODEL        = "RN-Pi-Link"
 DESCRIPTION  = "RN<->Pi Accessory"
 VERSION      = "1.0"
-URI          = "https://example.com"
+URI          = "https://mirako.org"
 SERIAL       = "0001"
 
-AOA_VENDOR_GOOGLE = 0x18D1
-AOA_PIDS = {0x2D00, 0x2D01, 0x2D02, 0x2D03, 0x2D04, 0x2D05}
-AOA_GET_PROTOCOL = 51
-AOA_SEND_IDENT   = 52
-AOA_START        = 53
-AOA_STR_MANUFACTURER = 0
-AOA_STR_MODEL        = 1
-AOA_STR_DESCRIPTION  = 2
-AOA_STR_VERSION      = 3
-AOA_STR_URI          = 4
-AOA_STR_SERIAL       = 5
+# Protocolo
+POLL_LINE_AUTO   = b"B;057091;0;0;0;0;B\n"  # poll automático
+POLL_LINE_MANUAL = b"B;057091;0;0;1;0;B\n"  # botão da UI
+POLL_LINE_HS1    = b"$;854751;$\n"
+POLL_LINE_HS2    = b"&;451796;0;0;&\n"
 
-# =========================
-# TOKENS DO PROTOCOLO
-# =========================
-HS1_TOKEN        = "!;157458;!"   # App -> Servidor (handshake #1)
-HS2_INVITE_TOKEN = "$;854751;$"   # Servidor -> App  (pede o HS#2)
-HS2_TOKEN        = "@;697154;@"   # App -> Servidor (handshake #2)
-POLL_TOKEN       = "S;190750;S"   # App -> Servidor (poll periódico)
-READY_LINE       = "&;451796;0;0;&"
-
-# =========================
-# LOG Config
-# =========================
-AOA_LOG_ENABLE       = int(os.getenv("AOA_LOG_ENABLE", "1")) == 1
-AOA_LOG_FILE_ENABLE  = int(os.getenv("AOA_LOG_FILE_ENABLE", "1")) == 1
-AOA_LOG_TRUNC        = int(os.getenv("AOA_LOG_TRUNC", "240"))
-CREDITS_DIR          = os.path.join(os.path.expanduser("~"), ".cache", "aoa_usb_server")
-LOG_FILE_PATH        = os.path.join(CREDITS_DIR, "aoa_rxtx.log")
-LOG_ROTATE_SIZE      = 5 * 1024 * 1024  # 5MB
-
-def _ensure_dir(path: str):
-    try: os.makedirs(path, exist_ok=True)
-    except Exception: pass
-_ensure_dir(CREDITS_DIR)
-
-def _ts(): return datetime.now().strftime("%H:%M:%S.%f")[:-3]
-def _truncate_for_console(s: str) -> str:
-    return s if (AOA_LOG_TRUNC <= 0 or len(s) <= AOA_LOG_TRUNC) else s[:AOA_LOG_TRUNC-3] + "..."
-def _rotate_log_if_needed(path: str):
-    try:
-        if os.path.exists(path) and os.path.getsize(path) >= LOG_ROTATE_SIZE:
-            bak = path + ".1"
-            try:
-                if os.path.exists(bak): os.remove(bak)
-            except Exception: pass
-            os.rename(path, bak)
-    except Exception: pass
-def _append_log_file(line: str):
-    if not AOA_LOG_FILE_ENABLE: return
-    try:
-        _rotate_log_if_needed(LOG_FILE_PATH)
-        with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception: pass
-
-# Pequeno bus para empurrar logs/eventos para o painel
-class EventBus:
-    def __init__(self, max_events=4000):
-        self.events = deque(maxlen=max_events)
-        self.subs = set()
-        self.lock = threading.Lock()
-    def publish(self, line: str):
-        with self.lock:
-            self.events.append(line)
-            subs = list(self.subs)
-        for q in subs:
-            try: q.put_nowait(line)
-            except Exception: pass
-    def subscribe(self):
-        q = queue.Queue(maxsize=1000)
-        with self.lock: self.subs.add(q)
-        return q
-    def unsubscribe(self, q):
-        with self.lock:
-            if q in self.subs: self.subs.remove(q)
-
-BUS = EventBus()
-
-def log_rxtx(kind: str, text: str, nbytes: int | None = None):
-    if not AOA_LOG_ENABLE: return
-    core = f"{_ts()} [{kind}] {text}"
-    if nbytes is not None: core = f"{core} (len={nbytes}B)"
-    line_console = _truncate_for_console(core)
-    print(line_console, flush=True)
-    _append_log_file(core)
-    BUS.publish(core)
-
-# =========================
-# I/O e Tuning
-# =========================
-READ_TIMEOUT_MS             = int(os.getenv("AOA_READ_TIMEOUT_MS", "1250"))
-IDLE_SLEEP_SEC              = 0.02
-ACCESSORY_WAIT_TIMEOUT_SEC  = 5.0
-ACCESSORY_WAIT_POLL_SEC     = 0.05
-SCAN_INTERVAL_SEC           = 0.40
-AFTER_ENUMERATION_GRACE     = 1.5
-EARLY_ERROR_GRACE_SEC       = 8.0
-MAX_LINE_LEN                = 4096
-ERROR_COOLDOWN_SEC          = 0.5
-EARLY_EIO_MAX_STRIKES       = 5
-REOPEN_STABILIZE_MS         = 800
-REOPEN_MAX_ATTEMPTS         = 4
-WRITE_TIMEOUT_MS            = 300
-
-# eco opcional (desligado por padrão)
-SEND_BACK_TO_ANDROID        = int(os.getenv("AOA_ECHO_TO_ANDROID", "0")) == 1
-
-# pacing mínimo entre TX (alinha com RN: 40ms por padrão)
-TX_MIN_SPACING_MS           = int(os.getenv("AOA_TX_MIN_SPACING_MS", "40"))
-
-# ===== Robustez extra / Keepalive =====
-# ===== Robustez extra / Keepalive =====
-# ===== Robustez / Keepalive =====
-WRITE_TIMEOUT_STRIKES_LIMIT = int(os.getenv("AOA_WRITE_TIMEOUT_STRIKES", "4"))
-RECLAIM_BACKOFF_SEC         = float(os.getenv("AOA_RECLAIM_BACKOFF_SEC", "0.5"))
-AOA_USB_RESET_ON_STALL      = int(os.getenv("AOA_USB_RESET_ON_STALL", "0")) == 1
-
-# Agora o servidor NÃO inicia polling/keepalive por conta própria
-SERVER_DRIVEN_POLL          = int(os.getenv("AOA_SERVER_DRIVEN_POLL", "0")) == 1
-SERVER_POLL_PERIOD_SEC      = float(os.getenv("AOA_SERVER_POLL_PERIOD_SEC", "1.5"))
-# Mantemos a constante para compat, mas não vamos mais usar keepalive automático
-NO_RX_RENUDGE_SEC           = float(os.getenv("AOA_NO_RX_RENUDGE_SEC", "5.0"))
+AFTER_ENUMERATION_GRACE = 1.5  # delay inicial depois de achar AOA
+POLL_INTERVAL_SEC       = 5.0
 
 
 # =========================
-# UDP (compat ESP32) + Legado
-# =========================
-UDP_BROADCAST_ADDR = ("255.255.255.255", 4210)
-UDP_CLIENT_PORT    = 4211
-UDP_SO_REUSE       = True
-UDP_LABEL          = "CREDITO"
-UDP_GROUP_ID       = os.getenv("AOA_UDP_GROUP", "A")
-UDP_ACK_RETRIES    = 5
-UDP_ACK_TIMEOUT_SEC= 0.25
-
-def make_udp_socket(bind_port=None):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    if UDP_SO_REUSE:
-        try: s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        except Exception: pass
-    if bind_port is not None: s.bind(("", int(bind_port)))
-    s.settimeout(0.0)
-    return s
-
-NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
-def parse_int_from_text(text: str) -> int:
-    if not text: return 0
-    m = NUM_RE.search(text)
-    if not m: return 0
-    raw = m.group(0).replace(",", ".")
-    try: return abs(int(round(float(raw))))
-    except Exception: return 0
-
-def build_esp32_msg(tipo: str, maquina: str, credito: int) -> str:
-    tipo = (tipo or "POS").upper()
-    if tipo not in ("POS", "PIX"): tipo = "POS"
-    maquina = str(maquina).zfill(2)
-    return f"#MSG;Group:{UDP_GROUP_ID};Maquina{tipo}:{maquina};Credito:{int(credito)};*"
-
-def send_credit_udp(sock, tipo, maquina, credito, expect_ack=True, panel=None, session=None):
-    message = build_esp32_msg(tipo, maquina, credito).encode("utf-8")
-    expected_ack = f"ACK{UDP_GROUP_ID}_{maquina}"
-    ok = False
-    prev_timeout = sock.gettimeout()
-    try:
-        for attempt in range(1, UDP_ACK_RETRIES + 1):
-            try:
-                sock.sendto(message, UDP_BROADCAST_ADDR)
-                log_rxtx("UDP-TX", message.decode("utf-8", errors="ignore"))
-                if session is not None:
-                    session["udp_sent"] += 1
-                if not expect_ack:
-                    ok = True; break
-                sock.settimeout(UDP_ACK_TIMEOUT_SEC)
-                got_ack = False
-                while True:
-                    try: data, addr = sock.recvfrom(512)
-                    except socket.timeout: break
-                    txt = data.decode("utf-8", errors="ignore").strip()
-                    log_rxtx("UDP-RX", f"{txt} <- {addr[0]}")
-                    if txt == expected_ack:
-                        got_ack = True
-                        if panel: panel.add_event(f"ACK de {maquina} via {addr[0]}")
-                        break
-                if got_ack:
-                    ok = True; break
-            except Exception as e:
-                if session is not None: session["udp_errs"] += 1
-                if panel: panel.add_event(f"UDP erro (tentativa {attempt}): {e}")
-        return ok
-    finally:
-        try: sock.settimeout(prev_timeout if prev_timeout is not None else 0.0)
-        except Exception: pass
-
-# =========================
-# Persistência de créditos
-# =========================
-CREDITS_FILE = os.path.join(CREDITS_DIR, "credits.json")
-def load_credits_total(default: int = 0) -> int:
-    try:
-        with open(CREDITS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict) and isinstance(data.get("credits_total"), int):
-            return data["credits_total"]
-        if isinstance(data, int): return data
-    except FileNotFoundError: return default
-    except Exception: return default
-    return default
-
-def save_credits_total(value: int):
-    _ensure_dir(CREDITS_DIR)
-    tmp = CREDITS_FILE + ".tmp"
-    data = {"credits_total": int(value), "updated_at": datetime.now().isoformat()}
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f); f.flush(); os.fsync(f.fileno())
-        os.replace(tmp, CREDITS_FILE)
-    finally:
-        try:
-            if os.path.exists(tmp): os.remove(tmp)
-        except Exception: pass
-
-# =========================
-# Painel/Events
-# =========================
-def fmt_dur(seconds: float) -> str:
-    if seconds < 0: seconds = 0
-    td = timedelta(seconds=int(seconds))
-    s = str(td)
-    if s.count(":") == 1: s = "00:" + s
-    elif s.index(":") == 1: s = "0" + s
-    return s
-
-class Panel:
-    def __init__(self, keep=400):
-        self._events = deque(maxlen=keep)
-    def add_event(self, text: str):
-        t = datetime.now().strftime("%H:%M:%S")
-        line = f"[{t}] {text}"
-        self._events.append(line)
-        BUS.publish(f"{_ts()} [EVENT] {line}")
-    @property
-    def events(self): return list(self._events)
-
-# =========================
-# GPIO
-# =========================
-class GpioDriverBase:
-    name = "BASE"
-    def setup(self): ...
-    def pulse(self, count: int, on_ms: int, off_ms: int): ...
-    def cleanup(self): ...
-
-class GpioSUNXI(GpioDriverBase):
-    name = "SUNXI(OPi.GPIO/terindo)"
-    def __init__(self, pin_name: str = "PC9"):
-        self.pin = os.getenv("SUNXI_PIN", pin_name)
-        self.GPIO = None
-    def setup(self):
-        try:
-            import OPi.GPIO as GPIO
-        except ImportError:
-            import OrangePi.GPIO as GPIO
-        self.GPIO = GPIO
-        try:
-            if hasattr(self.GPIO, "setwarnings"): self.GPIO.setwarnings(False)
-        except Exception: pass
-        if not hasattr(self.GPIO, "SUNXI"):
-            raise RuntimeError("Seu OPi.GPIO não expõe GPIO.SUNXI; atualize.")
-        if hasattr(self.GPIO, "setmode"):
-            self.GPIO.setmode(self.GPIO.SUNXI)
-        else:
-            raise RuntimeError("Seu OPi.GPIO não expõe setmode().")
-        initial_low = getattr(self.GPIO, "LOW", 0)
-        self.GPIO.setup(self.pin, self.GPIO.OUT, initial=initial_low)
-    def pulse(self, count: int, on_ms: int, off_ms: int):
-        if count <= 0: return
-        count = min(count, 1000)
-        high = getattr(self.GPIO, "HIGH", 1)
-        low  = getattr(self.GPIO, "LOW", 0)
-        for _ in range(count):
-            self.GPIO.output(self.pin, high); time.sleep(on_ms/1000.0)
-            self.GPIO.output(self.pin, low);  time.sleep(off_ms/1000.0)
-    def cleanup(self):
-        try:
-            if self.GPIO:
-                try: self.GPIO.output(self.pin, getattr(self.GPIO, "LOW", 0))
-                except Exception: pass
-                try: self.GPIO.cleanup(self.pin)
-                except TypeError: self.GPIO.cleanup()
-        except Exception: pass
-
-def init_gpio(panel: Panel) -> GpioDriverBase:
-    try:
-        drv = GpioSUNXI()
-        drv.setup()
-        panel.add_event(f"GPIO backend: {drv.name}")
-        return drv
-    except ModuleNotFoundError:
-        panel.add_event("terindo.gpio/OPi.GPIO não instalada; GPIO desativado.")
-    except Exception as e:
-        panel.add_event(f"GPIO: falha na init: {e}")
-    return GpioDriverBase()
-
-# =========================
-# USB helpers (se pyusb não disponível, AOA fica inativo)
-# =========================
-def is_accessory(dev) -> bool:
-    try: return (dev.idVendor == AOA_VENDOR_GOOGLE) and (dev.idProduct in AOA_PIDS)
-    except Exception: return False
-
-def list_all_devices():
-    if not HAVE_USB: return []
-    try: return list(usb.core.find(find_all=True)) or []
-    except Exception: return []
-
-def find_accessory_device():
-    if not HAVE_USB: return None
-    try:
-        devs = list(usb.core.find(find_all=True, idVendor=AOA_VENDOR_GOOGLE))
-        for d in devs:
-            if d.idProduct in AOA_PIDS: return d
-    except Exception: pass
-    return None
-
-def find_any_android_like():
-    if not HAVE_USB: return None
-    for d in list_all_devices():
-        try:
-            if is_accessory(d): continue
-            if getattr(d, "bDeviceClass", 0) == 9: continue  # hubs
-            return d
-        except Exception: continue
-    return None
-
-def aoa_switch_to_accessory(dev):
-    # GET_PROTOCOL
-    try:
-        _ = dev.ctrl_transfer(0xC0, AOA_GET_PROTOCOL, 0, 0, 2)
-    except Exception:
-        pass
-    # idents (terminadas em NUL conforme spec)
-    for idx, val in (
-        (AOA_STR_MANUFACTURER, MANUFACTURER),
-        (AOA_STR_MODEL,        MODEL),
-        (AOA_STR_DESCRIPTION,  DESCRIPTION),
-        (AOA_STR_VERSION,      VERSION),
-        (AOA_STR_URI,          URI),
-        (AOA_STR_SERIAL,       SERIAL),
-    ):
-        try:
-            dev.ctrl_transfer(0x40, AOA_SEND_IDENT, 0, idx, val.encode("utf-8") + b"\x00")
-        except Exception:
-            pass
-    # START
-    try:
-        dev.ctrl_transfer(0x40, AOA_START, 0, 0, None)
-    except Exception:
-        pass
-
-def wait_for_accessory(timeout_sec=ACCESSORY_WAIT_TIMEOUT_SEC):
-    t0 = time.time()
-    while time.time() - t0 < timeout_sec:
-        acc = find_accessory_device()
-        if acc is not None: return acc
-        time.sleep(ACCESSORY_WAIT_POLL_SEC)
-    return None
-
-def _detach_all_kernel_drivers(dev):
-    try:
-        cfg = dev.get_active_configuration()
-    except Exception:
-        try:
-            dev.set_configuration(); cfg = dev.get_active_configuration()
-        except Exception:
-            return
-    for intf in cfg:
-        try:
-            if dev.is_kernel_driver_active(intf.bInterfaceNumber):
-                try: dev.detach_kernel_driver(intf.bInterfaceNumber)
-                except Exception: pass
-        except Exception:
-            try: dev.detach_kernel_driver(intf.bInterfaceNumber)
-            except Exception: pass
-
-def _pick_bulk_pair(intf):
-    ep_in, ep_out = None, None
-    for ep in intf:
-        if usb.util.endpoint_type(ep.bmAttributes) != usb.util.ENDPOINT_TYPE_BULK: continue
-        if usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_IN:
-            if ep_in is None: ep_in = ep
-        else:
-            if ep_out is None: ep_out = ep
-    return ep_in, ep_out
-
-def claim_bulk_endpoints(dev, retries=4, retry_sleep=0.25):
-    try: dev.set_configuration()
-    except Exception: pass
-    last_err = None
-    for attempt in range(1, retries+1):
-        try:
-            _detach_all_kernel_drivers(dev)
-            cfg = dev.get_active_configuration()
-            # prefer protocol != 1
-            for stage in (1, 2):
-                for intf in cfg:
-                    try: proto = getattr(intf, "bInterfaceProtocol", 0)
-                    except Exception: proto = 0
-                    if stage == 1 and proto == 1: continue
-                    ep_in, ep_out = _pick_bulk_pair(intf)
-                    if ep_in and ep_out:
-                        try: usb.util.claim_interface(dev, intf.bInterfaceNumber)
-                        except usb.core.USBError as e:
-                            if getattr(e, "errno", None) in (16,):
-                                last_err = e; time.sleep(retry_sleep * attempt); continue
-                            else:
-                                raise
-                        return intf.bInterfaceNumber, ep_in, ep_out
-            raise RuntimeError("Endpoints IN/OUT não encontrados")
-        except usb.core.USBError as e:
-            last_err = e; time.sleep(retry_sleep * attempt)
-        except Exception as e:
-            last_err = e; break
-    if last_err: raise last_err
-    raise RuntimeError("Falha ao reivindicar interface")
-
-# =========================
-# Serviço AOA/USB em thread
+# Serviço AOA em thread
 # =========================
 class AOAService(threading.Thread):
-    def __init__(self):
+    def __init__(self, max_logs=1000):
         super().__init__(daemon=True)
-        self.panel = Panel()
-        self.gpio = init_gpio(self.panel)
-        self.stop_evt = threading.Event()
-        self.global_state = {
-            "status": "Aguardando",
-            "usb_vidpid": "--",
-            "uptime": 0.0,
-            "rx_msgs": 0, "rx_bytes": 0,
-            "tx_msgs": 0, "tx_bytes": 0,
-            "max_len": 0,
-            "last_msg": "",
-            "udp_sent": 0, "udp_errs": 0,
-            "udp_ack_ok": 0, "udp_ack_fail": 0,
-            "gpio_pulses": 0, "gpio_errs": 0,
-            "gpio_backend": getattr(self.gpio, "name", "-"),
-            "credits_total": load_credits_total(0),
-            "last_credit": 0,
-            "have_usb": HAVE_USB,
-        }
         self.lock = threading.Lock()
 
-    def run(self):
-        self.panel.add_event(f"Iniciando serviço. Total persistido: {self.global_state['credits_total']}")
-        while not self.stop_evt.is_set():
-            if not HAVE_USB:
-                self._idle_draw()
-                time.sleep(SCAN_INTERVAL_SEC)
-                continue
+        # estado USB
+        self.dev = None
+        self.intf_no = None
+        self.ep_in = None
+        self.ep_out = None
 
-            acc = find_accessory_device()
-            if acc is None:
-                cand = find_any_android_like()
-                if cand is not None:
-                    try: aoa_switch_to_accessory(cand)
-                    except Exception as e:
-                        self.panel.add_event(f"Erro iniciar AOA: {e}")
-                        time.sleep(ERROR_COOLDOWN_SEC)
-                        continue
-                    acc = wait_for_accessory()
-            if acc is None:
-                self._idle_draw()
-                time.sleep(SCAN_INTERVAL_SEC)
-                continue
+        # estado de handshake
+        self.hs1_done = False
+        self.hs2_done = False
 
-            try:
-                self._serve_accessory(acc)
-                self.panel.add_event("Conexão finalizada")
-            except Exception as e:
-                self.panel.add_event(f"Exceção sessão AOA: {e}")
-                traceback.print_exc()
-            time.sleep(SCAN_INTERVAL_SEC)
+        # polling
+        self.last_poll_ts = 0.0
+        self.poll_count = 0
+        self.no_dev_scan_count = 0   # contador de scans sem device
 
-    def _idle_draw(self):
+        # contador de RX
+        self.rx_count = 0
+
+        # tempos
+        self.start_time = time.time()      # uptime do servidor
+        self.aoa_connect_time = None       # uptime da conexão AOA
+
+        # status / info
+        self.status_text = "Procurando"
+        self.usb_id = "--"
+        self.device_info = {"manufacturer": "", "product": "", "serial": ""}
+
+        # últimos TX/RX
+        self.last_tx = ""
+        self.last_rx = ""
+
+        # logs
+        self.logs = deque(maxlen=max_logs)
+
+        # fila TX manual
+        self.tx_queue = queue.Queue()
+
+        # buffer RX de linha
+        self.rx_buffer = bytearray()
+
+        self.last_usb_snapshot = set()
+
+        # --- GPIO / créditos ---
+        self.gpio_chip = None
+        self.gpio_line = None
+        self.gpio_ok = False
+        self.gpio_backend = "desativado"
+        self.credit_log_path = "creditos_log.csv"
+
+        # totais de créditos por máquina: {maquina_id: soma_creditocredito}
+        self.credit_totals = {}
+
+        self._init_gpio()
+
+    # ---------- logging ----------
+    def _log(self, kind, msg):
+        line = f"[{ts()}] [{kind}] {msg}"
         with self.lock:
-            self.global_state["status"] = "Aguardando"
-            self.global_state["uptime"] = 0.0
+            self.logs.append(line)
+        print(line, flush=True)
 
-    def _serve_accessory(self, dev):
-        time.sleep(AFTER_ENUMERATION_GRACE)
-        try:
-            m = usb.util.get_string(dev, dev.iManufacturer) or ""
-            p = usb.util.get_string(dev, dev.iProduct) or ""
-            s = usb.util.get_string(dev, dev.iSerialNumber) or ""
-            usb_id = f"{dev.idVendor:04x}:{dev.idProduct:04x}"
-        except Exception:
-            m = p = s = ""
-            usb_id = f"{dev.idVendor:04x}:{dev.idProduct:04x}"
-
-        session = {
-            "t_start": time.time(),
-            "rx_msgs": 0, "rx_bytes": 0,
-            "tx_msgs": 0, "tx_bytes": 0,
-            "max_len": 0, "last_msg": "",
-            "udp_sent": 0, "udp_errs": 0,
-            "udp_ack_ok": 0, "udp_ack_fail": 0,
-            "gpio_pulses": 0, "gpio_errs": 0,
-            "last_credit": 0,
-            "eio_strikes": 0, "reenum_attempts": 0,
-        }
-
-        udp_sock = make_udp_socket(bind_port=UDP_CLIENT_PORT)
-        try:
-            intf_no, ep_in, ep_out = claim_bulk_endpoints(dev)
-        except Exception as e:
-            self.panel.add_event(f"ERRO endpoints: {e}")
-            time.sleep(ERROR_COOLDOWN_SEC)
+    # ---------- GPIO ----------
+    def _init_gpio(self):
+        if gpiod is None:
+            self._log("GPIO", "libgpiod não instalada. Rode: pip3 install gpiod")
+            self.gpio_ok = False
+            self.gpio_backend = "não instalado"
             return
 
-        grace_until = time.time() + EARLY_ERROR_GRACE_SEC
-        buffer = bytearray()
-        self.panel.add_event(f"Conectado AOA {usb_id} Manuf='{m}' Prod='{p}' SN='{s}'")
-
-        def write_bytes(b: bytes):
-            try:
-                n = dev.write(ep_out.bEndpointAddress, b, timeout=WRITE_TIMEOUT_MS)
-                session["tx_msgs"] += 1; session["tx_bytes"] += n
-                return n
-            except Exception as e:
-                self.panel.add_event(f"ERRO USB write: {e}")
-                try: usb.util.clear_halt(dev, ep_out.bEndpointAddress)
-                except Exception: pass
-                time.sleep(ERROR_COOLDOWN_SEC)
-                return 0
-
-        def write_line(text: str, tag: str = ""):
-            if not text.endswith("\n"): text = text + "\n"
-            n = write_bytes(text.encode("utf-8"))
-            if n > 0: log_rxtx("AOA-TX", f"{text.rstrip()}{(' ' + tag) if tag else ''}", nbytes=n)
-
-        # ---------- Helpers de STAT ----------
-        def build_stat_line():
-            m1 = str(session.get("last_credit", 0))
-            m2 = str(self.global_state.get("credits_total", 0))
-            cfg = f"ACK:{session.get('udp_ack_ok',0)}/{session.get('udp_ack_fail',0)}"
-            m3 = "AOA"
-            return f"STAT;OK;{m1};{m2};{cfg};{m3}"
-
-        def send_stat(tag="[STAT]"):
-            write_line(build_stat_line(), tag=tag)
-
-        # --- estado do handshake para "auto-nudge" ---
-        hs2_done = False
-        last_invite_ts = 0.0
-        invite_retries = 0
-        INVITE_INTERVAL = 1.5  # s
-        INVITE_MAX = 6         # número de nudges
-
-        # HELLO: ping + STAT + convite HS2 ao conectar
         try:
-            time.sleep(0.3)
-            write_line("ping")
-            send_stat(tag="[STAT/HELLO]")
-            write_line(HS2_INVITE_TOKEN)  # "$;854751;$"
-            last_invite_ts = time.time()
-            invite_retries = 1
-        except Exception:
-            pass
+            chip = gpiod.Chip(CHIP)
+            line = chip.get_line(PULSO_PIN)
+            line.request(
+                consumer="rn-credit",
+                type=gpiod.LINE_REQ_DIR_OUT,
+                default_val=0
+            )
+            self.gpio_chip = chip
+            self.gpio_line = line
+            self.gpio_ok = True
+            self.gpio_backend = f"gpiod ({CHIP}, line {PULSO_PIN} / PC9)"
+            self._log("GPIO", f"GPIO backend: {self.gpio_backend}")
+        except Exception as e:
+            self._log("GPIO", f"GPIO: falha na inicialização gpiod: {e}")
+            self.gpio_ok = False
+            self.gpio_backend = f"erro: {e}"
 
-        while not self.stop_evt.is_set():
-            with self.lock:
-                self.global_state.update({
-                    "status": "Conectado",
-                    "usb_vidpid": usb_id,
-                    "uptime": time.time() - session["t_start"],
-                    "rx_msgs": session["rx_msgs"], "rx_bytes": session["rx_bytes"],
-                    "tx_msgs": session["tx_msgs"], "tx_bytes": session["tx_bytes"],
-                    "max_len": session["max_len"], "last_msg": session["last_msg"],
-                    "udp_sent": session["udp_sent"], "udp_errs": session["udp_errs"],
-                    "udp_ack_ok": session["udp_ack_ok"], "udp_ack_fail": session["udp_ack_fail"],
-                    "gpio_pulses": session["gpio_pulses"], "gpio_errs": session["gpio_errs"],
-                    "last_credit": session["last_credit"],
-                })
+    def _registrar_credito_em_arquivo(self, maquina_id, creditomaquina, creditocredito):
+        agora = ts()
+        linha = f"{agora};{maquina_id};{creditomaquina};{creditocredito}\n"
+        try:
+            with open(self.credit_log_path, "a", encoding="utf-8") as f:
+                f.write(linha)
+            self._log("CREDIT", f"Registrado em arquivo: {linha.strip()}")
+        except Exception as e:
+            self._log("CREDIT", f"Erro ao gravar arquivo de créditos: {e}")
 
-            # Reenvia convite para HS#2 enquanto o app não responder com HS2
-            if not hs2_done and invite_retries < INVITE_MAX:
-                if (time.time() - last_invite_ts) >= INVITE_INTERVAL:
-                    send_stat(tag="[STAT/NUDGE]")
-                    write_line(HS2_INVITE_TOKEN)
-                    last_invite_ts = time.time()
-                    invite_retries += 1
+        # Atualiza totais por máquina
+        with self.lock:
+            atual = self.credit_totals.get(maquina_id, 0)
+            self.credit_totals[maquina_id] = atual + creditocredito
 
+    def _pulsar_creditos_gpio(self, creditocredito: int):
+        if not self.gpio_ok or self.gpio_line is None:
+            self._log("GPIO", f"Pulso de crédito ignorado, GPIO não disponível (creditocredito={creditocredito})")
+            return
+
+        try:
+            for i in range(creditocredito):
+                self.gpio_line.set_value(1)
+                time.sleep(0.05)
+                self.gpio_line.set_value(0)
+                time.sleep(0.05)
+            self._log("GPIO", f"Pulsos de crédito enviados: {creditocredito}x")
+        except Exception as e:
+            self._log("GPIO", f"Erro ao gerar pulsos de crédito: {e}")
+
+    def _handle_credit_message(self, msg: str):
+        """
+        Exemplo de msg: "#;7C48247;02;002;0;*"
+        parts[0] = "#"
+        parts[1] = maquina_id (7C48247)
+        parts[2] = creditomaquina ("02")
+        parts[3] = creditocredito ("002")
+        """
+        parts = msg.split(";")
+        if len(parts) < 5:
+            self._log("CREDIT", f"Mensagem de crédito inválida: {msg}")
+            return
+
+        try:
+            maquina_id = parts[1]
+            creditomaquina = int(parts[2])
+            creditocredito = int(parts[3])
+        except Exception as e:
+            self._log("CREDIT", f"Falha ao parsear mensagem de crédito '{msg}': {e}")
+            return
+
+        self._log("CREDIT", f"MAQUINA={maquina_id} CREDITO_MAQ={creditomaquina} CREDITO={creditocredito}")
+
+        # 1) Salva em arquivo
+        self._registrar_credito_em_arquivo(maquina_id, creditomaquina, creditocredito)
+
+        # 2) Gera pulsos na GPIO
+        self._pulsar_creditos_gpio(creditocredito)
+
+    # =========================
+    # Debug de devices
+    # =========================
+    def debug_list_all_devices(self):
+        devs = usb.core.find(find_all=True)
+        snapshot = set()
+        lines = []
+
+        for d in devs:
             try:
-                read_size = max(getattr(ep_in, "wMaxPacketSize", 0) or 0, 64)
-                data = dev.read(ep_in.bEndpointAddress, read_size, timeout=READ_TIMEOUT_MS)
-                if data:
-                    session["eio_strikes"] = 0
-                    buffer.extend(bytearray(data))
-                    while b'\n' in buffer:
-                        line, _, buffer = buffer.partition(b'\n')
-                        if len(line) > MAX_LINE_LEN: line = line[:MAX_LINE_LEN]
-                        try: msg = line.decode('utf-8', errors='ignore').strip()
-                        except Exception: msg = ""
-                        session["rx_msgs"] += 1; session["rx_bytes"] += len(line)+1
-                        if len(line) > session["max_len"]: session["max_len"] = len(line)
-                        session["last_msg"] = msg
-                        log_rxtx("AOA-RX", msg, nbytes=len(line)+1)
+                vid = d.idVendor
+                pid = d.idProduct
+                vidpid = f"{vid:04x}:{pid:04x}"
+            except Exception:
+                vid = pid = None
+                vidpid = "????:????"
 
-                        # 1) PING -> PONG
-                        if msg.lower() == "ping":
-                            write_line("pong")
-                            continue
+            snapshot.add(vidpid)
 
-                        # 2) HANDSHAKE FASE 1 (compat)
-                        if msg == HS1_TOKEN:
-                            send_stat(tag="[STAT/HS1]")
-                            write_line(HS2_INVITE_TOKEN)
-                            last_invite_ts = time.time()
-                            continue
+            if self.is_accessory(d):
+                tag = "AOA"
+            elif vid == ANDROID_VENDOR and pid in ANDROID_PIDS:
+                tag = "ANDROID_BASE"
+            else:
+                tag = "OUTRO"
 
-                        # 3) HANDSHAKE FASE 2
-                        if msg == HS2_TOKEN:
-                            hs2_done = True
-                            send_stat(tag="[STAT/HS2]")
-                            write_line(READY_LINE)
-                            continue
+            lines.append(f"{tag} {vidpid}")
 
-                        # 4) POLLING
-                        if msg == POLL_TOKEN:
-                            send_stat(tag="[STAT/POLL]")
-                            continue
+        if snapshot != self.last_usb_snapshot:
+            self.last_usb_snapshot = snapshot
+            if lines:
+                self._log("USB", "Scan devices: " + ", ".join(lines))
+            else:
+                self._log("USB", "Scan devices: <nenhum dispositivo>")
 
-                        # 5) Eco
-                        if SEND_BACK_TO_ANDROID:
-                            write_line(f"eco:{msg}")
+    # =========================
+    # Descoberta de devices
+    # =========================
+    def is_accessory(self, dev):
+        try:
+            return dev.idVendor == AOA_VENDOR and dev.idProduct in AOA_PIDS
+        except Exception:
+            return False
 
-                        # 6) Protocolo POS/PIX
-                        parts = [p.strip() for p in msg.split(";") if p.strip()]
-                        cmd = None
-                        if len(parts) == 3:
-                            tipo, maq, cred = parts[0].upper(), parts[1], parts[2]
-                            cmd = (tipo, maq, cred)
-                        elif len(parts) == 2:
-                            tipo, maq, cred = "POS", parts[0], parts[1]
-                            cmd = (tipo, maq, cred)
-                        if cmd and cmd[1].isdigit():
-                            tipo, maq, cred_s = cmd
-                            try: cred = abs(int(round(float(cred_s.replace(",", ".")))))
-                            except Exception: cred = None
-                            if cred is not None:
-                                ok = send_credit_udp(udp_sock, tipo, str(maq).zfill(2), cred, True, self.panel, session)
-                                if ok:
-                                    session["udp_ack_ok"] += 1; confirm = f"ok:{tipo}:{str(maq).zfill(2)}:{cred}"
-                                else:
-                                    session["udp_ack_fail"] += 1; confirm = f"nok:{tipo}:{str(maq).zfill(2)}:{cred}"
-                                write_line(confirm)
-                                new_total = self.global_state.get("credits_total", 0) + int(cred)
-                                with self.lock:
-                                    self.global_state["credits_total"] = new_total
-                                save_credits_total(new_total)
-                                session["last_credit"] = int(cred)
-                                self.panel.add_event(f"[UDP→ESP32] {tipo}:{str(maq).zfill(2)} crédito {cred} (TOTAL={new_total})")
-                                continue
+    def find_accessory(self):
+        try:
+            devs = usb.core.find(find_all=True)
+        except Exception as e:
+            self._log("USB", f"find_accessory: erro ao varrer USB: {e}")
+            return None
 
-                        # 7) Legado: broadcast simples
-                        try:
-                            payload = f"{UDP_LABEL}:{msg}".encode("utf-8")
-                            udp_sock.sendto(payload, UDP_BROADCAST_ADDR)
-                            log_rxtx("UDP-TX", f"{UDP_LABEL}:{msg}")
-                            session["udp_sent"] += 1
-                        except Exception as e:
-                            session["udp_errs"] += 1
-                            self.panel.add_event(f"UDP erro: {e}")
+        if not devs:
+            return None
 
-                        # 8) Legado: GPIO + acumulador numérico
-                        try:
-                            n = parse_int_from_text(msg)
-                            session["last_credit"] = n
-                            if n > 0 and hasattr(self.gpio, "pulse"):
-                                new_total = self.global_state.get("credits_total", 0) + n
-                                with self.lock:
-                                    self.global_state["credits_total"] = new_total
-                                save_credits_total(new_total)
-                                self.panel.add_event(f"Crédito +{n} (TOTAL={new_total})")
-                                self.gpio.pulse(n, int(os.getenv("PULSE_ON_MS", "150")), int(os.getenv("PULSE_OFF_MS", "150")))
-                                session["gpio_pulses"] += n
-                        except Exception as e:
-                            session["gpio_errs"] += 1
-                            self.panel.add_event(f"GPIO erro: {e}")
+        for d in devs:
+            try:
+                if self.is_accessory(d):
+                    return d
+            except Exception:
+                continue
 
+        return None
+
+    def find_android_base(self):
+        devs = usb.core.find(find_all=True)
+        if not devs:
+            return None
+        for d in devs:
+            try:
+                if d.idVendor != ANDROID_VENDOR:
+                    continue
+                if d.idProduct not in ANDROID_PIDS:
+                    continue
+                if self.is_accessory(d):
+                    continue
+                return d
+            except Exception:
+                continue
+        return None
+
+    def aoa_switch_to_accessory(self, dev, retry_delay=0.5):
+        # 1) GET_PROTOCOL
+        while True:
+            try:
+                proto = dev.ctrl_transfer(0xC0, AOA_GET_PROTOCOL, 0, 0, 2)
+                if len(proto) >= 2:
+                    proto_ver = proto[0] | (proto[1] << 8)
+                else:
+                    proto_ver = 0
+
+                self._log("AOA", f"GET_PROTOCOL -> {bytes(proto)} (v={proto_ver})")
+
+                if proto_ver >= 1:
+                    break
+                else:
+                    self._log("AOA", "GET_PROTOCOL retornou versão inválida, tentando de novo...")
             except usb.core.USBError as e:
                 s = str(e).lower()
                 errno = getattr(e, "errno", None)
-                if errno in (110,) or ("timed out" in s):
-                    continue
+                self._log("AOA", f"GET_PROTOCOL falhou: {e} (tentando novamente)")
                 if errno == 19 or "no such device" in s:
-                    self.panel.add_event("Dispositivo removido (ENODEV).")
-                    time.sleep(ERROR_COOLDOWN_SEC)
+                    self._log("AOA", "Dispositivo base sumiu durante GET_PROTOCOL, abortando handshake.")
                     return
-                if errno == 5 or "input/output error" in s:
-                    session["eio_strikes"] = session.get("eio_strikes", 0) + 1
-                    if time.time() < grace_until or session["eio_strikes"] <= EARLY_EIO_MAX_STRIKES:
-                        self.panel.add_event("EIO; limpando halt e aguardando...")
-                        try: usb.util.clear_halt(dev, ep_in.bEndpointAddress)
-                        except Exception: pass
-                        try: usb.util.clear_halt(dev, ep_out.bEndpointAddress)
-                        except Exception: pass
-                        time.sleep(0.2); continue
-                    self.panel.add_event("EIO persistente; encerrando sessão.")
-                    time.sleep(ERROR_COOLDOWN_SEC); return
-                self.panel.add_event(f"USB read erro: {e}")
-                time.sleep(ERROR_COOLDOWN_SEC); return
             except Exception as e:
-                self.panel.add_event(f"Loop erro: {e}")
-                time.sleep(ERROR_COOLDOWN_SEC); return
-        # fim while
-        try: usb.util.release_interface(dev, intf_no)
-        except Exception: pass
-        try: usb.util.dispose_resources(dev)
-        except Exception: pass
+                self._log("AOA", f"GET_PROTOCOL erro genérico: {e} (tentando novamente)")
+            time.sleep(retry_delay)
 
-    # ===== APIs auxiliares públicas =====
-    def get_status(self):
-        with self.lock:
-            st = dict(self.global_state)
-        # últimos eventos “genéricos”
-        st["events"] = self.panel.events[-200:]
-        # últimos RX/TX filtrados do BUS
+        # 2) Envia os IDENTs
+        idents = [
+            (AOA_STR_MANUFACTURER, MANUFACTURER),
+            (AOA_STR_MODEL,        MODEL),
+            (AOA_STR_DESCRIPTION,  DESCRIPTION),
+            (AOA_STR_VERSION,      VERSION),
+            (AOA_STR_URI,          URI),
+            (AOA_STR_SERIAL,       SERIAL),
+        ]
+        for idx, val in idents:
+            try:
+                dev.ctrl_transfer(
+                    0x40, AOA_SEND_IDENT, 0, idx,
+                    val.encode("utf-8") + b"\x00"
+                )
+                self._log("AOA", f"IDENT idx={idx} '{val}' OK")
+            except Exception as e:
+                self._log("AOA", f"IDENT idx={idx} '{val}' ERRO: {e}")
+
+        # 3) START
         try:
-            tags = ("[AOA-RX]", "[AOA-TX]", "[UDP-RX]", "[UDP-TX]")
-            filt = [ln for ln in list(BUS.events)[-2000:] if any(t in ln for t in tags)]
-            st["rxtx"] = filt[-400:]
+            dev.ctrl_transfer(0x40, AOA_START, 0, 0, None)
+            self._log("AOA", "START enviado (Android deve reenumerar em modo AOA)")
+        except Exception as e:
+            self._log("AOA", f"AOA_START falhou: {e}")
+            return
+
+        try:
+            usb.util.dispose_resources(dev)
         except Exception:
-            st["rxtx"] = []
-        return st
+            pass
 
-    def add_manual_credit(self, tipo, maquina, credito, expect_ack=True):
-        sock = make_udp_socket(bind_port=UDP_CLIENT_PORT)
-        session = {"udp_sent":0, "udp_errs":0, "udp_ack_ok":0, "udp_ack_fail":0}
-        ok = send_credit_udp(sock, tipo, maquina, int(credito), expect_ack=expect_ack, panel=self.panel, session=session)
-        if ok:
-            with self.lock:
-                new_total = self.global_state.get("credits_total", 0) + int(credito)
-                self.global_state["credits_total"] = new_total
-            save_credits_total(new_total)
-            self.panel.add_event(f"[MANUAL] {tipo}:{maquina} crédito {credito} (TOTAL={new_total})")
-        return ok, session
+        # 5) Espera novo device AOA
+        self._log("AOA", "Aguardando reenumeração para modo AOA (18d1:2d0x)...")
 
-    def gpio_test(self, pulses=1, on_ms=150, off_ms=150):
+        for i in range(60):
+            time.sleep(0.5)
+            acc = self.find_accessory()
+            if acc is None:
+                continue
+
+            self._log("INFO", "Accessory AOA encontrado após START, conectando...")
+
+            self.dev = acc
+            self.intf_no = None
+            self.ep_in = self.ep_out = None
+            self.hs1_done = False
+            self.hs2_done = False
+            self.rx_buffer.clear()
+
+            time.sleep(AFTER_ENUMERATION_GRACE)
+
+            try:
+                intf_no, ep_in, ep_out = self.claim_bulk_endpoints(self.dev)
+                usb_id = f"{self.dev.idVendor:04x}:{self.dev.idProduct:04x}"
+
+                try:
+                    m = usb.util.get_string(self.dev, self.dev.iManufacturer) or ""
+                except Exception:
+                    m = ""
+                try:
+                    p = usb.util.get_string(self.dev, self.dev.iProduct) or ""
+                except Exception:
+                    p = ""
+                try:
+                    s = usb.util.get_string(self.dev, self.dev.iSerialNumber) or ""
+                except Exception:
+                    s = ""
+
+                with self.lock:
+                    self.intf_no = intf_no
+                    self.ep_in = ep_in
+                    self.ep_out = ep_out
+                    self.usb_id = usb_id
+                    self.device_info = {"manufacturer": m, "product": p, "serial": s}
+                    self.status_text = "Conectado"
+                    self.aoa_connect_time = time.time()
+                    self.rx_count = 0
+                    self.poll_count = 0
+                    self.credit_totals = {}
+
+                self._log("INFO", f"Conectado AOA {usb_id} (pós-START)")
+                return
+
+            except Exception as e:
+                msg = str(e).lower()
+                if "no such device" in msg or getattr(e, "errno", None) == 19:
+                    self._log("WARN", f"Accessory sumiu durante claim_bulk_endpoints (pós-START): {e}")
+                else:
+                    self._log("ERRO", f"claim_bulk_endpoints (pós-START): {e}")
+
+                try:
+                    if self.intf_no is not None:
+                        usb.util.release_interface(self.dev, self.intf_no)
+                except Exception:
+                    pass
+                try:
+                    usb.util.dispose_resources(self.dev)
+                except Exception:
+                    pass
+
+                self.dev = None
+                self.intf_no = None
+                self.ep_in = self.ep_out = None
+                with self.lock:
+                    self.status_text = "Procurando"
+                    self.aoa_connect_time = None
+                    self.credit_totals = {}
+
+                return
+
+        self._log(
+            "WARN",
+            "Timeout esperando device AOA (18d1:2d0x) após START."
+        )
+
+    # =========================
+    # USB helpers
+    # =========================
+    def _detach_all_kernel_drivers(self, dev):
         try:
-            if hasattr(self.gpio, "pulse"):
-                self.gpio.pulse(int(pulses), int(on_ms), int(off_ms))
-                self.panel.add_event(f"GPIO teste: {pulses} pulsos")
-                return True
+            cfg = dev.get_active_configuration()
+        except Exception:
+            try:
+                dev.set_configuration()
+                cfg = dev.get_active_configuration()
+            except Exception:
+                return
+        for intf in cfg:
+            try:
+                if dev.is_kernel_driver_active(intf.bInterfaceNumber):
+                    try:
+                        dev.detach_kernel_driver(intf.bInterfaceNumber)
+                    except Exception:
+                        pass
+            except Exception:
+                try:
+                    dev.detach_kernel_driver(intf.bInterfaceNumber)
+                except Exception:
+                    pass
+
+    def _pick_bulk_pair(self, intf):
+        ep_in, ep_out = None, None
+        for ep in intf:
+            if usb.util.endpoint_type(ep.bmAttributes) != usb.util.ENDPOINT_TYPE_BULK:
+                continue
+            if usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_IN:
+                if ep_in is None:
+                    ep_in = ep
+            else:
+                if ep_out is None:
+                    ep_out = ep
+        return ep_in, ep_out
+
+    def claim_bulk_endpoints(self, dev, retries=4, retry_sleep=0.25):
+        try:
+            dev.set_configuration()
+        except Exception:
+            pass
+
+        last_err = None
+        for attempt in range(1, retries + 1):
+            try:
+                self._detach_all_kernel_drivers(dev)
+                cfg = dev.get_active_configuration()
+
+                for stage in (1, 2):
+                    for intf in cfg:
+                        try:
+                            proto = getattr(intf, "bInterfaceProtocol", 0)
+                        except Exception:
+                            proto = 0
+
+                        if stage == 1 and proto == 1:
+                            continue
+
+                        ep_in, ep_out = self._pick_bulk_pair(intf)
+                        if ep_in and ep_out:
+                            try:
+                                usb.util.claim_interface(dev, intf.bInterfaceNumber)
+                            except usb.core.USBError as e:
+                                if getattr(e, "errno", None) in (16,):  # EBUSY
+                                    last_err = e
+                                    time.sleep(retry_sleep * attempt)
+                                    continue
+                                else:
+                                    raise
+                            return intf.bInterfaceNumber, ep_in, ep_out
+
+                raise RuntimeError("Endpoints IN/OUT não encontrados")
+            except usb.core.USBError as e:
+                last_err = e
+                time.sleep(retry_sleep * attempt)
+            except Exception as e:
+                last_err = e
+                break
+
+        if last_err:
+            raise last_err
+        raise RuntimeError("Falha ao reivindicar interface")
+
+    # =========================
+    # safe_write
+    # =========================
+    def safe_write(self, label, payload):
+        with self.lock:
+            dev = self.dev
+            ep_out = self.ep_out
+        if dev is None or ep_out is None:
+            self._log("WARN", f"{label}: write sem device/endpoint")
+            return False
+        try:
+            dev.write(ep_out.bEndpointAddress, payload, timeout=1000)
+            txt = payload.decode(errors="ignore").strip()
+            with self.lock:
+                self.last_tx = txt
+            self._log("TX", f"{label}: {txt}")
+            return True
+        except usb.core.USBError as e:
+            self._log("WARN", f"Erro em write ({label}): {e}")
             return False
         except Exception as e:
-            self.panel.add_event(f"GPIO teste erro: {e}")
+            self._log("WARN", f"Erro genérico em write ({label}): {e}")
             return False
 
-    def reset_total(self):
-        with self.lock:
-            self.global_state["credits_total"] = 0
-        save_credits_total(0)
-        self.panel.add_event("TOTAL de créditos resetado p/ 0")
-        return True
+    # =========================
+    # API pública: enviar manual
+    # =========================
+    def send_manual_poll(self):
+        self.tx_queue.put(("MANUAL", POLL_LINE_MANUAL))
 
+    # =========================
+    # Snapshot de status para a UI
+    # =========================
+    def get_status(self):
+        with self.lock:
+            uptime = time.time() - self.start_time
+            aoa_up = time.time() - self.aoa_connect_time if self.aoa_connect_time else 0.0
+            st = {
+                "status": self.status_text,
+                "uptime": uptime,
+                "aoa_uptime": aoa_up,
+                "usb_id": self.usb_id,
+                "manufacturer": self.device_info.get("manufacturer", ""),
+                "product": self.device_info.get("product", ""),
+                "serial": self.device_info.get("serial", ""),
+                "poll_count": self.poll_count,   # não mostramos na UI, mas mantemos
+                "rx_count": self.rx_count,
+                "last_tx": self.last_tx,
+                "last_rx": self.last_rx,
+                "gpio_ok": self.gpio_ok,
+                "gpio_backend": self.gpio_backend,
+                "credit_totals": self.credit_totals.copy(),
+                "logs": list(self.logs),
+            }
+        return st
+
+    # =========================
+    # Loop principal
+    # =========================
+    def run(self):
+        last_scan_log = 0.0
+        no_dev_since = time.time()
+        scan_attempt = 0
+
+        while True:
+            now = time.time()
+
+            # 1) Poll automático
+            if now - self.last_poll_ts >= POLL_INTERVAL_SEC:
+                with self.lock:
+                    self.poll_count += 1
+                    self.last_poll_ts = now
+
+                if self.dev is not None and self.ep_out is not None:
+                    self.safe_write(f"TX_POLL#{self.poll_count}", POLL_LINE_AUTO)
+
+            # 2) Consumir fila de TX manual
+            while True:
+                try:
+                    label, payload = self.tx_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                if self.dev is not None and self.ep_out is not None:
+                    self.safe_write(label, payload)
+                else:
+                    self._log("WARN", f"Descartando TX '{label}' (sem device/endpoint)")
+
+            # 3) Se NÃO temos dev AOA, tentar achar (AOA direto ou base)
+            if self.dev is None:
+                if self.aoa_connect_time is not None:
+                    no_dev_since = now
+                    with self.lock:
+                        self.aoa_connect_time = None
+                        self.status_text = "Procurando"
+                        self.credit_totals = {}
+
+                scan_attempt += 1
+
+                if now - last_scan_log >= 2.0:
+                    self._log("INFO", f"Procurando device em modo AOA... (tentativa {scan_attempt})")
+                    try:
+                        self.debug_list_all_devices()
+                    except Exception as e:
+                        self._log("USB", f"debug_list_all_devices erro: {e}")
+                    last_scan_log = now
+
+                # 3a) Tenta achar já em modo AOA
+                acc = self.find_accessory()
+                if acc is not None:
+                    self._log("INFO", "Accessory AOA encontrado, conectando direto (sem handshake base).")
+                    self.dev = acc
+                    self.intf_no = None
+                    self.ep_in = self.ep_out = None
+                    self.hs1_done = False
+                    self.hs2_done = False
+                    self.rx_buffer.clear()
+
+                    time.sleep(AFTER_ENUMERATION_GRACE)
+
+                    try:
+                        intf_no, ep_in, ep_out = self.claim_bulk_endpoints(self.dev)
+                        usb_id = f"{self.dev.idVendor:04x}:{self.dev.idProduct:04x}"
+
+                        try:
+                            m = usb.util.get_string(self.dev, self.dev.iManufacturer) or ""
+                        except Exception:
+                            m = ""
+                        try:
+                            p = usb.util.get_string(self.dev, self.dev.iProduct) or ""
+                        except Exception:
+                            p = ""
+                        try:
+                            s = usb.util.get_string(self.dev, self.dev.iSerialNumber) or ""
+                        except Exception:
+                            s = ""
+
+                        with self.lock:
+                            self.intf_no = intf_no
+                            self.ep_in = ep_in
+                            self.ep_out = ep_out
+                            self.usb_id = usb_id
+                            self.device_info = {"manufacturer": m, "product": p, "serial": s}
+                            self.status_text = "Conectado"
+                            self.aoa_connect_time = time.time()
+                            self.rx_count = 0
+                            self.poll_count = 0
+                            self.credit_totals = {}
+
+                        self._log("INFO", f"[INFO] Conectado AOA {usb_id}")
+                        scan_attempt = 0
+                    except Exception as e:
+                        msg = str(e).lower()
+                        if "no such device" in msg or getattr(e, "errno", None) == 19:
+                            self._log("WARN", f"Accessory sumiu durante claim_bulk_endpoints (re-enum?): {e}")
+                        else:
+                            self._log("ERRO", f"claim_bulk_endpoints (AOA direto): {e}")
+
+                        try:
+                            if self.intf_no is not None:
+                                usb.util.release_interface(self.dev, self.intf_no)
+                        except Exception:
+                            pass
+                        try:
+                            usb.util.dispose_resources(self.dev)
+                        except Exception:
+                            pass
+
+                        self.dev = None
+                        self.intf_no = None
+                        self.ep_in = self.ep_out = None
+                        with self.lock:
+                            self.status_text = "Procurando"
+                            self.aoa_connect_time = None
+                            self.credit_totals = {}
+
+                    time.sleep(0.1)
+                    continue
+
+                # 3b) Tenta achar base e fazer handshake
+                base = self.find_android_base()
+                if base is not None:
+                    try:
+                        vidpid = f"{base.idVendor:04x}:{base.idProduct:04x}"
+                    except Exception:
+                        vidpid = "????:????"
+                    self._log("INFO", f"Encontrado Android base {vidpid}, iniciando handshake AOA...")
+                    self.aoa_switch_to_accessory(base)
+                else:
+                    if scan_attempt % 3 == 0:
+                        self._log(
+                            "INFO",
+                            f"[RECOVERY] Nenhum Android base 2fb8:220x visível após {scan_attempt} scans."
+                        )
+
+                time.sleep(0.1)
+                continue
+
+            # 4) Temos dev AOA; garantir endpoints
+            if self.dev is not None and (self.ep_in is None or self.ep_out is None):
+                try:
+                    intf_no, ep_in, ep_out = self.claim_bulk_endpoints(self.dev)
+                    usb_id = f"{self.dev.idVendor:04x}:{self.dev.idProduct:04x}"
+                    with self.lock:
+                        self.intf_no = intf_no
+                        self.ep_in = ep_in
+                        self.ep_out = ep_out
+                        self.usb_id = usb_id
+                        self.status_text = "Conectado"
+                        self.aoa_connect_time = time.time()
+                        self.rx_count = 0
+                        self.poll_count = 0
+                        self.credit_totals = {}
+                    self._log("INFO", f"(re)Conectado AOA {usb_id}")
+                    self.hs1_done = False
+                    self.hs2_done = False
+                    self.rx_buffer.clear()
+                except Exception as e:
+                    self._log("ERRO", f"claim_bulk_endpoints (já com dev): {e}")
+                    try:
+                        if self.intf_no is not None:
+                            usb.util.release_interface(self.dev, self.intf_no)
+                    except Exception:
+                        pass
+                    try:
+                        usb.util.dispose_resources(self.dev)
+                    except Exception:
+                        pass
+
+                    self.dev = None
+                    self.intf_no = None
+                    self.ep_in = self.ep_out = None
+                    self.hs1_done = self.hs2_done = False
+                    self.rx_buffer.clear()
+                    with self.lock:
+                        self.status_text = "Procurando"
+                        self.aoa_connect_time = None
+                        self.rx_count = 0
+                        self.poll_count = 0
+                        self.credit_totals = {}
+                    time.sleep(0.2)
+                    continue
+
+            # 5) Enviar HS1 / HS2 uma vez por conexão
+            if self.dev is not None and self.ep_out is not None:
+                if not self.hs1_done:
+                    ok1 = self.safe_write("TX_HS1", POLL_LINE_HS1)
+                    if not ok1:
+                        self._log("INFO", "HS1 falhou (timeout/busy?), mantendo sessão")
+                    self.hs1_done = True
+
+                if not self.hs2_done:
+                    ok2 = self.safe_write("TX_HS2", POLL_LINE_HS2)
+                    if not ok2:
+                        self._log("INFO", "HS2 falhou (timeout/busy?), mantendo sessão")
+                    self.hs2_done = True
+
+            # 6) Ler dados (RX)
+            if self.dev is not None and self.ep_in is not None:
+                try:
+                    size = getattr(self.ep_in, "wMaxPacketSize", 64) or 64
+                    data = self.dev.read(self.ep_in.bEndpointAddress, size, timeout=500)
+                except usb.core.USBError as e:
+                    s = str(e).lower()
+                    errno = getattr(e, "errno", None)
+                    if errno in (110,) or "timed out" in s:
+                        time.sleep(0.01)
+                        continue
+                    if errno == 19 or "no such device" in s:
+                        self._log("WARN", f"Dispositivo sumiu (no such device): {e}")
+                    else:
+                        self._log("WARN", f"Erro de leitura, assumindo desconexão: {e}")
+
+                    try:
+                        if self.intf_no is not None:
+                            usb.util.release_interface(self.dev, self.intf_no)
+                    except Exception:
+                        pass
+                    try:
+                        usb.util.dispose_resources(self.dev)
+                    except Exception:
+                        pass
+
+                    self.dev = None
+                    self.intf_no = None
+                    self.ep_in = self.ep_out = None
+                    self.hs1_done = self.hs2_done = False
+                    self.rx_buffer.clear()
+                    with self.lock:
+                        self.status_text = "Procurando"
+                        self.aoa_connect_time = None
+                        self.rx_count = 0
+                        self.poll_count = 0
+                        self.credit_totals = {}
+                    time.sleep(0.2)
+                    continue
+
+                if data:
+                    hex_str = " ".join(f"{b:02X}" for b in data)
+                    self._log("RX_RAW", f"({len(data)} bytes): {hex_str}")
+                    try:
+                        text = data.decode("utf-8", errors="replace")
+                        self._log("RX_TXT", repr(text))
+                    except Exception:
+                        pass
+
+                    self.rx_buffer.extend(data)
+                    while b"\n" in self.rx_buffer:
+                        line, _, self.rx_buffer = self.rx_buffer.partition(b"\n")
+                        try:
+                            msg = line.decode("utf-8", errors="ignore").strip()
+                        except Exception:
+                            msg = repr(line)
+                        with self.lock:
+                            self.last_rx = msg
+                            self.rx_count += 1
+                        self._log("RX_LINE", msg)
+
+                        # Mensagens de crédito
+                        if msg.startswith("#;"):
+                            self._handle_credit_message(msg)
+
+                        # Handshake RX -> TX
+                        if msg == "!;157458;!":
+                            self.safe_write("AUTO_HS1", POLL_LINE_HS1)
+                        elif msg == "@;697154;@":
+                            self.safe_write("AUTO_HS2", POLL_LINE_HS2)
+                        elif msg == "S;190750;S":
+                            self.safe_write("AUTO_POLL", POLL_LINE_AUTO)
+
+            time.sleep(0.01)
 
 
 # =========================
-# Flask App
+# Flask + UI
 # =========================
 app = Flask(__name__)
 svc = AOAService()
@@ -820,161 +937,252 @@ INDEX_HTML = """
 <html lang="pt-br">
 <head>
 <meta charset="utf-8">
-<title>AOA + UDP + GPIO · Painel</title>
+<title>AOA USB Monitor</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;background:#0f1115;color:#e5e7eb;margin:0}
-header{padding:12px 16px;background:#111827;border-bottom:1px solid #1f2937}
-main{padding:16px;display:grid;gap:16px;grid-template-columns:1fr 1fr}
-.card{background:#111827;border:1px solid #1f2937;border-radius:8px;padding:12px}
-h1{font-size:18px;margin:0}
-h2{font-size:16px;margin:0 0 8px 0}
-table{width:100%;border-collapse:collapse;font-size:14px}
-td{padding:4px 6px;border-bottom:1px solid #1f2937}
-input,select,button{background:#0b0f17;color:#e5e7eb;border:1px solid #374151;border-radius:6px;padding:8px}
-button{cursor:pointer}
-.row{display:flex;gap:8px;flex-wrap:wrap}
-
-/* ====== TERMINAIS ====== */
-pre.term{
-  height:48vh;
-  max-height:none;
-  overflow-y:auto;
-  resize:vertical;
-  background:#0b0f17;
-  border:1px solid #1f2937;
-  padding:8px;
+:root{
+  color-scheme: dark;
+  --bg:#0f1117;
+  --bg2:#111827;
+  --bg3:#020617;
+  --border:#1f2937;
+  --text:#e5e7eb;
+  --muted:#9ca3af;
+  --accent:#22c55e;
+  --accent2:#3b82f6;
+  --danger:#ef4444;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;
+  background:var(--bg);
+  color:var(--text);
+}
+header{
+  padding:12px 16px;
+  background:var(--bg2);
+  border-bottom:1px solid var(--border);
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:12px;
+}
+h1{font-size:18px;font-weight:600;}
+main{
+  padding:16px;
+  display:grid;
+  grid-template-columns:1.1fr 1.2fr;
+  gap:16px;
+}
+.card{
+  background:var(--bg2);
+  border:1px solid var(--border);
+  border-radius:8px;
+  padding:12px;
+}
+.card h2{
+  font-size:16px;
+  margin-bottom:8px;
+}
+.status-grid{
+  display:grid;
+  grid-template-columns:minmax(0,1fr) minmax(0,1fr);
+  gap:4px 12px;
+  font-size:13px;
+}
+.status-label{color:var(--muted);}
+.status-value{font-weight:500;word-break:break-all;}
+.badge{
+  display:inline-flex;
+  align-items:center;
+  padding:2px 8px;
+  border-radius:999px;
+  font-size:11px;
+}
+.badge-ok{background:rgba(34,197,94,.12);color:var(--accent);}
+.badge-warn{background:rgba(248,113,113,.15);color:var(--danger);}
+button{
+  background:var(--bg3);
+  color:var(--text);
+  border:1px solid var(--border);
   border-radius:6px;
+  padding:8px 12px;
+  font-size:13px;
+  cursor:pointer;
+}
+button:hover{border-color:var(--accent2);}
+button.primary{
+  background:var(--accent2);
+  border-color:var(--accent2);
+}
+button.primary:hover{filter:brightness(1.1);}
+.row{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px;}
+pre.term{
+  height:60vh;
+  background:var(--bg3);
+  border:1px solid var(--border);
+  border-radius:6px;
+  padding:8px;
+  font-size:11px;
+  font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  overflow-y:auto;
+  white-space:pre-wrap;
+}
+small{color:var(--muted);font-size:11px;}
+@media (max-width: 900px){
+  main{grid-template-columns:1fr;}
+}
+table{
+  width:100%;
+  border-collapse:collapse;
   font-size:12px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-  line-height:1.25;
-  box-sizing:border-box;
+  margin-top:4px;
 }
-pre.term.fullscreen{
-  position:fixed;
-  inset:8px;
-  z-index:9999;
-  height:auto;
-  max-height:none;
-  box-shadow:0 0 0 1px #1f2937, 0 10px 30px rgba(0,0,0,.5);
+table th, table td{
+  border:1px solid var(--border);
+  padding:4px 6px;
+  text-align:left;
 }
-
-small{color:#9ca3af}
-@media (max-width: 1100px){ main{grid-template-columns:1fr} }
-.ok{color:#22c55e}.nok{color:#ef4444}
+table th{
+  background:var(--bg3);
+}
+a.link{
+  color:var(--accent2);
+  text-decoration:none;
+  font-size:12px;
+}
+a.link:hover{
+  text-decoration:underline;
+}
 </style>
 </head>
 <body>
-<header><h1>AOA USB Server + UDP (ESP32) + GPIO</h1></header>
+<header>
+  <h1>AOA USB Monitor · WEBSYS</h1>
+  <div id="statusBadge" class="badge badge-warn">Carregando...</div>
+</header>
+
 <main>
   <section class="card">
     <h2>Status</h2>
-    <table><tbody id="statusTbl"></tbody></table>
-    <small id="usbWarn"></small>
+    <div class="status-grid" id="statusGrid"></div>
+
+    <h2 style="margin-top:10px;">Créditos por máquina</h2>
+    <table id="creditTable">
+      <thead>
+        <tr><th>Máquina</th><th>Total de créditos</th></tr>
+      </thead>
+      <tbody>
+      </tbody>
+    </table>
+    <small>
+      <a href="/download_creditos" class="link" target="_blank">Baixar CSV de créditos</a>
+    </small>
+
+    <small style="display:block;margin-top:8px;">
+      Atualiza automaticamente a cada 1s. Interface 100% offline.
+    </small>
+    <hr style="border:none;border-top:1px solid var(--border);margin:10px 0;">
+    <h2>Controles</h2>
+    <div class="row">
+      <button class="primary" onclick="sendManualPoll()">Enviar B;057091;0;0;1;0;B</button>
+      <button onclick="refreshNow()">Atualizar agora</button>
+      <button onclick="clearLog()">Limpar log local</button>
+    </div>
   </section>
 
   <section class="card">
-    <h2>Enviar crédito (manual)</h2>
-    <div class="row">
-      <select id="tipo"><option>POS</option><option>PIX</option></select>
-      <input id="maq" type="text" placeholder="Máquina (ex: 01)" value="01">
-      <input id="cred" type="number" placeholder="Crédito" value="1" min="1">
-      <button onclick="sendCredit()">Enviar</button>
-      <button onclick="resetTotal()">Reset TOTAL</button>
-    </div>
-    <small>Envia via UDP com ACK. Soma no total se ACK recebido.</small>
-  </section>
-
-  <section class="card">
-    <h2>Eventos (geral)</h2>
-    <pre id="events" class="term"></pre>
-    <div class="row">
-      <button onclick="tailLog()">Atualizar log</button>
-      <button onclick="gpioTest()">Testar GPIO (1 pulso)</button>
-      <button onclick="toggleFullscreen('events')">Tela cheia</button>
-    </div>
-  </section>
-
-  <section class="card">
-    <h2>RX/TX (AOA/UDP)</h2>
-    <pre id="rxtx" class="term"></pre>
-    <div class="row">
-      <button onclick="tailRxtx()">Atualizar RX/TX</button>
-      <button onclick="toggleFullscreen('rxtx')">Tela cheia</button>
-    </div>
+    <h2>Log</h2>
+    <pre id="logTerm" class="term"></pre>
+    <small>Últimas linhas do log. Rola automaticamente para o final.</small>
   </section>
 </main>
 
 <script>
-function fmtDur(sec){ sec = Math.max(0, Math.floor(sec||0)); const h=String(Math.floor(sec/3600)).padStart(2,'0'); const m=String(Math.floor((sec%3600)/60)).padStart(2,'0'); const s=String(sec%60).padStart(2,'0'); return h+':'+m+':'+s; }
-function tr(a,b){ return `<tr><td>${a}</td><td>${b}</td></tr>` }
-
-function scrollToBottom(id){
-  const pre = document.getElementById(id);
+function fmtDur(sec){
+  sec = Math.max(0, Math.floor(sec||0));
+  const h = String(Math.floor(sec/3600)).padStart(2,'0');
+  const m = String(Math.floor((sec%3600)/60)).padStart(2,'0');
+  const s = String(sec%60).padStart(2,'0');
+  return h+":"+m+":"+s;
+}
+function scrollLogBottom(){
+  const pre = document.getElementById('logTerm');
   pre.scrollTop = pre.scrollHeight;
 }
-function toggleFullscreen(id){
-  document.getElementById(id).classList.toggle('fullscreen');
-  setTimeout(()=>scrollToBottom(id),0);
-}
 
-async function refresh(){
+async function refreshNow(){
   try{
-    const r = await fetch('/api/status'); const st = await r.json();
+    const r = await fetch('/api/status');
+    const st = await r.json();
+
+    const badge = document.getElementById('statusBadge');
+    if(st.status === 'Conectado'){
+      badge.className = 'badge badge-ok';
+      badge.textContent = 'Conectado · '+(st.usb_id||'--')+' · AOA '+fmtDur(st.aoa_uptime||0);
+    }else{
+      badge.className = 'badge badge-warn';
+      badge.textContent = 'Procurando dispositivo...';
+    }
+
     const rows = [];
-    rows.push(tr('Status', st.status));
-    rows.push(tr('USB', st.usb_vidpid));
-    rows.push(tr('Uptime', fmtDur(st.uptime)));
-    rows.push(tr('RX', `msgs=${st.rx_msgs} bytes=${st.rx_bytes}`));
-    rows.push(tr('TX', `msgs=${st.tx_msgs} bytes=${st.tx_bytes}`));
-    rows.push(tr('MaxLine', st.max_len));
-    rows.push(tr('UDP', `sent=${st.udp_sent} errs=${st.udp_errs} ACK ${st.udp_ack_ok}/${st.udp_ack_fail}`));
-    rows.push(tr('GPIO', `${st.gpio_backend} (pulses=${st.gpio_pulses} errs=${st.gpio_errs})`));
-    rows.push(tr('Créditos', `TOTAL=${st.credits_total} último=${st.last_credit}`));
-    document.getElementById('statusTbl').innerHTML = rows.join('');
-    document.getElementById('usbWarn').textContent = st.have_usb ? '' : 'pyusb não disponível: AOA/USB desativado (instale pyusb).';
+    function row(a,b){
+      rows.push('<div class="status-label">'+a+'</div><div class="status-value">'+b+'</div>');
+    }
+    row('Status', st.status||'--');
+    row('Uptime servidor', fmtDur(st.uptime||0));
+    row('Uptime AOA', fmtDur(st.aoa_uptime||0));
+    row('USB VID:PID', st.usb_id||'--');
+    row('Fabricante', st.manufacturer||'--');
+    row('Produto', st.product||'--');
+    row('Serial', st.serial||'--');
+    row('RX recebidos', st.rx_count||0);
+    row('Driver GPIO', st.gpio_ok ? ('OK · '+(st.gpio_backend||'')) : 'NÃO INSTALADO / ERRO');
+    row('Último TX', st.last_tx||'—');
+    row('Último RX', st.last_rx||'—');
+    document.getElementById('statusGrid').innerHTML = rows.join('');
 
-    // Eventos (geral)
-    document.getElementById('events').textContent = (st.events||[]).join("\\n");
-    scrollToBottom('events');
+    // Preenche tabela de créditos totais por máquina
+    const ct = st.credit_totals || {};
+    const tbody = document.querySelector('#creditTable tbody');
+    if(tbody){
+      const keys = Object.keys(ct).sort();
+      if(keys.length === 0){
+        tbody.innerHTML = '<tr><td colspan="2">Nenhum crédito registrado ainda.</td></tr>';
+      }else{
+        tbody.innerHTML = keys.map(maq => {
+          return '<tr><td>'+maq+'</td><td>'+ct[maq]+'</td></tr>';
+        }).join('');
+      }
+    }
 
-    // RX/TX filtrado
-    document.getElementById('rxtx').textContent = (st.rxtx||[]).join("\\n");
-    scrollToBottom('rxtx');
-  }catch(e){}
-}
-
-async function tailLog(){
-  const r = await fetch('/api/log/tail'); const t = await r.text();
-  document.getElementById('events').textContent = t;
-  scrollToBottom('events');
-}
-async function tailRxtx(){
-  const r = await fetch('/api/log/rxtx'); const t = await r.text();
-  document.getElementById('rxtx').textContent = t;
-  scrollToBottom('rxtx');
-}
-
-async function sendCredit(){
-  const tipo = document.getElementById('tipo').value;
-  const maq  = document.getElementById('maq').value;
-  const cred = parseInt(document.getElementById('cred').value||'0',10);
-  const r = await fetch('/api/send_credit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tipo, maquina:maq, credito:cred})});
-  const dj = await r.json();
-  alert((dj.ok?'OK':'FALHA') + ' | ' + (dj.detail||''));
-  refresh();
-}
-async function resetTotal(){
-  const r = await fetch('/api/reset_total',{method:'POST'}); const dj = await r.json();
-  alert(dj.ok?'TOTAL zerado':'Falha ao zerar'); refresh();
-}
-async function gpioTest(){
-  const r = await fetch('/api/gpio/test',{method:'POST'}); const dj = await r.json();
-  alert(dj.ok?'GPIO ok':'GPIO falhou'); refresh();
+    const term = document.getElementById('logTerm');
+    const shouldStick = (term.scrollTop + term.clientHeight + 40) >= term.scrollHeight;
+    term.textContent = (st.logs||[]).join("\\n");
+    if(shouldStick) scrollLogBottom();
+  }catch(e){
+    console.error(e);
+  }
 }
 
-setInterval(refresh, 1000);
-refresh();
+async function sendManualPoll(){
+  try{
+    const r = await fetch('/api/send_manual', {method:'POST'});
+    const dj = await r.json();
+    if(!dj.ok){
+      alert('Falha ao enviar: '+(dj.error||'desconhecido'));
+    }
+  }catch(e){
+    alert('Erro ao enviar: '+e);
+  }
+}
+
+function clearLog(){
+  document.getElementById('logTerm').textContent = '';
+}
+
+setInterval(refreshNow, 1000);
+refreshNow();
 </script>
 </body>
 </html>
@@ -988,74 +1196,44 @@ def index():
 def api_status():
     return jsonify(svc.get_status())
 
-@app.route("/api/send_credit", methods=["POST"])
-def api_send_credit():
+@app.route("/api/send_manual", methods=["POST"])
+def api_send_manual():
     try:
-        data = request.get_json(force=True)
-        tipo = (data.get("tipo") or "POS").upper()
-        maquina = str(data.get("maquina") or "01").zfill(2)
-        credito = int(data.get("credito") or 0)
-        ok, session = svc.add_manual_credit(tipo, maquina, credito, expect_ack=True)
-        return jsonify({"ok": bool(ok), "detail": f"ACK ok={session['udp_ack_ok']} fail={session['udp_ack_fail']}"})
+        svc.send_manual_poll()
+        return jsonify({"ok": True})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route("/api/gpio/test", methods=["POST"])
-def api_gpio_test():
-    ok = svc.gpio_test(1, int(os.getenv("PULSE_ON_MS","150")), int(os.getenv("PULSE_OFF_MS","150")))
-    return jsonify({"ok": bool(ok)})
-
-@app.route("/api/reset_total", methods=["POST"])
-def api_reset_total():
-    return jsonify({"ok": svc.reset_total()})
-
-@app.route("/api/log/tail")
-def api_log_tail():
+@app.route("/download_creditos")
+def download_creditos():
+    path = svc.credit_log_path
+    if not os.path.exists(path):
+        return "Nenhum crédito registrado ainda.", 404
     try:
-        with open(LOG_FILE_PATH, "r", encoding="utf-8") as f:
-            lines = f.readlines()[-1000:]
-            return Response("".join(lines), mimetype="text/plain; charset=utf-8")
-    except Exception:
-        try:
-            mem = list(BUS.events)[-1000:]
-            return Response("\n".join(mem), mimetype="text/plain; charset=utf-8")
-        except Exception:
-            return Response("", mimetype="text/plain; charset=utf-8")
-
-@app.route("/api/log/rxtx")
-def api_log_rxtx():
-    tags = ("[AOA-RX]", "[AOA-TX]", "[UDP-RX]", "[UDP-TX]")
-    try:
-        with open(LOG_FILE_PATH, "r", encoding="utf-8") as f:
-            lines = f.readlines()[-2000:]
-        filt = [ln for ln in lines if any(t in ln for t in tags)]
-        return Response("".join(filt[-1000:]), mimetype="text/plain; charset=utf-8")
-    except Exception:
-        try:
-            mem = [ln for ln in list(BUS.events)[-2000:] if any(t in ln for t in tags)]
-            return Response("\n".join(mem[-1000:]), mimetype="text/plain; charset=utf-8")
-        except Exception:
-            return Response("", mimetype="text/plain; charset=utf-8")
-
-def on_sigint(sig, frame):
-    try: svc.stop_evt.set()
-    except Exception: pass
-    try: svc.gpio.cleanup()
-    except Exception: pass
-    save_credits_total(svc.get_status().get("credits_total", 0))
-    print("\nEncerrando...", flush=True)
-    os._exit(0)
-
-signal.signal(signal.SIGINT, on_sigint)
+        return send_file(
+            path,
+            mimetype="text/csv",
+            as_attachment=True,
+            download_name="creditos_log.csv"
+        )
+    except Exception as e:
+        return f"Erro ao baixar arquivo: {e}", 500
 
 if __name__ == "__main__":
-    host = os.getenv("FLASK_HOST", "0.0.0.0")
-    port = int(os.getenv("FLASK_PORT", "5002"))
+    host = "0.0.0.0"
+    port = 5002
+    print(f"[{ts()}] Iniciando Flask em {host}:{port}")
     app.run(host=host, port=port, threaded=True)
+
 
 PYEOF
 
 
+sudo systemctl restart aoa.service
+
+
+
+tail -f ~/.cache/aoa_usb_server/aoa_rxtx.log
 
 
 
@@ -1063,25 +1241,49 @@ PYEOF
 
 sudo tee /etc/systemd/system/aoa.service >/dev/null <<'EOF'
 [Unit]
-Description=Mirako Router Web UI (Flask)
+Description=AOA USB Monitor (WEBSYS)
 After=network.target
-Wants=network.target
 
 [Service]
 Type=simple
+
+# garante que roda como root
 User=root
+Group=root
+
 WorkingDirectory=/opt/mirako_web
 ExecStart=/usr/bin/python3 /opt/mirako_web/aoa.py
-Environment=PORT=5002
-Restart=on-failure
-RestartSec=2
+
+Restart=always
+RestartSec=3
+
+# ambiente
+Environment=PYTHONUNBUFFERED=1
+
+# MUITO IMPORTANTE: NÃO isolar /dev nem devices
+PrivateDevices=no
+PrivateTmp=no
+ProtectSystem=off
+ProtectHome=off
+DevicePolicy=auto
+# Se tiver systemd mais novo, pode forçar:
+# DeviceAllow=char-usb_device rw
+
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now aoa.service
 
 sudo systemctl restart aoa.service
+
+sudo systemctl enable --now aoa.service
+
+sudo systemctl stop aoa.service
+
+journalctl -fu aoa.service
+
 

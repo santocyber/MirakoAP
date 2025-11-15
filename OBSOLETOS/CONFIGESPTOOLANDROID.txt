@@ -1,0 +1,12 @@
+pkg install openssh
+pkg install termux-services
+pkg install python
+pkg install rust
+pkg install wget 
+pip install python-cryptography
+pip install esptool
+wget https://vendcard.mirako.org/firmwaretelebox.bin
+sudo esptool.py --port /dev/ttyUSB0 --baud 921600 write_flash 0x10000 firmwaretelebox.bin
+
+
+
