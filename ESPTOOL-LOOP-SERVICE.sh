@@ -1,0 +1,298 @@
+pip install esptool --break-system-packages
+
+
+
+
+sudo tee /usr/local/bin/esp32-flash-bins.sh >/dev/null <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# === Config Padrão ===
+SEARCH_DIR="${SEARCH_DIR:-/root}"
+DEFAULT_BAUD="${ESP32_BAUD:-921600}"
+LOG_FILE="${LOG_FILE:-/root/esp32_flash_log.txt}"
+FLASH_MODE="${FLASH_MODE:-dio}"
+FLASH_FREQ="${FLASH_FREQ:-40m}"
+FLASH_SIZE="${FLASH_SIZE:-detect}"
+
+# === Funções utilitárias ===
+log() {
+  echo -e "[`date +'%Y-%m-%d %H:%M:%S'`] $*" | tee -a "$LOG_FILE"
+}
+sep() { log "------------------------------------------"; }
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { log "ERRO: '$1' não encontrado."; exit 2; }
+}
+
+choose_port() {
+  # Porta explícita via 1º argumento ou variável
+  local arg_port="${1:-${ESP32_PORT:-}}"
+  if [[ -n "$arg_port" && -e "$arg_port" ]]; then
+    echo "$arg_port"; return 0
+  fi
+
+  # Varre portas comuns
+  local ports=()
+  while IFS= read -r p; do ports+=("$p"); done < <(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null || true)
+
+  for p in "${ports[@]}"; do
+    if timeout 6s esptool.py --chip auto --port "$p" --baud 115200 chip_id >/dev/null 2>&1; then
+      echo "$p"; return 0
+    fi
+  done
+  return 1
+}
+
+detect_bins() {
+  # Se passaram arquivos via args, usa-os. Caso contrário, busca no SEARCH_DIR.
+  if [ "$#" -ge 1 ]; then
+    printf '%s\n' "$@"
+  else
+    find "$SEARCH_DIR" -maxdepth 1 -type f -iname "*.bin" | sort
+  fi
+}
+
+best_app_bin() {
+  # Prioriza nomes comuns de app; se não achar, pega o maior .bin (exclui bootloader/partition/boot_app0/ota_data_initial)
+  awk_escape='BEGIN{IGNORECASE=1}
+  /bootloader\.bin$|partition[-_]?table\.bin$|partitions?\.bin$|boot[_-]?app0\.bin$|ota[_-]?data[_-]?initial\.bin$/ {next}
+  /(^|\/)(app|firmware|factory).*\.bin$/ {print; found=1}
+  END{if(!found) exit 1}'
+  if app=$(printf '%s\n' "$@" | awk "$awk_escape" | tail -n1); then
+    echo "$app"
+  else
+    # maior bin por tamanho
+    printf '%s\n' "$@" | xargs -I{} stat -c '%s {}' 2>/dev/null | sort -n | tail -n1 | awk '{print $2}'
+  fi
+}
+
+detect_app_offset_from_csv() {
+  # Procura um CSV de partições (formato ESP-IDF) e pega offset de "factory" ou "ota_0"
+  local csv
+  csv="$(find "$SEARCH_DIR" -maxdepth 1 -type f -iname "*.csv" | head -n1 || true)"
+  [ -z "$csv" ] && return 1
+  # CSV: Name, Type, SubType, Offset, Size, Flags
+  local off
+  off=$(awk -F, 'BEGIN{IGNORECASE=1}
+    {gsub(/ /,"",$4)}
+    tolower($1) ~ /factory/ {print $4; exit}
+    tolower($1) ~ /ota_0/   {print $4; exit}' "$csv" | head -n1)
+  [ -n "$off" ] && echo "$off" && return 0
+  return 1
+}
+
+# === Início ===
+echo "========== LOG FLASH ESP32 - $(date '+%Y-%m-%d %H:%M:%S') ==========" > "$LOG_FILE"
+need_cmd esptool.py
+need_cmd tee
+need_cmd timeout
+
+# Lista de BINs
+BINS_RAW=( "$@" )
+mapfile -t BIN_FILES < <(detect_bins "${BINS_RAW[@]}")
+
+if [ "${#BIN_FILES[@]}" -eq 0 ]; then
+  log "Nenhum arquivo .bin encontrado em '$SEARCH_DIR' e nenhum argumento informado. Saindo."
+  exit 1
+fi
+
+log "Arquivos encontrados:"
+printf '  - %s\n' "${BIN_FILES[@]}" | tee -a "$LOG_FILE"
+sep
+
+# Descobre porta
+PORT=""
+if PORT="$(choose_port "${ESP32_PORT:-}")"; then
+  log "Porta detectada: $PORT"
+else
+  log "ERRO: Nenhuma porta serial válida encontrada (ttyUSB*/ttyACM*)."
+  exit 3
+fi
+
+# Identifica chip
+if CHIP_INFO=$(timeout 8s esptool.py --chip auto --port "$PORT" --baud 115200 chip_id 2>&1); then
+  log "Informações do chip:"
+  echo "$CHIP_INFO" | tee -a "$LOG_FILE"
+else
+  log "ERRO: Não foi possível se conectar ao chip na porta $PORT."
+  exit 4
+fi
+sep
+
+# Seleciona conjuntos conhecidos (opcional) + app
+BOOTLOADER=""
+PART_TABLE=""
+BOOT_APP0=""
+OTA_DATA=""
+APP_BIN=""
+
+for f in "${BIN_FILES[@]}"; do
+  case "$(basename "$f" | tr '[:upper:]' '[:lower:]')" in
+    bootloader.bin)           BOOTLOADER="$f" ;;
+    partition-table.bin|partitions.bin) PART_TABLE="$f" ;;
+    boot_app0.bin|boot-app0.bin) BOOT_APP0="$f" ;;
+    ota_data_initial.bin|ota-data-initial.bin) OTA_DATA="$f" ;;
+  esac
+done
+
+if APP_BIN="$(best_app_bin "${BIN_FILES[@]}")"; then
+  log "App bin: $APP_BIN"
+else
+  log "ERRO: Não foi possível determinar o binário de APP."
+  exit 5
+fi
+
+# Offset do APP
+APP_OFFSET="0x10000"
+if off=$(detect_app_offset_from_csv); then
+  APP_OFFSET="$off"
+  log "Offset de APP detectado no CSV de partições: $APP_OFFSET"
+else
+  log "Offset de APP padrão: $APP_OFFSET"
+fi
+
+# Monta comando write_flash
+CMD=(esptool.py --chip auto --port "$PORT" --baud "$DEFAULT_BAUD" --before default_reset --after hard_reset
+     write_flash -z --flash_mode "$FLASH_MODE" --flash_freq "$FLASH_FREQ" --flash_size "$FLASH_SIZE")
+
+# Adiciona pares (offset arquivo)
+[ -n "$BOOTLOADER" ] && CMD+=("0x1000" "$BOOTLOADER")
+[ -n "$PART_TABLE" ] && CMD+=("0x8000" "$PART_TABLE")
+[ -n "$BOOT_APP0" ] && CMD+=("0xE000" "$BOOT_APP0")
+[ -n "$OTA_DATA" ] && CMD+=("0xD000" "$OTA_DATA")
+CMD+=("$APP_OFFSET" "$APP_BIN" "--verify")
+
+log "Executando flash com baud=$DEFAULT_BAUD ..."
+log "Comando: ${CMD[*]}"
+if "${CMD[@]}" >>"$LOG_FILE" 2>&1; then
+  log "✓ Flash concluído com sucesso."
+else
+  log "✗ Falha no write_flash. Veja o log em $LOG_FILE"
+  exit 6
+fi
+sep
+
+# MAC address para registro
+if MAC_OUT=$(timeout 5s esptool.py --chip auto --port "$PORT" --baud 115200 read_mac 2>&1); then
+  log "MAC Address:"
+  echo "$MAC_OUT" | tee -a "$LOG_FILE"
+fi
+
+log "Log completo salvo em: $LOG_FILE"
+exit 0
+SH
+
+sudo chmod +x /usr/local/bin/esp32-flash-bins.sh
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+sudo tee /usr/local/bin/esp32-auto-flasher.sh >/dev/null <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="/usr/local/bin"
+FLASH_SCRIPT="$SCRIPT_DIR/esp32-flash-bins.sh"
+CHECK_INTERVAL=30
+LOG_FILE="/var/log/esp32_auto_flasher.log"
+LOCK_FILE="/var/lock/esp32-auto-flash.lock"
+
+log() {
+  echo "[`date +'%Y-%m-%d %H:%M:%S'`] $*" | tee -a "$LOG_FILE"
+}
+
+log "=== Serviço ESP32 Auto Flasher iniciado ==="
+
+while true; do
+  # Qualquer ttyUSB/ttyACM?
+trap 'log "SIGTERM recebido; limpando lock e saindo"; rm -f "$LOCK_FILE"; exit 0' SIGTERM SIGINT
+
+if ls /dev/ttyUSB* /dev/ttyACM* >/dev/null 2>&1; then
+  log "Dispositivo serial detectado."
+  if [ -f "$LOCK_FILE" ] && kill -0 "$(cat "$LOCK_FILE")" 2>/dev/null; then
+    log "Flash já em andamento (PID $(cat "$LOCK_FILE")). Aguardando..."
+  else
+    echo $$ > "$LOCK_FILE"
+    log "Executando flash automático..."
+    if bash "$FLASH_SCRIPT" >> "$LOG_FILE" 2>&1; then
+      log "Flash automático finalizado."
+    else
+      log "Flash automático terminou com erro. Consulte os logs."
+    fi
+    rm -f "$LOCK_FILE"
+  fi
+else
+  log "Nenhuma porta serial encontrada."
+fi
+
+
+  sleep "$CHECK_INTERVAL"
+done
+SH
+
+sudo chmod +x /usr/local/bin/esp32-auto-flasher.sh
+
+
+
+
+sudo tee /etc/systemd/system/esp32-auto-flasher.service >/dev/null <<'EOF'
+[Unit]
+Description=Monitor ESP32 em USB e gravar .bin automaticamente (esptool)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/esp32-auto-flasher.sh
+Restart=on-failure
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=15
+ExecStop=/bin/kill -s TERM $MAINPID
+User=root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+StandardOutput=append:/var/log/esp32_auto_flasher.log
+StandardError=append:/var/log/esp32_auto_flasher.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+
+sudo systemctl daemon-reload
+sudo systemctl restart esp32-auto-flasher.service
+sudo systemctl status esp32-auto-flasher.service --no-pager
+
+
+
+
+cat /var/log/esp32_auto_flasher.log
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
