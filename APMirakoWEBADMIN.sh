@@ -33,37 +33,6 @@ figlet "SantoCyber"
 
 
 
-##SCRIPT DE EXPANSAO DA IMAGEM DE INSTALACAO CASO NAO TENHA SE EXPANDIDO
-cat > expand_ext4.sh << 'EOF'
-#!/bin/bash
-echo "=== Expansão para sistema de arquivos ext4 ==="
-
-# Dispositivo
-DEVICE="/dev/mmcblk0p1"
-
-echo "Estado ANTES:"
-df -h /
-echo ""
-
-# Verificar e reparar o sistema de arquivos
-echo "1. Verificando sistema de arquivos ext4..."
-e2fsck -f $DEVICE
-
-# Expandir o sistema de arquivos ext4 para preencher a partição
-echo "2. Expandindo sistema de arquivos ext4..."
-resize2fs $DEVICE
-
-echo "3. Estado DEPOIS:"
-df -h /
-
-echo "4. Informações detalhadas do sistema de arquivos:"
-tune2fs -l $DEVICE | grep -E "(Block count|Block size|Filesystem size)"
-
-echo "=== Concluído ==="
-EOF
-
-chmod +x expand_ext4.sh
-sudo ./expand_ext4.sh
 
 
 sudo apt update
@@ -2729,6 +2698,9 @@ kill_procs(){
   pkill -x hostapd    2>/dev/null || true
   pkill -x dnsmasq    2>/dev/null || true
   wpa_cli -i "$WLAN_IF" terminate 2>/dev/null || true
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop mirako-wpa@"$WLAN_IF".service 2>/dev/null || true
+  fi
 }
 
 clear_if(){
@@ -2912,10 +2884,18 @@ ensure_wpa_conf_from_env(){
 }
 
 start_wifi_and_wait(){
-  pkill -x wpa_supplicant 2>/dev/null || true
   rf_on
-  # Importante: não deixar -e matar o script aqui; devolva rc!=0 ao caller
-  wpa_supplicant -B -i "$WLAN_IF" -D nl80211 -c "$WPA_CONF" || return 1
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart mirako-wpa@"$WLAN_IF".service 2>/dev/null || {
+      log "AVISO: falha ao usar mirako-wpa@${WLAN_IF}, tentando wpa_supplicant direto"
+      pkill -x wpa_supplicant 2>/dev/null || true
+      wpa_supplicant -B -i "$WLAN_IF" -D nl80211 -c "$WPA_CONF" || return 1
+    }
+  else
+    pkill -x wpa_supplicant 2>/dev/null || true
+    wpa_supplicant -B -i "$WLAN_IF" -D nl80211 -c "$WPA_CONF" || return 1
+  fi
 
   local i=0
   while [ $i -lt 30 ]; do
@@ -2932,6 +2912,13 @@ start_wifi_and_wait(){
 
 profile_ap(){
   stop_all
+
+  # Garante que wpa_supplicant NÃO esteja rodando em modo AP
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop mirako-wpa@"$WLAN_IF".service 2>/dev/null || true
+    systemctl disable mirako-wpa@"$WLAN_IF".service 2>/dev/null || true
+  fi
+
   # WAN = end0 (DHCP), LAN = wlan0(AP)
   dhclient -r "$LAN_IF" 2>/dev/null || true
   dhclient "$LAN_IF" || true
@@ -2999,7 +2986,6 @@ profile_wifi_router(){
   log "Perfil 'wifi-router' aplicado (wlan0=${IPW} como WAN; end0 LAN ${WR_IP}${WR_MASK})"
 }
 
-
 profile_client_wifi(){
   stop_all
   ensure_wpa_conf_from_env
@@ -3034,19 +3020,33 @@ profile_client_wifi(){
     log "AVISO: sem reachability (1.1.1.1) após client-wifi; mantendo perfil client-wifi assim mesmo"
   fi
 
-  # 6) Levanta end0 como cliente DHCP também (best-effort)
+  # 6) Levanta end0 como cliente DHCP também (best-effort), sem herdar rota/DNS (se config existir)
   ip link set "$LAN_IF" up 2>/dev/null || true
   dhclient -r "$LAN_IF" 2>/dev/null || true
   local IPE=""
-  if dhclient "$LAN_IF"; then
-    IPE="$(ip -4 -o addr show dev "$LAN_IF" | awk '{print $4}' | cut -d/ -f1 | head -n1)"
-    if [ -n "$IPE" ]; then
-      log "end0 recebeu IPv4: ${IPE}"
+  local DHCP_CONF="/etc/dhcp/dhclient-${LAN_IF}.conf"
+  if [ -f "$DHCP_CONF" ]; then
+    if dhclient -cf "$DHCP_CONF" "$LAN_IF"; then
+      IPE="$(ip -4 -o addr show dev "$LAN_IF" | awk '{print $4}' | cut -d/ -f1 | head -n1)"
+      if [ -n "$IPE" ]; then
+        log "$LAN_IF recebeu IPv4 (sem rota/DNS): ${IPE}"
+      else
+        log "AVISO: $LAN_IF sem IPv4 após DHCP (config dedicada)"
+      fi
     else
-      log "AVISO: end0 sem IPv4 após DHCP"
+      log "AVISO: dhclient com -cf falhou em $LAN_IF (seguindo apenas com Wi-Fi)"
     fi
   else
-    log "AVISO: dhclient falhou em $LAN_IF (seguindo apenas com Wi-Fi)"
+    if dhclient "$LAN_IF"; then
+      IPE="$(ip -4 -o addr show dev "$LAN_IF" | awk '{print $4}' | cut -d/ -f1 | head -n1)"
+      if [ -n "$IPE" ]; then
+        log "$LAN_IF recebeu IPv4: ${IPE}"
+      else
+        log "AVISO: $LAN_IF sem IPv4 após DHCP"
+      fi
+    else
+      log "AVISO: dhclient falhou em $LAN_IF (seguindo apenas com Wi-Fi)"
+    fi
   fi
 
   # 7) Garante que a default fique pela Wi-Fi (se end0 ganhou default, tira)
@@ -3057,8 +3057,6 @@ profile_client_wifi(){
   set_last_profile "client-wifi"
   log "Perfil 'client-wifi' aplicado (wlan0=${IPW}; end0=${IPE:-'-'})"
 }
-
-
 
 profile_client_lan(){
   stop_all
@@ -3190,6 +3188,7 @@ esac
 EOF
 
 sudo chmod +x /usr/local/bin/profiles.sh
+
 
 
 
@@ -3466,6 +3465,84 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now mirako-apply-last-profile.service
+
+
+
+
+
+
+
+sudo tee /etc/systemd/system/mirako-wpa@.service >/dev/null <<'EOF'
+[Unit]
+Description=WPA supplicant for %i
+After=network.target
+
+[Service]
+ExecStart=/usr/sbin/wpa_supplicant -i %i -c /etc/wpa_supplicant/wpa_supplicant-%i.conf -D nl80211
+Restart=always
+RestartSec=3
+EOF
+
+
+sudo tee /etc/dhcp/dhclient-end0.conf >/dev/null <<'EOF'
+# Não aceitar rota nem DNS do servidor
+supersede routers 0.0.0.0;
+supersede domain-name-servers 0.0.0.0;
+EOF
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+##SCRIPT DE EXPANSAO DA IMAGEM DE INSTALACAO CASO NAO TENHA SE EXPANDIDO
+cat > expand_ext4.sh << 'EOF'
+#!/bin/bash
+echo "=== Expansão para sistema de arquivos ext4 ==="
+
+# Dispositivo
+DEVICE="/dev/mmcblk0p1"
+
+echo "Estado ANTES:"
+df -h /
+echo ""
+
+# Verificar e reparar o sistema de arquivos
+echo "1. Verificando sistema de arquivos ext4..."
+e2fsck -f $DEVICE
+
+# Expandir o sistema de arquivos ext4 para preencher a partição
+echo "2. Expandindo sistema de arquivos ext4..."
+resize2fs $DEVICE
+
+echo "3. Estado DEPOIS:"
+df -h /
+
+echo "4. Informações detalhadas do sistema de arquivos:"
+tune2fs -l $DEVICE | grep -E "(Block count|Block size|Filesystem size)"
+
+echo "=== Concluído ==="
+EOF
+
+chmod +x expand_ext4.sh
+sudo ./expand_ext4.sh
 
 
 
