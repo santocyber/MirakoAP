@@ -49,9 +49,9 @@ User=orangepi
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
 ExecStart=/usr/bin/env chisel client \
   --keepalive 10s \
-  --auth camai:qazwsx \
-  camai.mirako.org:6000 \
-  R:0.0.0.0:15000:127.0.0.1:80 \
+  --auth admin:qazwsx \
+  chisel.mirako.org:6000 \
+  R:0.0.0.0:15000:127.0.0.1:8080 \
   R:0.0.0.0:15001:127.0.0.1:5000 \
   R:0.0.0.0:15002:127.0.0.1:5001 \
   R:0.0.0.0:15003:127.0.0.1:5002
