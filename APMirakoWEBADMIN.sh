@@ -83,6 +83,24 @@ EOF
 sudo systemctl enable wpa_supplicant@wlan0.service
 
 
+sudo tee /etc/systemd/system/mirako-wpa@.service >/dev/null <<'EOF'
+[Unit]
+Description=WPA supplicant for %i
+After=network.target
+
+[Service]
+ExecStart=/usr/sbin/wpa_supplicant -i %i -c /etc/wpa_supplicant/wpa_supplicant-%i.conf -D nl80211
+Restart=always
+RestartSec=3
+EOF
+
+systemctl disable mirako-wpa@wlan0.service
+
+
+
+
+
+
 # pare e desabilite tudo; masque para não voltar no boot
 sudo systemctl disable --now NetworkManager || true
 sudo systemctl disable --now "wpa_supplicant@wlan0.service" wpa_supplicant || true
@@ -289,6 +307,7 @@ app.secret_key = os.environ.get("MIRAKO_SECRET", "devkey")
 # ========================== Config em runtime ==========================
 
 
+
 WIFI_SCAN_CACHE = "/var/lib/mirako/wifi_scan.json"
 WLAN_IF = os.environ.get("WLAN_IF", "wlan0")
 LAN_IF = os.environ.get("LAN_IF", "end0")
@@ -322,6 +341,24 @@ WPA_SUPP_CONF_CAND = [
     f"/etc/wpa_supplicant/wpa_supplicant-{WLAN_IF}.conf",
     "/etc/wpa_supplicant/wpa_supplicant.conf",
 ]
+
+
+
+
+
+ACTIVE_PROFILE_FILE = "/var/lib/mirako/active_profile"
+LAST_PROFILE_FILE   = "/var/lib/mirako/last_profile"
+
+def get_active_profile() -> str:
+    try:
+        with open(ACTIVE_PROFILE_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip() or "ap"
+    except Exception:
+        return "ap"
+
+
+
+
 
 # ========================== Terminal ao vivo ==========================
 LOG_DIR = "/var/log/mirako"
@@ -414,6 +451,17 @@ def read_log_tail(max_bytes: int = 120_000) -> str:
         return "(sem saída ainda)"
 
 # ========================== Helpers genéricos ==========================
+
+
+def write_last_profile(profile: str) -> None:
+    os.makedirs("/var/lib/mirako", exist_ok=True)
+    with open(LAST_PROFILE_FILE, "w", encoding="utf-8") as f:
+        f.write(profile.strip() + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.sync()
+
+
 def run(cmd: List[str], timeout: int = 10) -> Tuple[int, str]:
     try:
         out = subprocess.check_output(
@@ -936,10 +984,6 @@ def read_wpa_conf_networks() -> List[Dict[str, str]]:
     return out
 
 def wifi_connect(ssid: str, psk: str | None = None) -> Tuple[bool, str]:
-    """
-    Agora: só persiste credenciais em /etc/mirako/wifi.env e delega
-    a conexão ao profiles.sh client-wifi (para também voltar no boot).
-    """
     try:
         os.makedirs("/etc/mirako", exist_ok=True)
         with open("/etc/mirako/wifi.env", "w", encoding="utf-8") as f:
@@ -949,15 +993,19 @@ def wifi_connect(ssid: str, psk: str | None = None) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"falha ao salvar credenciais: {e}"
 
-    # Aplica imediatamente o profile e grava como 'last_profile' para voltar após boot
+    # >>> IMPORTANTE: marca o perfil desejado agora
+    try:
+        write_last_profile("client-wifi")
+    except Exception:
+        pass
+
     rc, out = profile_set("client-wifi")
     if rc != 0:
         return False, (out or "profiles.sh client-wifi falhou")
 
-    # Pequena espera e verificação opcional do IP em wlan0 (somente informativo)
     time.sleep(2)
     ip = get_ipv4_list(WLAN_IF)
-    return True, f"credenciais salvas e profile 'client-wifi' aplicado; IP wlan0={ip}"
+    return True, f"credenciais salvas; profile solicitado; IP wlan0={ip}"
 
 def wifi_disconnect() -> Tuple[bool, str]:
     rc, out = run([PROFILES_SCRIPT, "stop"], timeout=60)
@@ -2340,23 +2388,45 @@ def list_root_files() -> List[str]:
 
 @app.route("/", methods=["GET"])
 def index():
+    # 🔁 sempre carrega o último scan salvo pelo profiles.sh
+    scan, scan_dbg = get_cached_wifi_scan()
+
     context = dict(
-        WLAN_IF=WLAN_IF, LAN_IF=LAN_IF, PPP_IF=PPP_IF, PPP_PEER=PPP_PEER,
+        WLAN_IF=WLAN_IF,
+        LAN_IF=LAN_IF,
+        PPP_IF=PPP_IF,
+        PPP_PEER=PPP_PEER,
 
-        # PLACEHOLDERS
-        wifi={"mode":"-","state":"-","ssid":"-","bssid":"-","channel":"-",
-              "freq_mhz":"-","txpower":"-","rssi":"-","tx_bitrate":"-",
-              "rx_bitrate":"-","tx_bytes":"-","rx_bytes":"-",
-              "tx_bps":"0","rx_bps":"0","clients":0,"distance_m":"-"},
+        # ---- Wi-Fi (placeholders iniciais; atualizados via status.json) ----
+        wifi={
+            "mode": "-",
+            "state": "-",
+            "ssid": "-",
+            "bssid": "-",
+            "channel": "-",
+            "freq_mhz": "-",
+            "txpower": "-",
+            "rssi": "-",
+            "tx_bitrate": "-",
+            "rx_bitrate": "-",
+            "tx_bytes": "-",
+            "rx_bytes": "-",
+            "tx_bps": "0",
+            "rx_bps": "0",
+            "clients": 0,
+            "distance_m": "-",
+        },
 
+        # ---- Rede / sistema (placeholders) ----
         ppp_ipv4="-",
         def_route="-",
         all_routes="-",
         dns="-",
         leases=[],
         netlist=[],
-        services=[],        # NÃO carregar
-        saved_networks=[],  # NÃO carregar
+
+        services=[],        # NÃO carregar aqui (carregado via status.json)
+        saved_networks=[],  # NÃO carregar aqui
         wpa_file_networks=[],
 
         cpu_temp="-",
@@ -2372,13 +2442,18 @@ def index():
         cpu_count=os.cpu_count() or 1,
         cpu_used="0.0",
 
+        # ---- Estado do Mirako ----
         last_profile=get_last_profile(),
         root_files=list_root_files(),
         auto_dial_enabled=is_auto_dial_enabled(),
-        scan=[],
-        scan_dbg=None,
+
+        # ✅ redes detectadas SEM clicar em botão
+        scan=scan,
+        scan_dbg=scan_dbg,
     )
+
     return render_template_string(TEMPLATE, **context)
+
 
 
 @app.post("/wifi/scan")
@@ -2445,7 +2520,6 @@ def wifi_connect_route():
 
     # 1) Salva credenciais + aplica client-wifi
     ok, msg = wifi_connect(ssid, psk if psk else None)
-
     if not ok:
         flash(f"Falha ao iniciar conexão Wi-Fi: {msg}")
         return redirect(url_for("index"))
@@ -2453,14 +2527,14 @@ def wifi_connect_route():
     # 2) Aguarda o profiles.sh decidir (até ~15s)
     time.sleep(6)
 
-    # 3) Verifica perfil final
-    final_profile = get_last_profile()
+    # 3) Verifica perfil ativo (o que está realmente rodando)
+    final_active = get_active_profile().strip()
     wlan_ip = get_ipv4_list(WLAN_IF)
 
-    if final_profile != "client-wifi":
+    if final_active != "client-wifi":
         flash(
             "❌ Não foi possível conectar ao Wi-Fi.<br>"
-            "O sistema voltou automaticamente para <b>modo AP</b>."
+            f"Perfil ativo: <b>{final_active}</b> (fallback provável)."
         )
         return redirect(url_for("index"))
 
@@ -2476,6 +2550,7 @@ def wifi_connect_route():
         f"IP em wlan0: <span class='mono'>{wlan_ip}</span>"
     )
     return redirect(url_for("index"))
+
 
 
 @app.post("/wifi/disconnect")
@@ -2714,71 +2789,121 @@ sudo systemctl restart mirako-web
 
 
 
+
+
+
+
+
 sudo tee /usr/local/bin/profiles.sh >/dev/null <<'SH'
 #!/usr/bin/env bash
-# profiles.sh — Perfis de rede do Mirako (FINAL)
-# Perfis:
-#   ap | wifi-router | client-wifi | client-lan | 3g | 3g-client
-#   stop | status | ppp-up | ppp-down
+# profiles.sh — Mirako Network Profiles (COMPLETO / ROBUSTO)
+#
+# Regras principais:
+# - last_profile (/var/lib/mirako/last_profile) = PERFIL DESEJADO (selecionado pela UI/boot)
+# - active_profile (/var/lib/mirako/active_profile) = PERFIL ATIVO (informativo)
+# - Se client-wifi / wifi-router falhar, sobe AP "temporário" SEM sobrescrever last_profile
+# - Wi-Fi "OK" por padrão exige: ASSOCIADO + DHCP + (GW OU INTERNET) (configurável)
+# - Cache de scan Wi-Fi para UI em /var/lib/mirako/wifi_scan.json (corrigido)
 
 set -Eeuo pipefail
-trap 'rc=$?; echo "[profiles][ERRO] linha $LINENO: $BASH_COMMAND (rc=$rc)" >&2' ERR
+trap 'echo "[profiles][ERRO] linha $LINENO: $BASH_COMMAND" >&2' ERR
 
-PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 LOGTAG="profiles"
 
-# ============================================================
-# INTERFACES
-# ============================================================
+# ================= INTERFACES =================
 WLAN_IF="${WLAN_IF:-wlan0}"
 LAN_IF="${LAN_IF:-end0}"
 PPP_IF="${PPP_IF:-ppp0}"
 PPP_PEER="${PPP_PEER:-3g}"
 
-# ============================================================
-# WI-FI / AP
-# ============================================================
-SSID="${SSID:-${AP_SSID:-MirakoAP}}"
-PASS="${PASS:-${AP_PASS:-12345678}}"
-AP_CHANNEL="${AP_CHANNEL:-6}"
-COUNTRY_CODE="${COUNTRY_CODE:-BR}"
+# ================= RETRY / TIMEOUTS =================
+WIFI_RETRY_MAX="${WIFI_RETRY_MAX:-10}"
+WIFI_RETRY_DELAY="${WIFI_RETRY_DELAY:-2}"
+WIFI_ASSOC_TIMEOUT="${WIFI_ASSOC_TIMEOUT:-10}"          # segundos aguardando wpa_state=COMPLETED
+WIFI_DHCP_TIMEOUT="${WIFI_DHCP_TIMEOUT:-12}"            # timeout DHCP no wlan0
+WIFI_GW_PING_TIMEOUT="${WIFI_GW_PING_TIMEOUT:-2}"       # ping gateway (seg)
+
+DHCP_WAN_TIMEOUT="${DHCP_WAN_TIMEOUT:-12}"              # dhcp no WAN (ex: end0 no perfil AP)
+AP_FALLBACK_MARK_WINDOW="${AP_FALLBACK_MARK_WINDOW:-180}"  # marcação do fallback (seg)
+
+# ================= WIFI VALIDATION =================
+# Modos:
+# - assoc_dhcp      => considera ok após ASSOCIADO + DHCP (sem ping)
+# - gw              => exige ping no gateway
+# - internet         => exige ping em IPs externos
+# - gw_or_internet  => tenta GW; se falhar, aceita internet (PADRÃO)
+WIFI_VALIDATE_MODE="${WIFI_VALIDATE_MODE:-gw_or_internet}"
+
+# IPs para teste externo (ICMP). Ajuste se a rede bloquear ping.
+WIFI_TEST_IPS_DEFAULT=("1.1.1.1" "8.8.8.8")
+# Permite override via env: WIFI_TEST_IPS="1.1.1.1 9.9.9.9"
+if [ -n "${WIFI_TEST_IPS:-}" ]; then
+  # shellcheck disable=SC2206
+  WIFI_TEST_IPS_ARR=($WIFI_TEST_IPS)
+else
+  WIFI_TEST_IPS_ARR=("${WIFI_TEST_IPS_DEFAULT[@]}")
+fi
+
+# ================= PATHS =================
+RUND="/run/mirako"
+mkdir -p "$RUND" /etc/mirako /var/lib/mirako
+
+LAST_FILE="/var/lib/mirako/last_profile"              # PERFIL DESEJADO (UI/boot)
+ACTIVE_FILE="/var/lib/mirako/active_profile"          # PERFIL ATIVO (informativo)
+FALLBACK_UNTIL_FILE="/var/lib/mirako/ap_fallback_until"
 
 WIFI_ENV="/etc/mirako/wifi.env"
-WPA_CONF="/etc/wpa_supplicant/wpa_supplicant-${WLAN_IF}.conf"
-
-# ============================================================
-# ENDEREÇOS
-# ============================================================
-AP_IP="192.168.40.1";  AP_MASK="/24";   AP_RANGE_START="192.168.40.50";  AP_RANGE_END="192.168.40.200"
-WR_IP="192.168.50.1";  WR_MASK="/24";   WR_RANGE_START="192.168.50.50";  WR_RANGE_END="192.168.50.200"
-G3_IP="192.168.60.1";  G3_MASK="/24";   G3_RANGE_START="192.168.60.50";  G3_RANGE_END="192.168.60.200"
-G3C_IP="192.168.61.1"; G3C_MASK="/24";  G3C_RANGE_START="192.168.61.50"; G3C_RANGE_END="192.168.61.200"
-
-# ============================================================
-# PATHS
-# ============================================================
-RUND="/run/mirako"
-SCAN_CACHE="/var/lib/mirako/wifi_scan.json"
-LAST_FILE="/var/lib/mirako/last_profile"
+AP_ENV="/etc/mirako/ap.env"
 
 HOSTAPD_CONF="$RUND/hostapd.conf"
-DNSMASQ_CONF="$RUND/dnsmasq.conf"
-HOSTAPD_LOG="/var/log/hostapd-mirako.log"
+WPA_CTRL_DIR="/run/wpa_supplicant"
+WPA_CONF="/etc/wpa_supplicant/wpa_supplicant-${WLAN_IF}.conf"
 
-mkdir -p "$RUND" "$(dirname "$SCAN_CACHE")" "$(dirname "$LAST_FILE")"
+WIFI_SCAN_CACHE="/var/lib/mirako/wifi_scan.json"
 
-# ============================================================
-# HELPERS
-# ============================================================
+# ================= DEFAULTS (AP) =================
+AP_SSID_DEFAULT="MirakoAP"
+AP_PASS_DEFAULT="12345678"
+AP_CHANNEL_DEFAULT="6"
+COUNTRY_CODE_DEFAULT="BR"
+
+# ================= LOAD AP CONFIG =================
+[ -f "$AP_ENV" ] && . "$AP_ENV"
+
+AP_SSID="${AP_SSID:-$AP_SSID_DEFAULT}"
+AP_PASS="${AP_PASS:-$AP_PASS_DEFAULT}"
+AP_CHANNEL="${AP_CHANNEL:-$AP_CHANNEL_DEFAULT}"
+COUNTRY_CODE="${COUNTRY_CODE:-$COUNTRY_CODE_DEFAULT}"
+
+# ================= IPs / DHCP =================
+AP_IP="192.168.40.1/24"
+AP_RANGE="192.168.40.50,192.168.40.200"
+
+WR_IP="192.168.50.1/24"
+WR_RANGE="192.168.50.50,192.168.50.200"
+
+# ================= BIN HELPERS =================
+have(){ command -v "$1" >/dev/null 2>&1; }
+
+IW_BIN="$(have iw && echo iw || echo "")"
+IWLIST_BIN="$(have iwlist && echo iwlist || echo "")"
+PY_BIN="$(have python3 && echo python3 || echo "")"
+
+WPA_SUPP_BIN="$(have wpa_supplicant && echo wpa_supplicant || echo "")"
+WPA_CLI_BIN="$(have wpa_cli && echo wpa_cli || echo "")"
+
+DHCLIENT_BIN="$(have dhclient && echo dhclient || echo "")"
+UDHCPC_BIN="$(have udhcpc && echo udhcpc || echo "")"
+
+TIMEOUT_BIN="$(have timeout && echo timeout || echo "")"
+
+# ================= HELPERS =================
 log(){ echo "[$LOGTAG] $*"; logger -t "$LOGTAG" -- "$*"; }
 
 rf_on(){
   rfkill unblock all 2>/dev/null || true
   ip link set "$WLAN_IF" up 2>/dev/null || true
-}
-
-ensure_ip_forward(){
-  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 }
 
 flush_fw(){
@@ -2788,127 +2913,258 @@ flush_fw(){
 
 nat_on(){
   local LAN="$1" WAN="$2"
-  ensure_ip_forward
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
   iptables -t nat -C POSTROUTING -o "$WAN" -j MASQUERADE 2>/dev/null || \
     iptables -t nat -A POSTROUTING -o "$WAN" -j MASQUERADE
+
   iptables -C FORWARD -i "$LAN" -o "$WAN" -j ACCEPT 2>/dev/null || \
     iptables -A FORWARD -i "$LAN" -o "$WAN" -j ACCEPT
+
   iptables -C FORWARD -i "$WAN" -o "$LAN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
     iptables -A FORWARD -i "$WAN" -o "$LAN" -m state --state RELATED,ESTABLISHED -j ACCEPT
 }
 
-stop_all(){
-  log "Parando serviços e limpando estado"
-  pkill -x hostapd dnsmasq wpa_supplicant pppd 2>/dev/null || true
-  ip addr flush dev "$WLAN_IF" 2>/dev/null || true
-  ip addr flush dev "$LAN_IF" 2>/dev/null || true
-  ip link set "$WLAN_IF" down 2>/dev/null || true
-  ip link set "$LAN_IF" down 2>/dev/null || true
-  flush_fw
-}
-
-set_if(){
-  ip link set "$1" up
-  ip addr add "$2$3" dev "$1"
-}
-
-set_last_profile(){
+set_last(){
   echo "$1" > "$LAST_FILE"
   sync
 }
 
-# ============================================================
-# 🔥 SCAN WI-FI PRÉ-AP (CACHE PARA UI)
-# ============================================================
-wifi_scan_pre_ap(){
-  log "Scan Wi-Fi pré-AP"
-  rf_on
-  iw dev "$WLAN_IF" set type managed 2>/dev/null || true
-  sleep 1
-
-  iw dev "$WLAN_IF" scan >"$RUND/wifi.scan.raw" 2>/dev/null || true
-
-  awk '
-    BEGIN { print "{ \"ts\": " systime() ", \"nets\": ["; first=1 }
-    /^BSS / {
-      if (ssid!="") {
-        if(!first) print ","
-        printf("{\"ssid\":\"%s\",\"signal\":\"%s\",\"freq\":\"%s\",\"security\":\"%s\"}",ssid,signal,freq,sec)
-        first=0
-      }
-      ssid=""; signal=""; freq=""; sec="OPEN"
-    }
-    /SSID:/   { sub(/.*SSID:[ ]*/, "", $0); ssid=$0 }
-    /signal:/ { signal=$2 " dBm" }
-    /freq:/   { freq=$2 " MHz" }
-    /RSN:|WPA:/ { sec="WPA/WPA2" }
-    END {
-      if (ssid!="") {
-        if(!first) print ","
-        printf("{\"ssid\":\"%s\",\"signal\":\"%s\",\"freq\":\"%s\",\"security\":\"%s\"}",ssid,signal,freq,sec)
-      }
-      print "]}"
-    }
-  ' "$RUND/wifi.scan.raw" >"$SCAN_CACHE"
-
-  chmod 600 "$SCAN_CACHE"
-  log "Scan salvo em $SCAN_CACHE"
+set_active(){
+  echo "$1" > "$ACTIVE_FILE"
+  sync
 }
 
-# ============================================================
-# WPA CLIENT
-# ============================================================
-ensure_wpa_conf_from_env(){
-  [ -f "$WIFI_ENV" ] && . "$WIFI_ENV"
-  : "${WIFI_SSID:=}"
-  : "${WIFI_PSK:=}"
+mark_ap_fallback_window(){
+  local until=$(( $(date +%s) + AP_FALLBACK_MARK_WINDOW ))
+  echo "$until" > "$FALLBACK_UNTIL_FILE" 2>/dev/null || true
+}
 
-  mkdir -p /etc/wpa_supplicant
-  {
-    echo "ctrl_interface=/run/wpa_supplicant"
-    echo "update_config=1"
-    echo "country=$COUNTRY_CODE"
-    echo "network={"
-    echo "  ssid=\"$WIFI_SSID\""
-    if [ -n "$WIFI_PSK" ]; then
-      echo "  psk=\"$WIFI_PSK\""
+clear_ap_fallback_window(){
+  rm -f "$FALLBACK_UNTIL_FILE" 2>/dev/null || true
+}
+
+# ---------- DHCP helpers (dhclient/udhcpc) ----------
+dhcp_release(){
+  local dev="$1"
+  if [ -n "$DHCLIENT_BIN" ]; then
+    dhclient -r "$dev" 2>/dev/null || true
+  fi
+  if [ -n "$UDHCPC_BIN" ]; then
+    # udhcpc geralmente não tem "release" confiável aqui; apenas mata instâncias.
+    pkill -f "udhcpc.*-i $dev" 2>/dev/null || true
+  fi
+}
+
+dhcp_acquire(){
+  local dev="$1"
+  local tmo="${2:-12}"
+
+  if [ -n "$DHCLIENT_BIN" ]; then
+    if [ -n "$TIMEOUT_BIN" ]; then
+      timeout "$tmo" dhclient -1 "$dev" >/dev/null 2>&1
     else
-      echo "  key_mgmt=NONE"
+      dhclient -1 "$dev" >/dev/null 2>&1
     fi
-    echo "}"
-  } > "$WPA_CONF"
-  chmod 600 "$WPA_CONF"
+    return $?
+  fi
+
+  if [ -n "$UDHCPC_BIN" ]; then
+    # -n: sai se falhar, -q: quiet, -t tentativas, -T timeout por tentativa
+    if [ -n "$TIMEOUT_BIN" ]; then
+      timeout "$tmo" udhcpc -i "$dev" -n -q -t 3 -T 3 >/dev/null 2>&1
+    else
+      udhcpc -i "$dev" -n -q -t 3 -T 3 >/dev/null 2>&1
+    fi
+    return $?
+  fi
+
+  log "ERRO: nenhum cliente DHCP encontrado (dhclient/udhcpc)"
+  return 1
 }
 
-start_wifi_and_wait(){
-  pkill -x wpa_supplicant 2>/dev/null || true
-  rf_on
-  wpa_supplicant -B -i "$WLAN_IF" -c "$WPA_CONF" || return 1
-  for _ in $(seq 1 30); do
-    wpa_cli -i "$WLAN_IF" status | grep -q wpa_state=COMPLETED && return 0
-    sleep 1
+# ---------- WPA CLI wrapper ----------
+wpa_cli_cmd(){
+  # Usa -p para garantir ctrl_interface correto
+  [ -n "$WPA_CLI_BIN" ] || return 1
+  wpa_cli -p "$WPA_CTRL_DIR" -i "$WLAN_IF" "$@" 2>/dev/null
+}
+
+gw_for_dev(){
+  local dev="$1"
+  ip -4 route show default dev "$dev" 2>/dev/null | awk '
+    $1=="default" {
+      for(i=1;i<=NF;i++){
+        if($i=="via"){print $(i+1); exit}
+      }
+    }'
+}
+
+ping_via(){
+  local dev="$1"; local ip="$2"
+  ping -I "$dev" -c1 -W2 "$ip" >/dev/null 2>&1
+}
+
+gw_ok_for_dev(){
+  local dev="$1"
+  local gw
+  gw="$(gw_for_dev "$dev" || true)"
+  [ -n "${gw:-}" ] || return 1
+  ping -I "$dev" -c1 -W"$WIFI_GW_PING_TIMEOUT" "$gw" >/dev/null 2>&1
+}
+
+internet_ok_for_dev(){
+  local dev="$1"
+  local ip
+  for ip in "${WIFI_TEST_IPS_ARR[@]}"; do
+    if ping_via "$dev" "$ip"; then
+      return 0
+    fi
   done
   return 1
 }
 
-wait_dhcp(){
-  dhclient -r "$1" 2>/dev/null || true
-  dhclient "$1" || return 1
+uplink_ok_for_wifi(){
+  case "$WIFI_VALIDATE_MODE" in
+    assoc_dhcp)
+      return 0
+      ;;
+    gw)
+      gw_ok_for_dev "$WLAN_IF"
+      ;;
+    internet)
+      internet_ok_for_dev "$WLAN_IF"
+      ;;
+    gw_or_internet|*)
+      if gw_ok_for_dev "$WLAN_IF"; then
+        return 0
+      fi
+      internet_ok_for_dev "$WLAN_IF"
+      ;;
+  esac
 }
 
-test_connectivity(){
-  local GW
-  GW="$(ip route | awk '$1=="default"{print $3; exit}')"
-  [ -n "$GW" ] && ping -c2 -W2 "$GW" >/dev/null 2>&1
+stop_all(){
+  log "resetando rede"
+  pkill -x hostapd dnsmasq wpa_supplicant pppd 2>/dev/null || true
+
+  dhcp_release "$WLAN_IF"
+  dhcp_release "$LAN_IF"
+
+  ip addr flush dev "$WLAN_IF" 2>/dev/null || true
+  ip addr flush dev "$LAN_IF" 2>/dev/null || true
+
+  ip link set "$WLAN_IF" down 2>/dev/null || true
+  ip link set "$LAN_IF" down 2>/dev/null || true
+
+  flush_fw
 }
 
-# ============================================================
-# HOSTAPD / DNSMASQ
-# ============================================================
+# ================= WIFI SCAN CACHE (corrigido) =================
+wifi_scan_cache_update(){
+  # Cacheia redes detectadas para a UI (não quebra o script se falhar).
+  [ -n "$PY_BIN" ] || return 0
+
+  rf_on
+
+  local raw=""
+  local ok=0
+
+  if [ -n "$IW_BIN" ]; then
+    raw="$($IW_BIN dev "$WLAN_IF" scan 2>/dev/null || true)"
+    [ -n "$raw" ] && ok=1
+  fi
+
+  if [ "$ok" -ne 1 ] && [ -n "$IWLIST_BIN" ]; then
+    raw="$($IWLIST_BIN "$WLAN_IF" scan 2>/dev/null || true)"
+    [ -n "$raw" ] && ok=2
+  fi
+
+  # Passa o RAW via stdin para python (-c) (evita o bug do "python3 -" + heredoc)
+  printf '%s' "$raw" | "$PY_BIN" -c '
+import sys, json, time, re
+mode = int(sys.argv[1])      # 0 none, 1 iw, 2 iwlist
+outf = sys.argv[2]
+raw  = sys.stdin.read()
+nets = []
+ts = int(time.time())
+
+def uniq_by_ssid(items):
+    best = {}
+    for n in items:
+        ssid = n.get("ssid") or ""
+        if not ssid:
+            continue
+        if ssid not in best:
+            best[ssid] = n
+        else:
+            try:
+                a = float(str(n.get("signal","")).split()[0])
+                b = float(str(best[ssid].get("signal","")).split()[0])
+                if a > b:
+                    best[ssid] = n
+            except Exception:
+                pass
+    return list(best.values())
+
+if mode == 1:
+    bss = None
+    for line in raw.splitlines():
+        s = line.strip()
+        if s.startswith("BSS "):
+            if bss:
+                nets.append(bss)
+            bss = {"ssid":"","signal":"","freq":"","security":"?"}
+        elif s.startswith("SSID:"):
+            if bss is None: bss = {"ssid":"","signal":"","freq":"","security":"?"}
+            bss["ssid"] = s.split("SSID:",1)[1].strip()
+        elif s.startswith("freq:"):
+            if bss is None: bss = {"ssid":"","signal":"","freq":"","security":"?"}
+            bss["freq"] = s.split("freq:",1)[1].strip()
+        elif s.startswith("signal:"):
+            if bss is None: bss = {"ssid":"","signal":"","freq":"","security":"?"}
+            bss["signal"] = s.split("signal:",1)[1].strip()
+        elif s.startswith("RSN:") or s.startswith("WPA:"):
+            if bss is None: bss = {"ssid":"","signal":"","freq":"","security":"?"}
+            bss["security"] = "WPA/WPA2"
+    if bss:
+        nets.append(bss)
+    nets = [n for n in nets if n.get("ssid")]
+
+elif mode == 2:
+    for cell in raw.split("Cell "):
+        m_ssid = re.search(r"ESSID:\"(.*)\"", cell)
+        if not m_ssid:
+            continue
+        ssid = m_ssid.group(1)
+        m_sig = re.search(r"Signal level=(-?\d+)", cell) or re.search(r"Quality=([0-9/]+)", cell)
+        m_frq = re.search(r"Frequency:([0-9\.]+)", cell)
+        enc = "Open" if "Encryption key:off" in cell else "WPA/WPA2"
+        nets.append({"ssid": ssid,
+                     "signal": (m_sig.group(1) if m_sig else "?"),
+                     "freq": (m_frq.group(1) if m_frq else "?"),
+                     "security": enc})
+
+nets = uniq_by_ssid(nets)
+payload = {"ts": ts, "nets": nets}
+try:
+    with open(outf, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+except Exception:
+    pass
+' "$ok" "$WIFI_SCAN_CACHE" || true
+
+  return 0
+}
+
+# ================= AP =================
 write_hostapd(){
-cat >"$HOSTAPD_CONF" <<EOF
+  if [ "${#AP_PASS}" -lt 8 ]; then
+    log "WARN: AP_PASS menor que 8 chars; hostapd pode falhar"
+  fi
+  cat >"$HOSTAPD_CONF" <<EOF
 interface=$WLAN_IF
-ssid=$SSID
+ssid=$AP_SSID
 country_code=$COUNTRY_CODE
 hw_mode=g
 channel=$AP_CHANNEL
@@ -2917,123 +3173,290 @@ wmm_enabled=1
 auth_algs=1
 wpa=2
 wpa_key_mgmt=WPA-PSK
-wpa_passphrase=$PASS
+wpa_pairwise=CCMP
+wpa_passphrase=$AP_PASS
 EOF
 }
 
-write_dnsmasq(){
-cat >"$DNSMASQ_CONF" <<EOF
-interface=$1
-dhcp-range=$1,$2,$3,12h
-dhcp-option=option:dns-server,1.1.1.1,8.8.8.8
-EOF
-}
+start_ap_services(){
+  # Para UI: cacheia redes detectadas ANTES de subir hostapd
+  wifi_scan_cache_update
 
-start_ap(){
+  rf_on
   write_hostapd
-  write_dnsmasq "$1" "$2" "$3"
-  hostapd -B -f "$HOSTAPD_LOG" "$HOSTAPD_CONF"
-  dnsmasq --conf-file="$DNSMASQ_CONF"
+
+  # dnsmasq isolado (não lê conf global)
+  dnsmasq \
+    --conf-file=/dev/null \
+    --no-hosts --no-resolv \
+    --interface="$WLAN_IF" --bind-interfaces \
+    --dhcp-range="$AP_RANGE" \
+    --dhcp-option=3,${AP_IP%/*} \
+    --dhcp-option=6,${AP_IP%/*} \
+    >/dev/null 2>&1 || true
+
+  hostapd -B "$HOSTAPD_CONF"
 }
 
-# ============================================================
-# PERFIS
-# ============================================================
-profile_ap(){
+# ================= CLIENT WIFI =================
+ensure_wpa(){
+  [ -f "$WIFI_ENV" ] || return 1
+  # shellcheck disable=SC1090
+  . "$WIFI_ENV"
+
+  : "${WIFI_SSID:?}"
+
+  mkdir -p "$WPA_CTRL_DIR" 2>/dev/null || true
+
+  cat >"$WPA_CONF" <<EOF
+ctrl_interface=$WPA_CTRL_DIR
+update_config=1
+country=$COUNTRY_CODE
+network={
+  ssid="$WIFI_SSID"
+EOF
+
+  if [ -n "${WIFI_PSK:-}" ]; then
+    echo "  psk=\"$WIFI_PSK\"" >>"$WPA_CONF"
+  else
+    echo "  key_mgmt=NONE" >>"$WPA_CONF"
+  fi
+
+  echo "}" >>"$WPA_CONF"
+  chmod 600 "$WPA_CONF"
+}
+
+start_wifi_once(){
+  pkill -x hostapd dnsmasq 2>/dev/null || true
+  pkill -x wpa_supplicant 2>/dev/null || true
+
+  dhcp_release "$WLAN_IF"
+  rf_on
+
+  [ -n "$WPA_SUPP_BIN" ] || { log "ERRO: wpa_supplicant não encontrado"; return 1; }
+
+  wpa_supplicant -B -i "$WLAN_IF" -c "$WPA_CONF"
+
+  local i=1
+  while [ "$i" -le "$WIFI_ASSOC_TIMEOUT" ]; do
+    wpa_cli_cmd status | grep -q '^wpa_state=COMPLETED' && break
+    sleep 1
+    i=$((i+1))
+  done
+
+  wpa_cli_cmd status | grep -q '^wpa_state=COMPLETED' || return 1
+
+  dhcp_acquire "$WLAN_IF" "$WIFI_DHCP_TIMEOUT" || return 1
+
+  # Validação de uplink (configurável)
+  uplink_ok_for_wifi || return 1
+
+  return 0
+}
+
+wifi_connect_with_retry(){
+  local attempt=1
+  while [ "$attempt" -le "$WIFI_RETRY_MAX" ]; do
+    log "Wi-Fi tentativa $attempt/$WIFI_RETRY_MAX (validate=$WIFI_VALIDATE_MODE)"
+    if start_wifi_once; then
+      log "Wi-Fi OK (associado + DHCP + validação ok)"
+      return 0
+    fi
+    log "Falha na tentativa $attempt — aguardando ${WIFI_RETRY_DELAY}s"
+    sleep "$WIFI_RETRY_DELAY"
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+# ================= FALLBACK AP (SEM ALTERAR last_profile) =================
+fallback_ap_runtime(){
+  local reason="${1:-}"
+  log "fallback AP temporário: ${reason:-motivo não informado}"
+  mark_ap_fallback_window
+
   stop_all
-  wifi_scan_pre_ap
-  set_if "$WLAN_IF" "$AP_IP" "$AP_MASK"
-  start_ap "$WLAN_IF" "$AP_RANGE_START" "$AP_RANGE_END"
+
+  rf_on
+  ip link set "$WLAN_IF" up 2>/dev/null || true
+  ip addr replace "$AP_IP" dev "$WLAN_IF" 2>/dev/null || true
+
+  start_ap_services
+
+  # tenta uplink por cabo (WAN em end0), mas não bloqueia se falhar
+  ip link set "$LAN_IF" up 2>/dev/null || true
+  dhcp_acquire "$LAN_IF" "$DHCP_WAN_TIMEOUT" >/dev/null 2>&1 || true
+
   nat_on "$WLAN_IF" "$LAN_IF"
-  set_last_profile "ap"
-  log "Perfil AP ativo"
+  set_active "ap(fallback)"
+  log "AP temporário ativo ($AP_SSID) — last_profile preservado"
+}
+
+# ================= PROFILES =================
+profile_ap(){
+  local commit="${1:-1}"  # 1 = grava last_profile, 0 = não grava (fallback)
+  stop_all
+
+  rf_on
+  ip link set "$WLAN_IF" up 2>/dev/null || true
+  ip addr replace "$AP_IP" dev "$WLAN_IF"
+
+  start_ap_services
+
+  # uplink por cabo (WAN end0) + NAT
+  ip link set "$LAN_IF" up 2>/dev/null || true
+  dhcp_acquire "$LAN_IF" "$DHCP_WAN_TIMEOUT" >/dev/null 2>&1 || true
+
+  nat_on "$WLAN_IF" "$LAN_IF"
+
+  clear_ap_fallback_window
+  set_active "ap"
+  [ "$commit" = "1" ] && set_last "ap"
+  log "AP ativo ($AP_SSID)"
 }
 
 profile_client_wifi(){
+  local commit="${1:-1}"  # 1 = grava last_profile, 0 = não grava (uso interno)
   stop_all
-  ensure_wpa_conf_from_env
 
-  log "client-wifi: conectando"
-  if ! start_wifi_and_wait; then
-    log "client-wifi: associação falhou → AP"
-    profile_ap
+  ensure_wpa || { fallback_ap_runtime "sem credenciais Wi-Fi"; return 1; }
+
+  if ! wifi_connect_with_retry; then
+    fallback_ap_runtime "Wi-Fi falhou após ${WIFI_RETRY_MAX} tentativas"
     return 1
   fi
 
-  if ! wait_dhcp "$WLAN_IF"; then
-    log "client-wifi: DHCP falhou → AP"
-    profile_ap
-    return 1
-  fi
+  # opcional: end0 também cliente (não bloqueia)
+  ip link set "$LAN_IF" up 2>/dev/null || true
+  dhcp_acquire "$LAN_IF" "$DHCP_WAN_TIMEOUT" >/dev/null 2>&1 || true
 
-  if ! test_connectivity; then
-    log "client-wifi: sem conectividade → AP"
-    profile_ap
-    return 1
-  fi
-
-  dhclient "$LAN_IF" 2>/dev/null || true
-  set_last_profile "client-wifi"
-  log "client-wifi conectado com sucesso"
+  clear_ap_fallback_window
+  set_active "client-wifi"
+  [ "$commit" = "1" ] && set_last "client-wifi"
+  log "client-wifi conectado (validate=$WIFI_VALIDATE_MODE)"
 }
 
 profile_wifi_router(){
-  profile_client_wifi || return 1
-  set_if "$LAN_IF" "$WR_IP" "$WR_MASK"
-  write_dnsmasq "$LAN_IF" "$WR_RANGE_START" "$WR_RANGE_END"
-  dnsmasq --conf-file="$DNSMASQ_CONF"
+  local commit="${1:-1}"
+  # WAN = WLAN (cliente), LAN = end0 (192.168.50.0/24)
+  stop_all
+
+  ensure_wpa || { fallback_ap_runtime "sem credenciais Wi-Fi (wifi-router)"; return 1; }
+  if ! wifi_connect_with_retry; then
+    fallback_ap_runtime "wifi-router: uplink Wi-Fi falhou"
+    return 1
+  fi
+
+  ip link set "$LAN_IF" up 2>/dev/null || true
+  ip addr replace "$WR_IP" dev "$LAN_IF"
+
+  dnsmasq \
+    --conf-file=/dev/null \
+    --no-hosts --no-resolv \
+    --interface="$LAN_IF" --bind-interfaces \
+    --dhcp-range="$WR_RANGE" \
+    --dhcp-option=3,${WR_IP%/*} \
+    --dhcp-option=6,${WR_IP%/*} \
+    >/dev/null 2>&1 || true
+
   nat_on "$LAN_IF" "$WLAN_IF"
-  set_last_profile "wifi-router"
+
+  clear_ap_fallback_window
+  set_active "wifi-router"
+  [ "$commit" = "1" ] && set_last "wifi-router"
+  log "wifi-router ativo (WAN=$WLAN_IF, LAN=$LAN_IF, validate=$WIFI_VALIDATE_MODE)"
 }
 
 profile_client_lan(){
   stop_all
-  dhclient "$LAN_IF" || return 1
-  set_last_profile "client-lan"
+  ip link set "$LAN_IF" up 2>/dev/null || true
+
+  dhcp_acquire "$LAN_IF" "$DHCP_WAN_TIMEOUT" >/dev/null 2>&1 || true
+
+  clear_ap_fallback_window
+  set_active "client-lan"
+  set_last "client-lan"
+  log "client-lan ativo"
 }
 
 profile_3g(){
   stop_all
-  wifi_scan_pre_ap
   pppd call "$PPP_PEER" &
-  set_if "$WLAN_IF" "$G3_IP" "$G3_MASK"
-  start_ap "$WLAN_IF" "$G3_RANGE_START" "$G3_RANGE_END"
+
+  rf_on
+  ip link set "$WLAN_IF" up 2>/dev/null || true
+  ip addr replace "192.168.60.1/24" dev "$WLAN_IF"
+  start_ap_services
   nat_on "$WLAN_IF" "$PPP_IF"
-  set_last_profile "3g"
+
+  clear_ap_fallback_window
+  set_active "3g"
+  set_last "3g"
+  log "3g ativo (AP via ppp0)"
 }
 
 profile_3g_client(){
   stop_all
-  wifi_scan_pre_ap
   pppd call "$PPP_PEER" &
-  set_if "$WLAN_IF" "$G3C_IP" "$G3C_MASK"
-  start_ap "$WLAN_IF" "$G3C_RANGE_START" "$G3C_RANGE_END"
+
+  rf_on
+  ip link set "$WLAN_IF" up 2>/dev/null || true
+  ip addr replace "192.168.61.1/24" dev "$WLAN_IF"
+  start_ap_services
   nat_on "$WLAN_IF" "$PPP_IF"
-  dhclient "$LAN_IF" 2>/dev/null || true
-  set_last_profile "3g-client"
+
+  ip link set "$LAN_IF" up 2>/dev/null || true
+  dhcp_acquire "$LAN_IF" "$DHCP_WAN_TIMEOUT" >/dev/null 2>&1 || true
+
+  clear_ap_fallback_window
+  set_active "3g-client"
+  set_last "3g-client"
+  log "3g-client ativo"
 }
 
-profile_status(){
-  ip -4 addr
-  ip route
-}
-
-# ============================================================
-# DISPATCH
-# ============================================================
+# ================= DISPATCH =================
 case "${1:-}" in
-  ap) profile_ap ;;
-  wifi-router) profile_wifi_router ;;
-  client-wifi) profile_client_wifi ;;
-  client-lan) profile_client_lan ;;
-  3g) profile_3g ;;
-  3g-client) profile_3g_client ;;
-  stop) stop_all ;;
-  status) profile_status ;;
+  ap)          profile_ap 1 ;;
+  client-wifi) profile_client_wifi 1 ;;
+  wifi-router) profile_wifi_router 1 ;;
+  client-lan)  profile_client_lan ;;
+  3g)          profile_3g ;;
+  3g-client)   profile_3g_client ;;
+  stop)
+    stop_all
+    set_active "stopped"
+    log "parado"
+    ;;
+  status)
+    echo "=== desired(last_profile) ==="
+    cat "$LAST_FILE" 2>/dev/null || echo "(none)"
+    echo
+    echo "=== active(active_profile) ==="
+    cat "$ACTIVE_FILE" 2>/dev/null || echo "(none)"
+    echo
+    echo "=== validate ==="
+    echo "WIFI_VALIDATE_MODE=$WIFI_VALIDATE_MODE"
+    echo "WIFI_TEST_IPS=${WIFI_TEST_IPS_ARR[*]}"
+    echo
+    echo "=== ip addr ==="
+    ip addr || true
+    echo
+    echo "=== ip route ==="
+    ip route || true
+    echo
+    if [ -n "$WPA_CLI_BIN" ]; then
+      echo "=== wpa_cli status ($WLAN_IF) ==="
+      wpa_cli_cmd status || true
+      echo
+    fi
+    ;;
   *)
-    echo "Uso: $0 {ap|wifi-router|client-wifi|client-lan|3g|3g-client|stop|status}"
-    exit 1 ;;
+    echo "uso: $0 {ap|client-wifi|wifi-router|client-lan|3g|3g-client|stop|status}"
+    exit 1
+    ;;
 esac
+
+
 
 
 
@@ -3069,26 +3492,6 @@ sudo chmod +x /usr/local/bin/profiles.sh
 
 
 
-sudo tee /etc/systemd/system/mirako-web.service >/dev/null <<'EOF'
-[Unit]
-Description=Mirako Router Web UI (Flask)
-After=network.target
-Wants=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/opt/mirako_web
-ExecStart=/usr/bin/python3 /opt/mirako_web/web_config.py
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now mirako-web.service
 
 
 
@@ -3098,102 +3501,8 @@ sudo systemctl enable --now mirako-web.service
 
 
 
-sudo tee /etc/systemd/system/mirako-autodial.service >/dev/null <<'EOF'
-[Unit]
-Description=Mirako auto-dial 3G while /var/lib/mirako/auto_dial_enabled exists
-After=network-online.target
-Wants=network-online.target
-ConditionPathExists=/var/lib/mirako/auto_dial_enabled
-
-[Service]
-Type=simple
-Environment=PPP_IF=ppp0
-Environment=PPP_PEER=3g
-ExecStart=/usr/local/bin/mirako-autodial.sh
-ExecStop=/usr/bin/pkill -x pppd
-Restart=always
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
-
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable mirako-autodial.service
 
 
-
-
-sudo tee /usr/local/bin/mirako-autodial.sh >/dev/null <<'EOF'
-#!/bin/sh
-set -eu
-
-FLAG="/var/lib/mirako/auto_dial_enabled"
-PPP_IF="${PPP_IF:-ppp0}"
-PPP_PEER="${PPP_PEER:-3g}"
-IP="/usr/sbin/ip"
-PPPD="/usr/sbin/pppd"
-
-log() { printf '[autodial] %s %s\n' "$(date '+%F %T')" "$*"; }
-
-trap 'log "saindo"; /usr/bin/pkill -x pppd >/dev/null 2>&1 || true; exit 0' INT TERM
-
-while [ -e "$FLAG" ]; do
-  # já está up? só monitora
-  if $IP link show "$PPP_IF" >/dev/null 2>&1; then
-    sleep 5
-    continue
-  fi
-
-  log "$PPP_IF down; limpando e discando..."
-  /usr/bin/pkill -x pppd >/dev/null 2>&1 || true
-  /bin/rm -f /var/lock/LCK..ttyUSB* /var/lock/LCK..ttyACM* >/dev/null 2>&1 || true
-
-  # inicia em foreground para logar no journald
-  $PPPD call "$PPP_PEER" nodetach &
-  PPPD_PID=$!
-
-  # aguarda até 30s o ppp0 aparecer
-  i=0
-  while [ $i -lt 30 ]; do
-    if $IP link show "$PPP_IF" >/dev/null 2>&1; then
-      log "$PPP_IF ativo."
-      break
-    fi
-    i=$((i+1))
-    sleep 1
-  done
-
-  # espera pppd ou flag sumir
-  while kill -0 "$PPPD_PID" 2>/dev/null; do
-    [ -e "$FLAG" ] || { log "flag removida; encerrando pppd"; kill "$PPPD_PID" >/dev/null 2>&1 || true; break; }
-    sleep 2
-  done
-
-  wait "$PPPD_PID" || true
-  log "pppd saiu; nova tentativa em 5s..."
-  sleep 5
-done
-
-log "flag ausente; encerrando."
-exit 0
-EOF
-
-
-
-sudo chmod +x /usr/local/bin/mirako-autodial.sh
-sudo install -m 0755 /usr/local/bin/mirako-autodial.sh /usr/local/bin/mirako-autodial.sh
-
-
-
-
-
-
-
-sudo systemctl daemon-reload
-sudo systemctl enable mirako-autodial.service
-sudo systemctl restart mirako-autodial.service
 
 
 
@@ -3307,6 +3616,322 @@ sudo chmod +x /usr/local/bin/mirako-apply-last-profile.sh
 
 
 
+
+
+
+
+
+
+
+
+
+
+sudo tee /usr/local/bin/mirako-netwatch.sh >/dev/null <<'EOF'
+#!/usr/bin/env bash
+# mirako-netwatch.sh — Supervisor de conectividade Mirako (respeita UI/last_profile)
+#
+# Objetivo:
+# - last_profile = perfil DESEJADO (selecionado pela UI / boot).
+# - active_profile = perfil ATIVO (informativo; o profiles.sh mantém).
+# - Se last_profile for client-wifi ou wifi-router:
+#     * se Wi-Fi estiver degradado, sobe AP temporário (fallback) por 180s,
+#       mantendo last_profile intacto, e depois tenta reconectar no Wi-Fi.
+# - Se last_profile for ap / client-lan / 3g / 3g-client:
+#     * não força alternância para Wi-Fi (apenas reaplica o próprio perfil quando fizer sentido).
+#
+# OBS: este script assume o profiles.sh que:
+# - valida GW no client-wifi/wifi-router (associação + DHCP + ping gateway)
+# - fallback AP temporário NÃO sobrescreve last_profile
+
+set -Eeuo pipefail
+trap 'echo "[mirako-netwatch][ERRO] linha $LINENO: $BASH_COMMAND" >&2' ERR
+
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+LOGTAG="mirako-netwatch"
+
+PROFILES_SCRIPT="${PROFILES_SCRIPT:-/usr/local/bin/profiles.sh}"
+LAST_FILE="${LAST_FILE:-/var/lib/mirako/last_profile}"
+ACTIVE_FILE="${ACTIVE_FILE:-/var/lib/mirako/active_profile}"
+FALLBACK_UNTIL_FILE="${FALLBACK_UNTIL_FILE:-/var/lib/mirako/ap_fallback_until}"
+
+WLAN_IF="${WLAN_IF:-wlan0}"
+LAN_IF="${LAN_IF:-end0}"
+PPP_IF="${PPP_IF:-ppp0}"
+
+# Alvos de teste (use 2 para reduzir falsos positivos de DNS/rota)
+TARGETS_DEFAULT=("1.1.1.1" "8.8.8.8")
+
+CHECK_INTERVAL="${CHECK_INTERVAL:-10}"        # segundos
+AP_FALLBACK_WINDOW="${AP_FALLBACK_WINDOW:-180}" # segundos (deve casar com profiles.sh)
+
+# Quantas falhas consecutivas antes de tentar reaplicar (evita flapping)
+FAILS_BEFORE_ACTION="${FAILS_BEFORE_ACTION:-2}"
+
+log(){ echo "[$LOGTAG] $*"; logger -t "$LOGTAG" -- "$*"; }
+
+have(){ command -v "$1" >/dev/null 2>&1; }
+
+get_file_trim(){
+  local f="$1"
+  [ -f "$f" ] || { echo ""; return 0; }
+  tr -d '\r\n' < "$f" 2>/dev/null || echo ""
+}
+
+get_last_profile(){
+  local p
+  p="$(get_file_trim "$LAST_FILE" | tr '[:upper:]' '[:lower:]')"
+  echo "${p:-ap}"
+}
+
+get_active_profile(){
+  local p
+  p="$(get_file_trim "$ACTIVE_FILE" | tr '[:upper:]' '[:lower:]')"
+  echo "${p:-}"
+}
+
+fallback_until_ts(){
+  local v
+  v="$(get_file_trim "$FALLBACK_UNTIL_FILE")"
+  if [[ "${v:-}" =~ ^[0-9]+$ ]]; then
+    echo "$v"
+  else
+    echo "0"
+  fi
+}
+
+now_ts(){ date +%s; }
+
+in_fallback_window(){
+  local until
+  until="$(fallback_until_ts)"
+  [ "$until" -gt 0 ] || return 1
+  [ "$(now_ts)" -lt "$until" ]
+}
+
+# ---------- Checks ----------
+iface_has_ipv4(){
+  local dev="$1"
+  ip -4 addr show dev "$dev" 2>/dev/null | grep -q 'inet '
+}
+
+wpa_completed(){
+  local dev="$1"
+  have wpa_cli || return 0
+  wpa_cli -i "$dev" status 2>/dev/null | grep -q '^wpa_state=COMPLETED'
+}
+
+gw_for_dev(){
+  local dev="$1"
+  ip -4 route show default dev "$dev" 2>/dev/null | awk '
+    $1=="default" {
+      for(i=1;i<=NF;i++){
+        if($i=="via"){print $(i+1); exit}
+      }
+    }'
+}
+
+ping_via(){
+  local dev="$1"; shift
+  local ip="$1"
+  ping -I "$dev" -c1 -W2 "$ip" >/dev/null 2>&1
+}
+
+any_target_ok(){
+  local dev="$1"
+  local t
+  for t in "${TARGETS_DEFAULT[@]}"; do
+    if ping_via "$dev" "$t"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+wifi_ok(){
+  ip link show "$WLAN_IF" >/dev/null 2>&1 || return 1
+  wpa_completed "$WLAN_IF" || return 1
+  iface_has_ipv4 "$WLAN_IF" || return 1
+
+  # valida GW (mais confiável que ping externo isolado)
+  local gw
+  gw="$(gw_for_dev "$WLAN_IF" || true)"
+  [ -n "${gw:-}" ] || return 1
+  ping_via "$WLAN_IF" "$gw" || return 1
+
+  # e ao menos 1 alvo externo
+  any_target_ok "$WLAN_IF" || return 1
+
+  return 0
+}
+
+lan_ok(){
+  ip link show "$LAN_IF" >/dev/null 2>&1 || return 1
+  iface_has_ipv4 "$LAN_IF" || return 1
+  any_target_ok "$LAN_IF" || return 1
+  return 0
+}
+
+ppp_ok(){
+  ip link show "$PPP_IF" >/dev/null 2>&1 || return 1
+  iface_has_ipv4 "$PPP_IF" || return 1
+  ping -I "$PPP_IF" -c1 -W4 1.1.1.1 >/dev/null 2>&1 || return 1
+  return 0
+}
+
+apply_profile(){
+  local p="$1"
+  log "reaplicando perfil '$p' via profiles.sh"
+  if "$PROFILES_SCRIPT" "$p"; then
+    log "perfil '$p' reaplicado (ok)"
+    return 0
+  else
+    log "ERRO ao reaplicar perfil '$p'"
+    return 1
+  fi
+}
+
+# ---------- Estado / contadores ----------
+FAIL_WIFI=0
+FAIL_LAN=0
+LAST_SEEN_PROFILE=""
+
+log "iniciado (CHECK_INTERVAL=${CHECK_INTERVAL}s, WLAN_IF=$WLAN_IF, LAN_IF=$LAN_IF, PPP_IF=$PPP_IF)"
+log "alvos: ${TARGETS_DEFAULT[*]} | FAILS_BEFORE_ACTION=$FAILS_BEFORE_ACTION | AP_FALLBACK_WINDOW=${AP_FALLBACK_WINDOW}s"
+
+while true; do
+  DESIRED="$(get_last_profile)"
+  ACTIVE="$(get_active_profile)"
+
+  # log leve quando trocar perfil desejado (UI)
+  if [ "$DESIRED" != "$LAST_SEEN_PROFILE" ]; then
+    log "perfil desejado (last_profile) = '$DESIRED' (ativo: '${ACTIVE:-?}')"
+    LAST_SEEN_PROFILE="$DESIRED"
+    FAIL_WIFI=0
+    FAIL_LAN=0
+  fi
+
+  case "$DESIRED" in
+    wifi-router|client-wifi)
+      # 1) se estamos na janela de fallback AP, NÃO tenta reconectar ainda
+      if in_fallback_window; then
+        # garante que AP está de pé (sem ficar reaplicando sem necessidade)
+        # apenas loga raramente (a cada ~60s)
+        if (( ( $(now_ts) % 60 ) == 0 )); then
+          local_until="$(fallback_until_ts)"
+          remain=$(( local_until - $(now_ts) ))
+          [ "$remain" -lt 0 ] && remain=0
+          log "janela AP fallback ativa, restam ~${remain}s (não tentando Wi-Fi agora)"
+        fi
+        sleep "$CHECK_INTERVAL"
+        continue
+      fi
+
+      # 2) fora da janela: precisa que Wi-Fi esteja OK; se não, aciona reconexão
+      if wifi_ok; then
+        FAIL_WIFI=0
+      else
+        FAIL_WIFI=$((FAIL_WIFI+1))
+        log "Wi-Fi degradado ($FAIL_WIFI/$FAILS_BEFORE_ACTION) — desejado=$DESIRED (ativo=${ACTIVE:-?})"
+        if [ "$FAIL_WIFI" -ge "$FAILS_BEFORE_ACTION" ]; then
+          FAIL_WIFI=0
+          # reaplica o perfil desejado; o profiles.sh:
+          # - tenta Wi-Fi (com retry e valida GW)
+          # - se falhar: sobe AP temporário por 180s, preservando last_profile
+          apply_profile "$DESIRED" || true
+        fi
+      fi
+      ;;
+
+    client-lan)
+      if lan_ok; then
+        FAIL_LAN=0
+      else
+        FAIL_LAN=$((FAIL_LAN+1))
+        log "LAN degradada ($FAIL_LAN/$FAILS_BEFORE_ACTION) — desejado=client-lan"
+        if [ "$FAIL_LAN" -ge "$FAILS_BEFORE_ACTION" ]; then
+          FAIL_LAN=0
+          apply_profile "client-lan" || true
+        fi
+      fi
+      ;;
+
+    3g|3g-client)
+      # PPP costuma ser cuidado por autodial; aqui só reporta.
+      if ppp_ok; then
+        :
+      else
+        log "PPP degradado (perfil $DESIRED) — autodial/pppd cuidará"
+      fi
+      ;;
+
+    ap|"")
+      # Se AP é o desejado, não forçamos reconexão de Wi-Fi nunca.
+      # Mas podemos garantir que está rodando (se alguém matou serviços).
+      # Evita loop: só reaplica se active_profile estiver vazio/stopped.
+      if [ -z "${ACTIVE:-}" ] || [[ "$ACTIVE" == "stopped" ]]; then
+        log "AP desejado mas ativo indefinido — reaplicando 'ap'"
+        apply_profile "ap" || true
+      fi
+      ;;
+
+    *)
+      log "perfil desejado desconhecido '$DESIRED' — ignorando"
+      ;;
+  esac
+
+  sleep "$CHECK_INTERVAL"
+done
+
+
+
+EOF
+
+sudo chmod +x /usr/local/bin/mirako-netwatch.sh
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+sudo tee /etc/systemd/system/mirako-web.service >/dev/null <<'EOF'
+[Unit]
+Description=Mirako Router Web UI (Flask)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/mirako_web
+ExecStart=/usr/bin/python3 /opt/mirako_web/web_config.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now mirako-web.service
+
+
+
+
+
+
+
+
+
 sudo tee /etc/systemd/system/mirako-apply-last-profile.service >/dev/null <<'EOF'
 [Unit]
 Description=Mirako: aplicar último perfil após o boot
@@ -3341,166 +3966,6 @@ sudo systemctl enable --now mirako-apply-last-profile.service
 
 
 
-sudo tee /etc/systemd/system/mirako-wpa@.service >/dev/null <<'EOF'
-[Unit]
-Description=WPA supplicant for %i
-After=network.target
-
-[Service]
-ExecStart=/usr/sbin/wpa_supplicant -i %i -c /etc/wpa_supplicant/wpa_supplicant-%i.conf -D nl80211
-Restart=always
-RestartSec=3
-EOF
-
-
-
-
-sudo tee /usr/local/bin/mirako-netwatch.sh >/dev/null <<'EOF'
-#!/usr/bin/env bash
-# mirako-netwatch.sh — Supervisor de conectividade Mirako
-# Responsabilidade:
-# - Monitorar conectividade
-# - Reaplicar o perfil ATUAL se estiver degradado
-# - NUNCA forçar fallback (profiles.sh decide)
-# - Respeitar fallback automático para AP
-
-set -Eeuo pipefail
-
-PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
-
-LOGTAG="mirako-netwatch"
-
-PROFILES_SCRIPT="${PROFILES_SCRIPT:-/usr/local/bin/profiles.sh}"
-LAST_FILE="${LAST_FILE:-/var/lib/mirako/last_profile}"
-
-WLAN_IF="${WLAN_IF:-wlan0}"
-LAN_IF="${LAN_IF:-end0}"
-PPP_IF="${PPP_IF:-ppp0}"
-
-TARGET_IP="${TARGET_IP:-1.1.1.1}"
-CHECK_INTERVAL="${CHECK_INTERVAL:-10}"
-
-log() {
-  echo "[$LOGTAG] $*"
-  logger -t "$LOGTAG" -- "$*"
-}
-
-# ==============================
-# Checkers
-# ==============================
-
-wifi_ok() {
-  ip link show "$WLAN_IF" >/dev/null 2>&1 || return 1
-
-  if command -v wpa_cli >/dev/null 2>&1; then
-    wpa_cli -i "$WLAN_IF" status 2>/dev/null | grep -q '^wpa_state=COMPLETED' || return 1
-  fi
-
-  ip -4 addr show dev "$WLAN_IF" | grep -q 'inet ' || return 1
-
-  ping -I "$WLAN_IF" -c1 -W2 "$TARGET_IP" >/dev/null 2>&1 || return 1
-
-  return 0
-}
-
-lan_ok() {
-  ip link show "$LAN_IF" >/dev/null 2>&1 || return 1
-  ip -4 addr show dev "$LAN_IF" | grep -q 'inet ' || return 1
-  ping -I "$LAN_IF" -c1 -W2 "$TARGET_IP" >/dev/null 2>&1 || return 1
-  return 0
-}
-
-ppp_ok() {
-  ip link show "$PPP_IF" >/dev/null 2>&1 || return 1
-  ip -4 addr show dev "$PPP_IF" | grep -q 'inet ' || return 1
-  ping -I "$PPP_IF" -c1 -W4 "$TARGET_IP" >/dev/null 2>&1 || return 1
-  return 0
-}
-
-# ==============================
-# Helpers
-# ==============================
-
-get_last_profile() {
-  [ -f "$LAST_FILE" ] && tr -d '\n\r' < "$LAST_FILE" | tr '[:upper:]' '[:lower:]' || echo ""
-}
-
-apply_profile_safe() {
-  local PROFILE="$1"
-  log "reaplicando perfil '$PROFILE'"
-  if "$PROFILES_SCRIPT" "$PROFILE"; then
-    log "perfil '$PROFILE' reaplicado"
-  else
-    log "ERRO ao reaplicar perfil '$PROFILE'"
-  fi
-}
-
-# ==============================
-# Loop principal
-# ==============================
-
-log "iniciado (WLAN_IF=$WLAN_IF, LAN_IF=$LAN_IF, PPP_IF=$PPP_IF, TARGET_IP=$TARGET_IP)"
-
-while true; do
-  PROFILE="$(get_last_profile)"
-
-  case "$PROFILE" in
-    wifi-router)
-      if ! wifi_ok; then
-        log "wifi-router degradado"
-        apply_profile_safe "wifi-router"
-
-        sleep 2
-        NEW_PROFILE="$(get_last_profile)"
-        [ "$NEW_PROFILE" = "ap" ] && log "fallback para AP detectado — respeitando"
-      fi
-      ;;
-
-    client-wifi)
-      if ! wifi_ok; then
-        log "client-wifi degradado"
-        apply_profile_safe "client-wifi"
-
-        sleep 2
-        NEW_PROFILE="$(get_last_profile)"
-        [ "$NEW_PROFILE" = "ap" ] && log "fallback para AP detectado — respeitando"
-      fi
-      ;;
-
-    client-lan)
-      if ! lan_ok; then
-        log "client-lan degradado"
-        apply_profile_safe "client-lan"
-      fi
-      ;;
-
-    3g|3g-client)
-      # PPP geralmente é supervisionado por autodial
-      if ! ppp_ok; then
-        log "PPP degradado (perfil $PROFILE) — autodial cuidará"
-      fi
-      ;;
-
-    ap|"")
-      # AP é estado seguro — nada a fazer
-      ;;
-  esac
-
-  sleep "$CHECK_INTERVAL"
-done
-
-
-EOF
-
-sudo chmod +x /usr/local/bin/mirako-netwatch.sh
-
-
-
-
-
-
-
-
 sudo tee /etc/systemd/system/mirako-netwatch.service >/dev/null <<'EOF'
 [Unit]
 Description=Mirako network health supervisor
@@ -3526,6 +3991,157 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now mirako-netwatch.service
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+sudo tee /etc/systemd/system/mirako-autodial.service >/dev/null <<'EOF'
+[Unit]
+Description=Mirako auto-dial 3G while /var/lib/mirako/auto_dial_enabled exists
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/mirako/auto_dial_enabled
+
+[Service]
+Type=simple
+Environment=PPP_IF=ppp0
+Environment=PPP_PEER=3g
+ExecStart=/usr/local/bin/mirako-autodial.sh
+ExecStop=/usr/bin/pkill -x pppd
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable mirako-autodial.service
+
+
+
+
+sudo tee /usr/local/bin/mirako-autodial.sh >/dev/null <<'EOF'
+#!/bin/sh
+set -eu
+
+FLAG="/var/lib/mirako/auto_dial_enabled"
+PPP_IF="${PPP_IF:-ppp0}"
+PPP_PEER="${PPP_PEER:-3g}"
+IP="/usr/sbin/ip"
+PPPD="/usr/sbin/pppd"
+
+log() { printf '[autodial] %s %s\n' "$(date '+%F %T')" "$*"; }
+
+trap 'log "saindo"; /usr/bin/pkill -x pppd >/dev/null 2>&1 || true; exit 0' INT TERM
+
+while [ -e "$FLAG" ]; do
+  # já está up? só monitora
+  if $IP link show "$PPP_IF" >/dev/null 2>&1; then
+    sleep 5
+    continue
+  fi
+
+  log "$PPP_IF down; limpando e discando..."
+  /usr/bin/pkill -x pppd >/dev/null 2>&1 || true
+  /bin/rm -f /var/lock/LCK..ttyUSB* /var/lock/LCK..ttyACM* >/dev/null 2>&1 || true
+
+  # inicia em foreground para logar no journald
+  $PPPD call "$PPP_PEER" nodetach &
+  PPPD_PID=$!
+
+  # aguarda até 30s o ppp0 aparecer
+  i=0
+  while [ $i -lt 30 ]; do
+    if $IP link show "$PPP_IF" >/dev/null 2>&1; then
+      log "$PPP_IF ativo."
+      break
+    fi
+    i=$((i+1))
+    sleep 1
+  done
+
+  # espera pppd ou flag sumir
+  while kill -0 "$PPPD_PID" 2>/dev/null; do
+    [ -e "$FLAG" ] || { log "flag removida; encerrando pppd"; kill "$PPPD_PID" >/dev/null 2>&1 || true; break; }
+    sleep 2
+  done
+
+  wait "$PPPD_PID" || true
+  log "pppd saiu; nova tentativa em 5s..."
+  sleep 5
+done
+
+log "flag ausente; encerrando."
+exit 0
+EOF
+
+
+
+sudo chmod +x /usr/local/bin/mirako-autodial.sh
+
+
+
+
+
+
+
+
+sudo systemctl daemon-reload
+sudo systemctl enable mirako-autodial.service
+sudo systemctl restart mirako-autodial.service
+
+
+
+
+
+
+
+
 
 
 
