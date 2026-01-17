@@ -40,19 +40,45 @@ EOF
 
 
 
+
+
 sudo apt update
 sudo apt install -y hostapd dnsmasq ppp usb-modeswitch wpasupplicant iptables-persistent python3-flask python3-systemd traceroute tcpdump isc-dhcp-client iptables pppoeconf rfkill nftables python3-pip zram-tools busybox udhcpc udhcpd watchdog zram-tools nginx
 
 
+sudo apt-get update
+sudo apt-get install -y build-essential cmake git libjson-c-dev libwebsockets-dev
+git clone https://github.com/tsl0922/ttyd.git
+cd ttyd && mkdir build && cd build
+cmake ..
+make
+sudo make install
 
-sudo systemctl enable watchdog
-sudo systemctl start watchdog
+
+sudo tee /etc/systemd/system/ttyd.service >/dev/null <<'EOF'
+[Unit]
+Description=ttyd web terminal
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/ttyd -p 7681 -i 0.0.0.0 -c admin:qazwsx -W bash -t fontSize=16
+Restart=always
+User=root
+WorkingDirectory=/root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now ttyd
+sudo systemctl restart ttyd
 
 
 
 
-sudo apt install certbot python3-certbot-nginx
-sudo certbot --nginx -d alien.mirako.org
+
 
 
 
@@ -252,7 +278,6 @@ sudo chown root:root /opt/mirako_web/users.ini
 
 
 
-
 sudo tee /opt/mirako_web/web_config.py >/dev/null <<'EOF'
 #!/usr/bin/env python3
 # coding: utf-8
@@ -282,7 +307,11 @@ import shutil
 import subprocess
 import threading
 import signal
+import configparser
+import json
+import uuid
 from typing import Any, List, Tuple, Dict
+
 
 from flask import (
     Flask,
@@ -294,12 +323,11 @@ from flask import (
     jsonify,
     send_from_directory,
     abort,
+    make_response,
 )
 
 
-import configparser
-from flask import jsonify, make_response
-import json
+
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("MIRAKO_SECRET", "devkey")
@@ -355,6 +383,176 @@ def get_active_profile() -> str:
             return f.read().strip() or "ap"
     except Exception:
         return "ap"
+
+
+
+# ========================== WIFI_SAVED_DB==========================
+
+
+WIFI_SAVED_DB = "/etc/mirako/wifi_saved.json"
+
+def _wifi_db_load() -> List[Dict[str, Any]]:
+    try:
+        if not os.path.exists(WIFI_SAVED_DB):
+            return []
+        with open(WIFI_SAVED_DB, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        items = data.get("items", [])
+        if not isinstance(items, list):
+            return []
+        # normaliza
+        out: List[Dict[str, Any]] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            ssid = str(it.get("ssid", "")).strip()
+            if not ssid:
+                continue
+            out.append({
+                "id": str(it.get("id", "")).strip() or str(uuid.uuid4()),
+                "ssid": ssid,
+                "psk": str(it.get("psk", "") or ""),
+                "ts": float(it.get("ts", time.time())),
+            })
+        out.sort(key=lambda x: x["ssid"].lower())
+        return out
+    except Exception:
+        return []
+
+def _wifi_db_write(items: List[Dict[str, Any]]) -> None:
+    os.makedirs(os.path.dirname(WIFI_SAVED_DB), exist_ok=True)
+    tmp = WIFI_SAVED_DB + ".tmp"
+    payload = {"items": items, "ts": time.time()}
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, WIFI_SAVED_DB)
+
+def wifi_saved_list() -> List[Dict[str, Any]]:
+    return _wifi_db_load()
+
+def wifi_saved_get(item_id: str) -> Dict[str, Any] | None:
+    item_id = (item_id or "").strip()
+    if not item_id:
+        return None
+    for it in _wifi_db_load():
+        if it.get("id") == item_id:
+            return it
+    return None
+
+def wifi_saved_upsert(item_id: str, ssid: str, psk: str) -> None:
+    item_id = (item_id or "").strip()
+    ssid = (ssid or "").strip()
+    psk = (psk or "")
+
+    if not ssid:
+        raise ValueError("SSID vazio")
+
+    items = _wifi_db_load()
+
+    # update por id (se existir)
+    if item_id:
+        for it in items:
+            if it.get("id") == item_id:
+                it["ssid"] = ssid
+                if psk != "":
+                    it["psk"] = psk
+                it["ts"] = time.time()
+                _wifi_db_write(items)
+                return
+
+    # senão: upsert por SSID
+    for it in items:
+        if it.get("ssid") == ssid:
+            if psk != "":
+                it["psk"] = psk
+            it["ts"] = time.time()
+            _wifi_db_write(items)
+            return
+
+    items.append({
+        "id": str(uuid.uuid4()),
+        "ssid": ssid,
+        "psk": psk,
+        "ts": time.time(),
+    })
+    items.sort(key=lambda x: x["ssid"].lower())
+    _wifi_db_write(items)
+
+def wifi_saved_delete(item_id: str) -> None:
+    item_id = (item_id or "").strip()
+    if not item_id:
+        return
+    items = [it for it in _wifi_db_load() if it.get("id") != item_id]
+    _wifi_db_write(items)
+
+def connect_wifi_guarded(ssid: str, psk: str) -> Tuple[bool, str]:
+    ssid = (ssid or "").strip()
+    psk = (psk or "").strip()
+
+    if not ssid:
+        return False, "SSID vazio"
+
+    # 1) salva wifi.env
+    try:
+        os.makedirs("/etc/mirako", exist_ok=True)
+        with open("/etc/mirako/wifi.env", "w", encoding="utf-8") as f:
+            f.write(f'WIFI_SSID="{ssid}"\n')
+            f.write(f'WIFI_PSK="{psk}"\n')
+        os.chmod("/etc/mirako/wifi.env", 0o600)
+    except Exception as e:
+        return False, f"falha ao salvar credenciais: {e}"
+
+    # 2) aplica client-wifi
+    rc, out = profile_set("client-wifi")
+
+    # ✅ se o profiles.sh falhou, ele mesmo já colocou AP fallback
+    if rc != 0:
+        return False, (
+            "❌ Não foi possível conectar ao Wi-Fi.<br>"
+            "✅ O sistema entrou em <b>AP fallback</b> automaticamente para não perder acesso.<br>"
+            f"<small class='mono'>{(out or '').strip()}</small>"
+        )
+
+    # 3) valida por alguns segundos (quando rc==0, geralmente já tem IP)
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        last_active = (get_active_profile() or "").strip()
+        last_ip = get_ipv4_list(WLAN_IF).strip()
+        if last_active == "client-wifi" and last_ip and last_ip != "-":
+            return True, f"✅ Conectado ao Wi-Fi <b>{ssid}</b><br>IP em {WLAN_IF}: <span class='mono'>{last_ip}</span>"
+        time.sleep(2)
+
+    # se demorou demais, não destrói last_profile — só informa
+    return False, (
+        "⚠️ Perfil aplicado, mas ainda sem IP no wlan0.<br>"
+        "Verifique DHCP/roteamento.<br>"
+        f"<small class='mono'>active={get_active_profile()} ip={get_ipv4_list(WLAN_IF)}</small>"
+    )
+
+
+
+
+# ========================== ap_fallback_until ==========================
+
+
+FALLBACK_UNTIL_FILE = "/var/lib/mirako/ap_fallback_until"
+
+def ap_fallback_remaining_sec() -> int:
+    try:
+        until = int(open(FALLBACK_UNTIL_FILE, "r").read().strip())
+        return max(0, until - int(time.time()))
+    except Exception:
+        return 0
+
+def force_ap_now(reason: str = "") -> None:
+    run([PROFILES_SCRIPT, "ap"], timeout=180)
+    try:
+        write_last_profile("ap")
+    except Exception:
+        pass
 
 
 
@@ -708,23 +906,23 @@ def iw_info() -> dict:
     return info
 
 def get_ap_ssid() -> str:
-    for path in glob.glob("/tmp/create_ap*.conf"):
-        try:
-            txt = open(path, "r", encoding="utf-8", errors="ignore").read()
-            m = re.search(r"^\s*ssid\s*=\s*(.+)$", txt, re.M)
+    # prioridade: /etc/mirako/ap.env (fonte real do profiles.sh)
+    try:
+        if os.path.exists("/etc/mirako/ap.env"):
+            txt = open("/etc/mirako/ap.env","r",encoding="utf-8",errors="ignore").read()
+            m = re.search(r'^\s*AP_SSID\s*=\s*"?([^"\n]+)"?\s*$', txt, re.M)
             if m:
                 return m.group(1).strip()
-        except Exception:
-            pass
-    rc, out = run([IW_BIN, "dev", WLAN_IF, "info"])
-    if rc == 0 and out:
-        for ln in out.splitlines():
-            s = ln.strip()
-            if s.lower().startswith("ssid "):
-                return s.split(None, 1)[1].strip()
+    except Exception:
+        pass
     return SSID
 
+
 def iw_link() -> dict:
+    # Descobre tipo real (AP vs managed) para não “inventar conexão”
+    ii = iw_info()  # já existe no seu código
+    iftype = str(ii.get("type", "")).strip().lower()
+
     rc, out = run([IW_BIN, "dev", WLAN_IF, "link"])
     d: Dict[str, Any] = {
         "connected": False,
@@ -737,49 +935,76 @@ def iw_link() -> dict:
         "tx": "-",
         "clients": 0,
     }
-    if rc == 0 and out:
-        if "Not connected." in out:
+
+    if rc != 0 or not out:
+        return d
+
+    # 1) Caso "Not connected."
+    if "Not connected." in out:
+        # Só é "conectado" se a interface estiver em modo AP
+        if iftype == "ap":
             d["connected"] = True
             d["ssid"] = get_ap_ssid()
+
+            # Conta clientes e pega um RSSI (se houver)
             rc2, st = run([IW_BIN, "dev", WLAN_IF, "station", "dump"])
             if rc2 == 0 and st:
                 clients = 0
-                rssi = None
+                best_rssi = None
                 for ln in st.splitlines():
-                    s = ln.strip().lower()
-                    if s.startswith("station "):
+                    s = ln.strip()
+                    if s.lower().startswith("station "):
                         clients += 1
-                    if s.startswith("signal:"):
+                    # 'signal: -47 [-47] dBm' ou 'signal: -47.00 dBm'
+                    if s.lower().startswith("signal:"):
                         try:
-                            rssi = float(s.split()[1])
+                            val = float(s.split()[1])
+                            if best_rssi is None or val > best_rssi:
+                                best_rssi = val  # pega o “melhor” (mais perto de 0)
                         except Exception:
                             pass
+
                 d["clients"] = clients
-                if rssi is not None:
-                    d["signal_dbm"] = rssi
-            return d
-        else:
-            d["connected"] = True
-            for ln in out.splitlines():
-                s = ln.strip()
-                if s.startswith("SSID:"):
-                    d["ssid"] = s.split(":", 1)[1].strip()
-                elif s.startswith("Connected to "):
-                    d["bssid"] = s.split()[2].strip()
-                elif s.startswith("signal:"):
-                    try:
-                        d["signal_dbm"] = float(s.split()[1])
-                    except Exception:
-                        pass
-                elif s.startswith("rx bitrate:"):
-                    d["rx_bitrate"] = s.split(":", 1)[1].strip()
-                elif s.startswith("tx bitrate:"):
-                    d["tx_bitrate"] = s.split(":", 1)[1].strip()
-                elif s.startswith("RX:"):
-                    d["rx"] = s.split(":", 1)[1].strip()
-                elif s.startswith("TX:"):
-                    d["tx"] = s.split(":", 1)[1].strip()
+                if best_rssi is not None:
+                    d["signal_dbm"] = best_rssi
+        # Se não for AP, realmente não está conectado (managed idle)
+        return d
+
+    # 2) Caso associado (modo cliente)
+    d["connected"] = True
+    for ln in out.splitlines():
+        s = ln.strip()
+
+        if s.startswith("SSID:"):
+            d["ssid"] = s.split(":", 1)[1].strip()
+
+        elif s.startswith("Connected to "):
+            # Ex: "Connected to aa:bb:cc:dd:ee:ff (on wlan0)"
+            parts = s.split()
+            if len(parts) >= 3:
+                d["bssid"] = parts[2].strip()
+
+        elif s.startswith("signal:"):
+            # Ex: "signal: -47 dBm" ou "signal: -47.00 dBm"
+            try:
+                d["signal_dbm"] = float(s.split()[1])
+            except Exception:
+                pass
+
+        elif s.startswith("rx bitrate:"):
+            d["rx_bitrate"] = s.split(":", 1)[1].strip()
+
+        elif s.startswith("tx bitrate:"):
+            d["tx_bitrate"] = s.split(":", 1)[1].strip()
+
+        elif s.startswith("RX:"):
+            d["rx"] = s.split(":", 1)[1].strip()
+
+        elif s.startswith("TX:"):
+            d["tx"] = s.split(":", 1)[1].strip()
+
     return d
+
 
 def iface_byte_counters(dev: str) -> Tuple[int, int, int, int]:
     base = f"/sys/class/net/{dev}/statistics"
@@ -841,62 +1066,6 @@ def wifi_status_details() -> dict:
         "distance_m": f"~{dist_m} m" if dist_m else "-",
     }
 
-def wifi_scan() -> Tuple[List[dict], str | None]:
-    ensure_iface_up(WLAN_IF)
-    rc, out = run([IW_BIN, "dev", WLAN_IF, "scan"])
-    if rc == 0 and out:
-        bss: Dict[str, Any] | None = None
-        nets: List[dict] = []
-        for line in out.splitlines():
-            s = line.strip()
-            if s.startswith("BSS "):
-                if bss:
-                    nets.append(bss)
-                bss = {"ssid": "", "signal": "", "freq": "", "security": "?"}
-            elif s.startswith("SSID:"):
-                if bss is None:
-                    bss = {}
-                bss["ssid"] = s[5:].strip()
-            elif s.startswith("freq:"):
-                if bss is None:
-                    bss = {}
-                bss["freq"] = s[5:].strip()
-            elif s.startswith("signal:"):
-                if bss is None:
-                    bss = {}
-                bss["signal"] = s[7:].strip()
-            elif s.startswith("RSN:") or s.startswith("WPA:"):
-                if bss is None:
-                    bss = {}
-                bss["security"] = "WPA/WPA2"
-        if bss:
-            nets.append(bss)
-        nets = [n for n in nets if n.get("ssid")]
-        uniq: Dict[str, dict] = {}
-        for n in nets:
-            ssid = n["ssid"]
-            if ssid not in uniq or n.get("signal", "") > uniq[ssid].get("signal", ""):
-                uniq[ssid] = n
-        return list(uniq.values()), None
-    rc2, out2 = run([IWLIST_BIN, WLAN_IF, "scan"])
-    if rc2 == 0 and out2:
-        nets = []
-        for b in out2.split("Cell "):
-            ssid_m = re.search(r'ESSID:"(.*)"', b)
-            qual = re.search(r"Signal level=(-?\d+)", b) or re.search(r"Quality=([0-9/]+)", b)
-            freq = re.search(r"Frequency:([0-9\.]+)", b)
-            enc = "Open" if "Encryption key:off" in b else "WPA/WPA2"
-            if ssid_m:
-                nets.append(
-                    {
-                        "ssid": ssid_m.group(1),
-                        "signal": (qual.group(1) if qual else "?"),
-                        "freq": (freq.group(1) if freq else "?"),
-                        "security": enc,
-                    }
-                )
-        return nets, None
-    return [], "iw scan falhou"
 
 
 
@@ -993,11 +1162,6 @@ def wifi_connect(ssid: str, psk: str | None = None) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"falha ao salvar credenciais: {e}"
 
-    # >>> IMPORTANTE: marca o perfil desejado agora
-    try:
-        write_last_profile("client-wifi")
-    except Exception:
-        pass
 
     rc, out = profile_set("client-wifi")
     if rc != 0:
@@ -1013,23 +1177,82 @@ def wifi_disconnect() -> Tuple[bool, str]:
 
 
 # ========================== Serviços & PPP ==========================
-def list_services() -> List[dict]:
+# ========================== Serviços & PPP ==========================
+
+SERVICES_CACHE: Dict[str, Any] = {"ts": 0.0, "data": []}
+SERVICES_TTL_SEC = 20  # cache para evitar martelar systemctl
+
+def list_services_fast() -> List[dict]:
+    """
+    Versão rápida:
+    - 2 chamadas ao systemctl (list-units + list-unit-files)
+    - Sem loop de is-active por serviço (que é o que mata performance)
+    """
+    enabled_map: Dict[str, str] = {}
+
+    rc1, out1 = run(
+        ["systemctl", "list-unit-files", "--type=service", "--no-pager", "--no-legend"],
+        timeout=6,
+    )
+    if rc1 == 0 and out1:
+        for line in out1.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                enabled_map[parts[0]] = parts[1]  # enabled/disabled/masked/static/...
+
     services: List[dict] = []
-    rc, out = run(["systemctl","list-unit-files","--type=service","--no-pager","--no-legend"])
-    if rc != 0 or not out:
+    rc2, out2 = run(
+        ["systemctl", "list-units", "--type=service", "--all", "--no-pager", "--no-legend"],
+        timeout=6,
+    )
+    if rc2 != 0 or not out2:
         return services
-    for line in out.splitlines():
-        parts = line.split()
-        if not parts:
+
+    for line in out2.splitlines():
+        line = line.strip()
+        if not line:
             continue
-        name = parts[0]
-        state = parts[1] if len(parts) > 1 else "disabled"
-        rc_active, _ = run(["systemctl", "is-active", name])
-        active = (rc_active == 0)
-        enabled = state.startswith("enabled")
-        services.append({"name": name, "active": active, "enabled": enabled})
+
+        # tenta manter colunas separadas (UNIT LOAD ACTIVE SUB DESCRIPTION)
+        parts = line.split(None, 5)
+        if len(parts) < 4:
+            continue
+
+        # ✅ remove marcadores do systemctl (ex: "●")
+        if parts[0] in ("●", "○", "•", "*"):
+            parts = parts[1:]
+            if len(parts) < 4:
+                continue
+
+        name, load, active, sub = parts[:4]
+        enabled_state = enabled_map.get(name, "")
+        enabled = enabled_state.startswith("enabled")
+
+        services.append({
+            "name": name,
+            "active": (active == "active"),
+            "enabled": enabled,
+            "enabled_state": enabled_state or "-",
+        })
+
     services.sort(key=lambda x: x["name"])
     return services
+
+
+@app.get("/services.json")
+def services_json():
+    now = time.time()
+    try:
+        if (now - float(SERVICES_CACHE.get("ts", 0.0))) < SERVICES_TTL_SEC:
+            return jsonify({"services": SERVICES_CACHE.get("data", []), "cached": True})
+
+        data = list_services_fast()
+        SERVICES_CACHE["ts"] = now
+        SERVICES_CACHE["data"] = data
+        return jsonify({"services": data, "cached": False})
+    except Exception as e:
+        return jsonify({"services": [], "err": str(e)}), 500
+
 
 def service_action(service: str, action: str) -> Tuple[bool, str]:
     valid = {"start","stop","restart","enable","disable"}
@@ -1081,11 +1304,16 @@ def set_auto_dial(enabled: bool) -> None:
             os.makedirs(os.path.dirname(AUTO_DIAL_FILE), exist_ok=True)
             with open(AUTO_DIAL_FILE, "w") as f:
                 f.write("1")
+            # start imediato
+            run(["systemctl", "start", "mirako-autodial.service"], timeout=10)
         else:
             if os.path.exists(AUTO_DIAL_FILE):
                 os.remove(AUTO_DIAL_FILE)
+            # stop imediato
+            run(["systemctl", "stop", "mirako-autodial.service"], timeout=10)
     except Exception:
         pass
+
 
 def ensure_default_via(gw: str, dev: str) -> None:
     if not gw:
@@ -1182,8 +1410,23 @@ TEMPLATE = """
   html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif}
   a{color:var(--acc);text-decoration:none} a:hover{text-decoration:underline}
   
-  .wrap{max-width:1400px;margin:0 auto;padding:16px}
-  
+.wrap{max-width:none;width:100%;margin:0 auto;padding:16px}
+
+  .dashboard-grid, .main-grid, .network-section, .services-terminal-section{
+  align-items: stretch;
+}
+
+.card{
+  display:flex;
+  flex-direction:column;
+  min-height:0;
+}
+
+.card .bd{
+  flex:1;
+  min-height:0;
+}
+
   .topbar{
     display:flex;
     justify-content:space-between;
@@ -1596,10 +1839,21 @@ TEMPLATE = """
           </form>
         </div>
         <div class="bd">
-          <div class="card-section">
-            <div class="card-section-title">Perfil Atual</div>
-            <div class="pill mono">{{ last_profile }}</div>
-          </div>
+<div class="card-section">
+  <div class="card-section-title">Perfil Desejado (boot)</div>
+  <div class="pill mono" id="desired_profile">{{ desired_profile }}</div>
+</div>
+
+<div class="card-section">
+  <div class="card-section-title">Perfil Ativo (runtime)</div>
+  <div class="pill mono" id="active_profile">{{ active_profile }}</div>
+</div>
+
+<div id="ap_fallback_banner" class="flash" style="display:{% if ap_fallback_rem>0 %}block{% else %}none{% endif %}; border-color:#4a3f1d;">
+  <b>⚠️ AP fallback ativo</b>
+  <div class="muted">Restam <span class="mono" id="ap_fallback_rem">{{ ap_fallback_rem }}</span>s</div>
+</div>
+
           
           <div class="card-section">
             <div class="card-section-title">Selecionar Perfil</div>
@@ -1644,12 +1898,12 @@ TEMPLATE = """
             <div class="status-item">
               <div class="label">Memória</div>
               <div class="value mono" id="sys_mem">{{ mem_pct }}%</div>
-              <div class="value mono">{{ mem_used }} / {{ mem_total }}</div>
+              <div class="value mono" id="sys_mem_detail">{{ mem_used }} / {{ mem_total }}</div>
             </div>
             <div class="status-item">
               <div class="label">Disco (/)</div>
-              <div class="value mono" id="sys_disk">{{ disk_pct }}%</div>
-              <div class="value mono">{{ disk_used }} / {{ disk_total }}</div>
+             <div class="value mono" id="sys_disk">{{ disk_pct }}%</div>
+             <div class="value mono" id="sys_disk_detail">{{ disk_used }} / {{ disk_total }}</div>
             </div>
             <div class="status-item">
               <div class="label">Uptime</div>
@@ -1705,12 +1959,17 @@ TEMPLATE = """
     <div class="card full-width">
       <div class="hd">
         <span>Wi-Fi ({{WLAN_IF}})</span>
-        <form method="post" action="{{ url_for('wifi_scan_route') }}">
-<button class="btn small outline" title="Mostra o último scan feito antes do AP">
-  Mostrar redes detectadas
+
+<button
+  type="button"
+  class="btn small warn"
+  onclick="scanRebootConfirm()"
+>
+  Scan Wi-Fi (reiniciar)
 </button>
 
-        </form>
+
+
       </div>
       <div class="bd">
         <div class="card-section">
@@ -1753,32 +2012,99 @@ TEMPLATE = """
             </div>
           </div>
         </div>
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
         
-        <div class="card-section">
-          <div class="card-section-title">Conectar a Rede Wi-Fi</div>
-          <form method="post" action="{{ url_for('wifi_connect_route') }}">
-            <div class="form-group">
-              <label class="form-label" for="ssidField">SSID</label>
-              <input type="text" name="ssid" id="ssidField" required>
-            </div>
-            
-            <div class="form-group">
-              <label class="form-label" for="pskField">Senha (vazio = aberta)</label>
-              <input type="password" name="psk" id="pskField" autocomplete="off">
-            </div>
-            
-            <div class="form-group">
-              <div class="checkbox-group">
-                <input type="checkbox" id="showPass" onchange="togglePass()">
-                <label for="showPass">Mostrar senha</label>
-              </div>
-            </div>
-            
-            <div class="btn-group">
-              <button class="btn ok">Conectar</button>
-            </div>
-          </form>
-          
+ <div class="card-section">
+  <div class="card-section-title">Wi-Fi Salvos</div>
+
+  {% if wifi_saved and wifi_saved|length > 0 %}
+  <table class="table table-compact">
+    <thead>
+      <tr>
+        <th>SSID</th>
+        <th>Senha</th>
+        <th>Ações</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for w in wifi_saved %}
+      <tr>
+        <td class="mono">{{ w.ssid }}</td>
+<td class="mono">{{ w.psk|e if w.psk else '(aberta)' }}</td>
+        <td>
+          <div class="btn-group">
+            <form method="post" action="{{ url_for('wifi_connect_saved_route') }}">
+              <input type="hidden" name="id" value="{{ w.id }}">
+              <button class="btn small ok" type="submit">Conectar</button>
+            </form>
+
+<button class="btn small outline" type="button"
+        onclick='wifiEdit({{ w.id|tojson }}, {{ w.ssid|tojson }}, {{ w.psk|tojson }})'>
+  Editar
+</button>
+
+
+
+            <form method="post" action="{{ url_for('wifi_delete_route') }}"
+                  onsubmit="return confirm('Excluir o Wi-Fi {{ w.ssid|e }}?');">
+              <input type="hidden" name="id" value="{{ w.id }}">
+              <button class="btn small danger" type="submit">Excluir</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="muted">Nenhum Wi-Fi salvo ainda.</div>
+  {% endif %}
+</div>
+
+<div class="card-section">
+  <div class="card-section-title">Adicionar / Editar Wi-Fi</div>
+
+  <form method="post" action="{{ url_for('wifi_save_route') }}" id="wifi_save_form">
+    <input type="hidden" name="id" id="wifi_edit_id" value="">
+    <div class="form-group">
+      <label class="form-label" for="ssidFieldSave">SSID</label>
+      <input type="text" name="ssid" id="ssidFieldSave" required>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label" for="pskFieldSave">
+        Senha (deixe vazio para manter a senha ao editar / ou rede aberta)
+      </label>
+<input type="text" name="psk" id="pskFieldSave" autocomplete="off">
+    </div>
+
+    <div class="btn-group">
+      <button class="btn primary" type="submit" id="wifi_save_btn">Salvar</button>
+      <button class="btn outline" type="button" onclick="wifiClearEdit()">Limpar</button>
+    </div>
+  </form>
+</div>
+
+       
           <div class="card-section">
             <form method="post" action="{{ url_for('wifi_disconnect_route') }}">
               <button class="btn warn">Desconectar Wi-Fi</button>
@@ -1788,7 +2114,7 @@ TEMPLATE = """
         
         {% if wpa_file_networks and wpa_file_networks|length > 0 %}
         <div class="card-section">
-          <div class="card-section-title">Redes do wpa_supplicant</div>
+          <div class="card-section-title">Rede do wpa_supplicant</div>
           <table class="table table-compact">
             <thead>
               <tr>
@@ -1800,7 +2126,9 @@ TEMPLATE = """
             </thead>
             <tbody>
               {% for n in wpa_file_networks %}
-              <tr class="ssid-row" data-ssid="{{ n.ssid|e }}" onclick="document.getElementById('ssidField').value=this.dataset.ssid;">
+<tr class="ssid-row" data-ssid="{{ n.ssid|e }}"
+    onclick="wifiFillFromScan(this.dataset.ssid);">
+
                 <td class="mono">{{ n.ssid }}</td>
                 <td>{{ n.psk }}</td>
                 <td>{{ n.key_mgmt }}</td>
@@ -1838,7 +2166,7 @@ TEMPLATE = """
         
         {% if scan %}
         <div class="card-section">
-          <div class="card-section-title">Redes Disponíveis</div>
+          <div class="card-section-title">Redes detectadas antes do AP (último boot)</div>
           <table class="table table-compact">
             <thead>
               <tr>
@@ -1850,7 +2178,8 @@ TEMPLATE = """
             </thead>
             <tbody>
               {% for n in scan %}
-              <tr class="ssid-row" data-ssid="{{ n.ssid|e }}" onclick="document.getElementById('ssidField').value=this.dataset.ssid;">
+<tr class="ssid-row" data-ssid="{{ n.ssid|e }}"
+    onclick="wifiFillFromScan(this.dataset.ssid);">
                 <td class="mono">{{ n.ssid }}</td>
                 <td>{{ n.signal }}</td>
                 <td>{{ n.freq }}</td>
@@ -1867,6 +2196,18 @@ TEMPLATE = """
         {% endif %}
       </div>
     </div>
+
+
+
+
+
+
+
+
+
+
+
+
 
     <!-- Nova Seção: Redes, Rotas DNS, DHCP e Arquivos -->
     <div class="network-section">
@@ -1902,36 +2243,26 @@ TEMPLATE = """
         </div>
 
         <!-- DHCP Card (movido para baixo das Interfaces) -->
-        <div class="card">
-          <div class="hd">DHCP Leases</div>
-          <div class="bd">
-            {% if leases and leases|length>0 %}
-            <table class="table table-compact">
-              <thead>
-                <tr>
-                  <th>IP</th>
-                  <th>Host</th>
-                  <th>MAC</th>
-                  <th>Expira</th>
-                </tr>
-              </thead>
-              <tbody id="leases_table_body">
-                {% for L in leases %}
-                <tr>
-                  <td class="mono">{{ L.ip }}</td>
-                  <td class="mono">{{ L.hostname or "-" }}</td>
-                  <td class="mono">{{ L.mac }}</td>
-                  <td class="mono">{{ L.expiry }}</td>
-                </tr>
-                {% endfor %}
-              </tbody>
-            </table>
-            {% else %}
-            <div class="text-center muted">Sem leases ou arquivo não encontrado.</div>
-            {% endif %}
-          </div>
-        </div>
-      </div>
+<div class="card">
+  <div class="hd">DHCP Leases</div>
+  <div class="bd">
+    <table class="table table-compact">
+      <thead>
+        <tr>
+          <th>IP</th>
+          <th>Host</th>
+          <th>MAC</th>
+          <th>Expira</th>
+        </tr>
+      </thead>
+      <tbody id="leases_table_body"></tbody>
+    </table>
+
+    <div id="leases_empty" class="text-center muted">Carregando…</div>
+  </div>
+</div>
+</div>
+
 
       <!-- Coluna da Direita: Rotas DNS e Gerenciador de Arquivos -->
       <div>
@@ -1992,36 +2323,29 @@ TEMPLATE = """
     <!-- Seção Terminal e Serviços -->
     <div class="services-terminal-section">
       <!-- Terminal Card -->
-      <div class="card full-width" id="terminal_card">
-        <div class="hd">
-          <span>Terminal ao vivo</span>
-          <div class="btn-group">
-            <button type="button" class="btn small outline" onclick="prefill('dmesg -wT')">dmesg</button>
-            <button type="button" class="btn small outline" onclick="prefill('journalctl -f')">journalctl</button>
-            <button type="button" class="btn small outline" onclick="prefill('top -b')">top</button>
-            <button type="button" class="btn small outline" onclick="prefill('tcpdump -i {{WLAN_IF}} -n -vv -s 120')">tcpdump</button>
-            <button type="button" class="btn small warn" onclick="stopCmd()">Ctrl+C</button>
-            <button type="button" class="btn small outline" onclick="clearLog()">Limpar</button>
-            <button type="button" class="btn small danger" onclick="rebootConfirm()">Reiniciar</button>
-          </div>
-        </div>
-        <div class="bd">
-          <div id="terminal_wrap" class="logbox">
-            <pre id="terminal_out" class="mono"></pre>
-          </div>
-          
-          <div class="card-section">
-            <div class="form-group">
-              <div class="input-group" style="display:flex;gap:8px;align-items:center;">
-                <span class="mono muted">$</span>
-                <input id="terminal_cmd" placeholder="Digite um comando e pressione Enter" style="flex:1;">
-                <button class="btn ok" type="button" id="terminal_run_btn">Executar</button>
-              </div>
-            </div>
-            <div class="muted">Dica: use <span class="mono">top</span> — o backend usa modo batch automaticamente.</div>
-          </div>
-        </div>
+ <div class="card full-width" id="terminal_card">
+  <div class="hd">
+    <span>Terminal (ttyd)</span>
+    <div class="btn-group">
+      <a class="btn small ok" href="http://{{ host_ip }}:7681/" target="_blank" rel="noopener">Abrir</a>
+      <button class="btn small outline" type="button" onclick="toggleTerminalEmbed()">Embed</button>
+    </div>
+  </div>
+
+  <div class="bd">
+    <div id="terminal_embed" class="hidden" style="margin-top:10px;">
+      <div class="muted" style="margin-bottom:8px;">
+        Login: <span class="mono">admin</span> / <span class="mono">qazwsx</span>
       </div>
+      <iframe
+        src="http://{{ host_ip }}:7681/"
+        style="width:100%; height:60vh; border:1px solid var(--line); border-radius:8px; background:#0b0d10;"
+        loading="lazy"
+      ></iframe>
+    </div>
+  </div>
+</div>
+
 
       <!-- Serviços Card -->
       <div class="card full-width">
@@ -2161,6 +2485,20 @@ async function doLogin(ev){
 
 <script>
 // Funções JavaScript existentes (mantidas do código original)
+
+
+function scanRebootConfirm(){
+  if(!confirm(
+    "O Mirako será reiniciado para escanear redes Wi-Fi antes do AP.Deseja continuar?"
+  )) return;
+
+  fetch('/scan-reboot', { method: 'POST' })
+    .then(() => {
+      alert("Reiniciando para scan Wi-Fi…");
+    });
+}
+
+
 function togglePass(){
   var ps = document.getElementById('pskField');
   if(ps){ ps.type = (ps.type === 'password') ? 'text' : 'password'; }
@@ -2212,49 +2550,160 @@ async function fetchStatus(){
     setText('sys_cpu', j.cpu_pct+'%');
     setText('sys_mem', j.mem.pct+'%');
     setText('sys_disk', j.disk.pct+'%');
+    setText('sys_mem_detail', j.mem.used+' / '+j.mem.total);
+    setText('sys_disk_detail', j.disk.used+' / '+j.disk.total);
     setText('sys_uptime', j.uptime);
-setText('sys_cpus', j.cpu_used+' / '+j.cpu_count);
+    setText('sys_cpus', j.cpu_used+' / '+j.cpu_count);
+    setText('desired_profile', j.desired_profile || '-');
+    setText('active_profile', j.active_profile || '-');
+
+const banner = document.getElementById('ap_fallback_banner');
+if (banner){
+  const rem = Number(j.ap_fallback_rem || 0);
+  banner.style.display = rem > 0 ? 'block' : 'none';
+  setText('ap_fallback_rem', rem);
+}
 
 
-    const iftbody = document.querySelector('#if_table_body');
-    if (iftbody){
-      iftbody.innerHTML = '';
-      j.netlist.forEach(n=>{
-        const tr = document.createElement('tr');
-        tr.innerHTML = '<td class="mono">'+n.dev+'</td><td>'+n.state+'</td><td class="mono">'+n.ipv4+'</td><td>'+n.rx+'</td><td>'+n.tx+'</td>';
-        iftbody.appendChild(tr);
-      });
-    }
+
+const ifTbody = document.querySelector('#if_table_body');
+if (ifTbody){
+  ifTbody.innerHTML = '';
+  (j.netlist || []).forEach(n=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td class="mono">'+n.dev+'</td>'+
+      '<td>'+n.state+'</td>'+
+      '<td class="mono">'+n.ipv4+'</td>'+
+      '<td>'+n.rx+'</td>'+
+      '<td>'+n.tx+'</td>';
+    ifTbody.appendChild(tr);
+  });
+}
+
 
     setText('def_route', j.def_route);
     setText('all_routes', j.all_routes);
     setText('dns_info', j.dns);
-
-    const leasesBody = document.querySelector('#leases_table_body');
-    if (j.leases && j.leases.length && leasesBody){
-      leasesBody.innerHTML = '';
-      j.leases.forEach(L=>{
-        const tr = document.createElement('tr');
-        tr.innerHTML = '<td class="mono">'+L.ip+'</td><td class="mono">'+(L.hostname||'-')+'</td><td class="mono">'+L.mac+'</td><td class="mono">'+L.expiry+'</td>';
-        leasesBody.appendChild(tr);
-      });
-    }
-
     setText('ppp_ipv4', j.ppp_ipv4);
 
+const leasesBody = document.querySelector('#leases_table_body');
+const leasesEmpty = document.getElementById('leases_empty');
+
+if (leasesBody){
+  const leases = Array.isArray(j.leases) ? j.leases : [];
+  leasesBody.innerHTML = '';
+
+  if (leases.length){
+    if (leasesEmpty) leasesEmpty.style.display = 'none';
+
+    leases.forEach(L=>{
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td class="mono">'+(L.ip||'-')+'</td>'+
+        '<td class="mono">'+(L.hostname||'-')+'</td>'+
+        '<td class="mono">'+(L.mac||'-')+'</td>'+
+        '<td class="mono">'+(L.expiry||'-')+'</td>';
+      leasesBody.appendChild(tr);
+    });
+  } else {
+    if (leasesEmpty){
+      leasesEmpty.style.display = 'block';
+      leasesEmpty.textContent = 'Sem leases no momento.';
+    }
+  }
+}
+
+
+
+
+}catch(e){
+  console.error('fetchStatus erro:', e);
+}
+}
+function setText(id, txt){ var el=document.getElementById(id); if(el){ el.textContent = (txt!=null? String(txt): ''); } }
+setInterval(fetchStatus, 15000);
+fetchStatus();
+
+
+
+
+function wifiEdit(id, ssid, psk){
+  const idEl  = document.getElementById('wifi_edit_id');
+  const ssidEl = document.getElementById('ssidFieldSave');
+  const pskEl  = document.getElementById('pskFieldSave');
+  const btn    = document.getElementById('wifi_save_btn');
+
+  if(idEl) idEl.value = id || '';
+  if(ssidEl) ssidEl.value = ssid || '';
+  if(pskEl) pskEl.value = (psk || ''); // ✅ agora preenche a senha salva
+  if(btn) btn.textContent = 'Atualizar';
+  if(ssidEl) ssidEl.focus();
+}
+
+function wifiClearEdit(){
+  const idEl  = document.getElementById('wifi_edit_id');
+  const ssidEl = document.getElementById('ssidFieldSave');
+  const pskEl  = document.getElementById('pskFieldSave');
+  const btn    = document.getElementById('wifi_save_btn');
+
+  if(idEl) idEl.value = '';
+  if(ssidEl) ssidEl.value = '';
+  if(pskEl) pskEl.value = '';
+  if(btn) btn.textContent = 'Salvar';
+}
+
+function wifiFillFromScan(ssid){
+  // quando clicar numa rede detectada, prepara para “novo cadastro”
+  wifiClearEdit();
+  const ssidEl = document.getElementById('ssidFieldSave');
+  if(ssidEl){
+    ssidEl.value = ssid || '';
+    ssidEl.focus();
+  }
+}
+
+
+
+
+
+/* ===== Terminal ===== */
+
+function toggleTerminalEmbed(){
+  const el = document.getElementById('terminal_embed');
+  if(!el) return;
+  el.classList.toggle('hidden');
+}
+
+
+
+
+
+
+
+let servicesPolling = null;
+
+async function fetchServices(){
+  try{
+    const r = await fetch('/services.json?ts=' + Date.now(), {cache:'no-store'});
+    if(!r.ok) return;
+    const j = await r.json();
+
     const svtbody = document.querySelector('#svc_table_body');
-    if (svtbody){
-      svtbody.innerHTML = '';
-      j.services.forEach(s=>{
-        const pillA = s.active ? 'okpill' : 'dangerpill';
-        const pillE = s.enabled ? 'okpill' : 'warnpill';
-        const tr = document.createElement('tr');
-        tr.innerHTML =
-          '<td class="mono">'+s.name+'</td>'+
-          '<td><span class="pill '+pillA+'">'+(s.active?'ativo':'inativo')+'</span></td>'+
-          '<td><span class="pill '+pillE+'">'+(s.enabled?'habilitado':'desabilitado')+'</span></td>'+
-          '<td>'+
-            '<form method="post" action="/svc_action">'+
+    if (!svtbody) return;
+
+    svtbody.innerHTML = '';
+
+    (j.services || []).forEach(s=>{
+      const pillA = s.active ? 'okpill' : 'dangerpill';
+      const pillE = s.enabled ? 'okpill' : 'warnpill';
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td class="mono">'+s.name+'</td>'+
+        '<td><span class="pill '+pillA+'">'+(s.active?'ativo':'inativo')+'</span></td>'+
+        '<td><span class="pill '+pillE+'">'+(s.enabled?'habilitado':'desabilitado')+'</span></td>'+
+        '<td>'+
+          '<form method="post" action="/svc_action">'+
             '<input type="hidden" name="svc" value="'+s.name+'">'+
             '<div class="btn-group">'+
               '<button class="btn small ok" name="action" value="start">Start</button>'+
@@ -2264,117 +2713,63 @@ setText('sys_cpus', j.cpu_used+' / '+j.cpu_count);
                 ? '<button class="btn small outline" name="action" value="disable">Disable</button>'
                 : '<button class="btn small primary" name="action" value="enable">Enable</button>')+
             '</div>'+
-            '</form>'+
-          '</td>';
-        svtbody.appendChild(tr);
-      });
-    }
-
-  }catch(e){ /* silencioso */ }
-}
-function setText(id, txt){ var el=document.getElementById(id); if(el){ el.textContent = (txt!=null? String(txt): ''); } }
-setInterval(fetchStatus, 15000);
-fetchStatus();
-
-/* ===== Terminal ===== */
-function ansiToHtml(text){
-  text = text.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-  const colors={30:'color:#777;',31:'color:#ff6b6b;',32:'color:#9be564;',33:'color:#ffd166;',34:'color:#6ab0ff;',35:'color:#d785ff;',36:'color:#74d3ea;',37:'color:#eeeeee;',90:'color:#999;',91:'color:#ff7b7b;',92:'color:#a8f07a;',93:'color:#ffe07a;',94:'color:#7abaff;',95:'color:#e19bff;',96:'color:#85e9ff;',97:'color:#ffffff;'};
-  const bg={40:'background:#222;',41:'background:#5c1e1e;',42:'background:#294025;',43:'background:#4a3f1d;',44:'background:#1c2e4a;',45:'background:#3a2143;',46:'background:#1f3f45;',47:'background:#444;',100:'background:#333;',101:'background:#6b2a2a;',102:'background:#35552e;',103:'background:#5a4d24;',104:'background:#253c66;',105:'background:#4a2d54;',106:'background:#28545b;',107:'background:#666;'};
-  return text.replace(/\x1b\[(\d+(?:;\d+)*)m/g,function(m,seq){
-    const codes = seq.split(';').map(Number);
-    if(codes.includes(0)) return '</span>';
-    let style='';
-    codes.forEach(function(c){
-      if(c===1) style+='font-weight:bold;';
-      else if(c===3) style+='font-style:italic;';
-      else if(c===4) style+='text-decoration:underline;';
-      else if(colors[c]) style+=colors[c];
-      else if(bg[c]) style+=bg[c];
-      else if(c===39) style+='color:inherit;';
-      else if(c===49) style+='background:transparent;';
+          '</form>'+
+        '</td>';
+      svtbody.appendChild(tr);
     });
-    return '<span style="'+style+'">';
-  });
-}
-let polling=null, didInitialScroll=false, userScrolledUp=false;
-function prefill(cmd){
-  const el=document.getElementById('terminal_cmd');
-  if(el){ el.value=cmd; el.focus(); }
-  const anchor=document.getElementById('terminal_card')||el;
-  if(anchor) anchor.scrollIntoView({behavior:'smooth',block:'center'});
-}
-async function pullLog(){
-  try{
-    const r=await fetch('/shell/log?ts='+Date.now());
-    const txt=await r.text();
-    const out=document.getElementById('terminal_out');
-    const wrap=document.getElementById('terminal_wrap');
-    if(out&&wrap){
-      const atBottom=(wrap.scrollTop + wrap.clientHeight) >= (wrap.scrollHeight - 10);
-      out.innerHTML = ansiToHtml(txt);
-      if(!didInitialScroll){ wrap.scrollTop=wrap.scrollHeight; didInitialScroll=true; }
-      else if(atBottom && !userScrolledUp){ wrap.scrollTop=wrap.scrollHeight; }
-    }
+
   }catch(e){}
 }
-function startPolling(){
-  if(polling) clearInterval(polling);
-  pullLog();
-  polling=setInterval(pullLog, 900);
-}
-(function(){
-  const wrap=document.getElementById('terminal_wrap');
-  if(!wrap) return;
-  wrap.addEventListener('scroll', function(){
-    const nearBottom=(wrap.scrollTop + wrap.clientHeight) >= (wrap.scrollHeight - 10);
-    userScrolledUp=!nearBottom;
-  });
-})();
-async function runCmdFromInput(){
-  const el=document.getElementById('terminal_cmd');
-  const cmd=(el && el.value)?el.value.trim():'';
-  if(!cmd) return;
-  await fetch('/shell/run',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({cmd:cmd})});
-  didInitialScroll=false; userScrolledUp=false; startPolling();
-}
-async function stopCmd(){ await fetch('/shell/stop',{method:'POST'}); }
-async function clearLog(){ await fetch('/shell/clear',{method:'POST'}); const out=document.getElementById('terminal_out'); if(out) out.innerHTML=''; didInitialScroll=false; userScrolledUp=false; }
-async function rebootConfirm(){ if(!confirm('Reiniciar agora?')) return; await fetch('/reboot',{method:'POST'}); alert('Reiniciando...'); }
 
-// Adicionar evento de tecla Enter no terminal
-document.getElementById('terminal_cmd')?.addEventListener('keypress', function(e) {
-  if(e.key === 'Enter') runCmdFromInput();
-});
-document.getElementById('terminal_run_btn')?.addEventListener('click', runCmdFromInput);
 
-/* Serviços: mostrar/ocultar */
+
 /* Serviços: mostrar/ocultar */
 function toggleServices(){
   const card = document.getElementById('services_card');
   const btn  = document.getElementById('toggle_services_btn');
   if(!card || !btn) return;
-  const hidden = card.classList.toggle('hidden');
-  btn.textContent = hidden ? 'Ver serviços' : 'Ocultar serviços';
-  try { localStorage.setItem('svc_hidden', hidden ? '1' : '0'); } catch(e){}
+
+  const hiddenNow = card.classList.toggle('hidden');
+  btn.textContent = hiddenNow ? 'Ver serviços' : 'Ocultar serviços';
+
+  try { localStorage.setItem('svc_hidden', hiddenNow ? '1' : '0'); } catch(e){}
+
+  if(!hiddenNow){
+    fetchServices();
+    if(servicesPolling) clearInterval(servicesPolling);
+    servicesPolling = setInterval(fetchServices, 20000);
+  } else {
+    if(servicesPolling) clearInterval(servicesPolling);
+    servicesPolling = null;
+  }
 }
+
 
 (function(){
   const card = document.getElementById('services_card');
   const btn  = document.getElementById('toggle_services_btn');
   if(!card || !btn) return;
 
-  // ✅ Padrão: oculto na primeira visita (sem localStorage).
-  // Se já houver preferência salva, respeita.
   let stored = null;
   try { stored = localStorage.getItem('svc_hidden'); } catch(e){}
   const hidden = (stored === null) ? true : (stored === '1');
 
-  // Aplica estado inicial e rótulo do botão
   card.classList.toggle('hidden', hidden);
   btn.textContent = hidden ? 'Ver serviços' : 'Ocultar serviços';
+
+  // ✅ se começa visível, carrega e liga polling
+  if(!hidden){
+    fetchServices();
+    if(servicesPolling) clearInterval(servicesPolling);
+    servicesPolling = setInterval(fetchServices, 20000);
+  }
 })();
+
 </script>
+
+
+
+
 </body>
 </html>
 """
@@ -2390,12 +2785,25 @@ def list_root_files() -> List[str]:
 def index():
     # 🔁 sempre carrega o último scan salvo pelo profiles.sh
     scan, scan_dbg = get_cached_wifi_scan()
+    saved_networks = get_saved_networks()
+    wpa_file_networks = read_wpa_conf_networks()
+    host_ip = request.host.split(":")[0]
+
 
     context = dict(
         WLAN_IF=WLAN_IF,
         LAN_IF=LAN_IF,
         PPP_IF=PPP_IF,
         PPP_PEER=PPP_PEER,
+        desired_profile=get_last_profile(),
+        active_profile=get_active_profile(),
+        ap_fallback_rem=ap_fallback_remaining_sec(),
+        wifi_saved=wifi_saved_list(),
+        host_ip=host_ip,
+
+
+        
+
 
         # ---- Wi-Fi (placeholders iniciais; atualizados via status.json) ----
         wifi={
@@ -2426,8 +2834,8 @@ def index():
         netlist=[],
 
         services=[],        # NÃO carregar aqui (carregado via status.json)
-        saved_networks=[],  # NÃO carregar aqui
-        wpa_file_networks=[],
+        saved_networks=saved_networks,
+        wpa_file_networks=wpa_file_networks,
 
         cpu_temp="-",
         cpu_pct="0.0",
@@ -2455,58 +2863,45 @@ def index():
     return render_template_string(TEMPLATE, **context)
 
 
+@app.post("/wifi/save")
+def wifi_save_route():
+    item_id = (request.form.get("id") or "").strip()
+    ssid = (request.form.get("ssid") or "").strip()
+    psk = (request.form.get("psk") or "").strip()
 
-@app.post("/wifi/scan")
-def wifi_scan_route():
-    # 🔁 LÊ O CACHE GERADO PELO profiles.sh
-    nets, dbg = get_cached_wifi_scan()
+    if not ssid:
+        flash("Informe um SSID.")
+        return redirect(url_for("index"))
 
-    t = cpu_temp_c()
-    cpu_pct = round(cpu_usage_pct(), 1)
-    mem = mem_stats()
-    disk = disk_stats("/")
-    netlist = [net_stats_for(i) for i in list_interfaces(include_virtual=True, include_lo=True)]
-    leases, _, leases_path = read_dnsmasq_leases()
+    try:
+        wifi_saved_upsert(item_id, ssid, psk)
+        flash("✅ Wi-Fi salvo/atualizado.")
+    except Exception as e:
+        flash(f"❌ Erro ao salvar Wi-Fi: {e}")
 
-    context = dict(
-        WLAN_IF=WLAN_IF, LAN_IF=LAN_IF, PPP_IF=PPP_IF, PPP_PEER=PPP_PEER,
-        scan=nets,
-        scan_dbg=dbg,
+    return redirect(url_for("index"))
 
-        wifi=wifi_status_details(),
-        wlan_ipv4=get_ipv4_list(WLAN_IF),
-        ppp_ipv4=get_ipv4_list(PPP_IF),
+@app.post("/wifi/delete")
+def wifi_delete_route():
+    item_id = (request.form.get("id") or "").strip()
+    try:
+        wifi_saved_delete(item_id)
+        flash("✅ Wi-Fi removido.")
+    except Exception as e:
+        flash(f"❌ Erro ao remover Wi-Fi: {e}")
+    return redirect(url_for("index"))
 
-        def_route=default_route(),
-        all_routes=routes(),
-        dns=dns_info(),
+@app.post("/wifi/connect_saved")
+def wifi_connect_saved_route():
+    item_id = (request.form.get("id") or "").strip()
+    it = wifi_saved_get(item_id)
+    if not it:
+        flash("Wi-Fi salvo não encontrado.")
+        return redirect(url_for("index"))
 
-        leases=leases,
-        leases_path=leases_path,
-
-        cpu_temp=(f"{t:.1f} °C" if t is not None else "-"),
-        cpu_pct=cpu_pct,
-
-        mem_used=human_bytes(mem["used"]),
-        mem_total=human_bytes(mem["total"]),
-        mem_pct=f"{mem['pct']:.1f}",
-
-        disk_total=human_bytes(disk["total"]),
-        disk_used=human_bytes(disk["used"]),
-        disk_pct=f"{disk['pct']:.1f}",
-
-        procs=processes_top(20),
-        netlist=netlist,
-        services=list_services(),
-
-        last_profile=get_last_profile(),
-        auto_dial_enabled=is_auto_dial_enabled(),
-
-        saved_networks=get_saved_networks(),
-        wpa_file_networks=read_wpa_conf_networks(),
-        root_files=list_root_files(),
-    )
-    return render_template_string(TEMPLATE, **context)
+    ok, msg = connect_wifi_guarded(it["ssid"], it.get("psk", ""))
+    flash(msg)
+    return redirect(url_for("index"))
 
 
 @app.post("/wifi/connect")
@@ -2518,66 +2913,81 @@ def wifi_connect_route():
         flash("Informe um SSID.")
         return redirect(url_for("index"))
 
-    # 1) Salva credenciais + aplica client-wifi
-    ok, msg = wifi_connect(ssid, psk if psk else None)
-    if not ok:
-        flash(f"Falha ao iniciar conexão Wi-Fi: {msg}")
-        return redirect(url_for("index"))
+    # salva na lista também (pode tirar se quiser “não salvar automático”)
+    try:
+        wifi_saved_upsert("", ssid, psk)
+    except Exception:
+        pass
 
-    # 2) Aguarda o profiles.sh decidir (até ~15s)
-    time.sleep(6)
-
-    # 3) Verifica perfil ativo (o que está realmente rodando)
-    final_active = get_active_profile().strip()
-    wlan_ip = get_ipv4_list(WLAN_IF)
-
-    if final_active != "client-wifi":
-        flash(
-            "❌ Não foi possível conectar ao Wi-Fi.<br>"
-            f"Perfil ativo: <b>{final_active}</b> (fallback provável)."
-        )
-        return redirect(url_for("index"))
-
-    if wlan_ip == "-" or not wlan_ip:
-        flash(
-            "⚠️ Wi-Fi associado, mas sem IP válido.<br>"
-            "Verifique DHCP ou sinal."
-        )
-        return redirect(url_for("index"))
-
-    flash(
-        f"✅ Conectado ao Wi-Fi <b>{ssid}</b><br>"
-        f"IP em wlan0: <span class='mono'>{wlan_ip}</span>"
-    )
+    ok, msg = connect_wifi_guarded(ssid, psk)
+    flash(msg)
     return redirect(url_for("index"))
 
 
 
 @app.post("/wifi/disconnect")
 def wifi_disconnect_route():
-    ok, msg = wifi_disconnect()
-    flash(("Desconectado" if ok else "Falha") + f" ({msg})")
-    return redirect(url_for("index"))
-
-@app.post("/setprofile")
-def setprofile():
-    profile = request.form.get("profile", "").strip()
-    if not profile:
-        flash("Selecione um perfil.")
-        return redirect(url_for("index"))
-    rc, out = profile_set(profile)
+    # grava boot desejado
     try:
         os.makedirs("/var/lib/mirako", exist_ok=True)
         with open("/var/lib/mirako/last_profile", "w", encoding="utf-8") as f:
-            f.write(profile.strip() or "ap")
+            f.write("ap\n")
             f.flush()
             os.fsync(f.fileno())
-            os.sync()
+        os.sync()
     except Exception:
         pass
-    msg = out if out else ("ok" if rc == 0 else "erro")
-    flash(f"<b>profiles.sh {profile}</b>:<br><pre class='mono'>{msg}</pre>")
-    return redirect(url_for("index"))
+
+    try:
+        with open("/var/lib/mirako/last_action", "w", encoding="utf-8") as f:
+            f.write("wifi_disconnect_to_ap\n")
+    except Exception:
+        pass
+
+    flash("🔁 Voltando para AP… reiniciando para aplicar de forma limpa.")
+
+    # IMPORTANTE: tudo pesado em background (não derruba o HTTP)
+    threading.Thread(target=switch_to_ap_and_reboot, daemon=True).start()
+
+    # ✅ PRG: POST -> GET / (e o browser fica na home)
+    return redirect(url_for("index"), code=303)
+
+
+
+
+@app.post("/setprofile")
+def setprofile():
+    profile = (request.form.get("profile") or "").strip()
+    if not profile:
+        flash("Selecione um perfil.")
+        return redirect(url_for("index"))
+
+    # ✅ Se for AP: grava last_profile e reinicia (troca limpa do driver)
+    if profile == "ap":
+        try:
+            os.makedirs("/var/lib/mirako", exist_ok=True)
+            with open("/var/lib/mirako/last_profile", "w", encoding="utf-8") as f:
+                f.write("ap\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.sync()
+        except Exception:
+            pass
+
+        try:
+            with open("/var/lib/mirako/last_action", "w", encoding="utf-8") as f:
+                f.write("switch_to_ap\n")
+        except Exception:
+            pass
+
+        flash("🔁 Reiniciando para aplicar AP de forma limpa…")
+
+        threading.Thread(target=switch_to_ap_and_reboot, daemon=True).start()
+
+        return redirect(url_for("index"), code=303)
+
+
+
 
 @app.post("/profiles/stop")
 def profiles_stop_route():
@@ -2676,16 +3086,50 @@ def shell_clear_route():
     clear_log()
     return {"ok": True}
 
-@app.post("/reboot")
-def shell_reboot_route():
+def reboot_now() -> None:
     try:
         subprocess.Popen(["/sbin/shutdown", "-r", "now"])
     except Exception:
-        try:
-            subprocess.Popen(["/sbin/reboot"])
-        except Exception as e:
-            return {"ok": False, "err": str(e)}, 500
+        subprocess.Popen(["/sbin/reboot"])
+
+
+def reboot_delayed(delay_sec: float = 2.5) -> None:
+    time.sleep(delay_sec)
+    reboot_now()
+
+def switch_to_ap_and_reboot() -> None:
+    # opcional: parar tudo antes do reboot
+    run([PROFILES_SCRIPT, "stop"], timeout=60)
+    reboot_delayed(1.5)
+    
+
+@app.post("/reboot")
+def shell_reboot_route():
+    try:
+        threading.Thread(target=reboot_now, daemon=True).start()
+    except Exception as e:
+        return {"ok": False, "err": str(e)}, 500
     return {"ok": True}
+
+
+
+
+@app.post("/scan-reboot")
+def scan_reboot_route():
+    try:
+        # opcional: marca motivo do reboot
+        with open("/var/lib/mirako/last_action", "w") as f:
+            f.write("scan_reboot\n")
+    except Exception:
+        pass
+
+    try:
+        subprocess.Popen(["/sbin/shutdown", "-r", "now"])
+    except Exception:
+        subprocess.Popen(["/sbin/reboot"])
+
+    return {"ok": True}
+
 
 
 @app.get("/auth/users.json")
@@ -2712,6 +3156,7 @@ def status_json():
     mem = mem_stats()
     disk = disk_stats("/")
 
+
     cpu_pct = round(cpu_usage_pct(), 1)
     cpu_count = os.cpu_count() or 1
     cpu_used  = round(max(0.0, min(cpu_count, (cpu_pct / 100.0) * cpu_count)), 1)
@@ -2737,18 +3182,20 @@ def status_json():
         dns=dns_info(),
         leases=leases,
         ppp_ipv4=get_ipv4_list(PPP_IF),
-        services=list_services(),
 
         # >>> adicionados:
         uptime=uptime_str(),
         cpu_count=cpu_count,
         cpu_used=cpu_used,
+        desired_profile=get_last_profile(),
+        active_profile=get_active_profile(),
+        ap_fallback_rem=ap_fallback_remaining_sec(),
     )
     return jsonify(payload)
 
 # --------- Entrypoint ---------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host="0.0.0.0", port=8080, threaded=True)
 
 EOF
 
@@ -2833,7 +3280,7 @@ AP_FALLBACK_MARK_WINDOW="${AP_FALLBACK_MARK_WINDOW:-180}"  # marcação do fallb
 # - gw              => exige ping no gateway
 # - internet         => exige ping em IPs externos
 # - gw_or_internet  => tenta GW; se falhar, aceita internet (PADRÃO)
-WIFI_VALIDATE_MODE="${WIFI_VALIDATE_MODE:-gw_or_internet}"
+WIFI_VALIDATE_MODE="${WIFI_VALIDATE_MODE:-assoc_dhcp}"
 
 # IPs para teste externo (ICMP). Ajuste se a rede bloquear ping.
 WIFI_TEST_IPS_DEFAULT=("1.1.1.1" "8.8.8.8")
@@ -2855,6 +3302,8 @@ FALLBACK_UNTIL_FILE="/var/lib/mirako/ap_fallback_until"
 
 WIFI_ENV="/etc/mirako/wifi.env"
 AP_ENV="/etc/mirako/ap.env"
+LAST_ACTION_FILE="/var/lib/mirako/last_action"
+
 
 HOSTAPD_CONF="$RUND/hostapd.conf"
 WPA_CTRL_DIR="/run/wpa_supplicant"
@@ -2883,6 +3332,7 @@ AP_RANGE="192.168.40.50,192.168.40.200"
 WR_IP="192.168.50.1/24"
 WR_RANGE="192.168.50.50,192.168.50.200"
 
+
 # ================= BIN HELPERS =================
 have(){ command -v "$1" >/dev/null 2>&1; }
 
@@ -2910,6 +3360,62 @@ flush_fw(){
   iptables -t nat -F 2>/dev/null || true
   iptables -F FORWARD 2>/dev/null || true
 }
+
+wifi_prepare_managed(){
+  rfkill unblock all 2>/dev/null || true
+  ip link set "$WLAN_IF" down 2>/dev/null || true
+  iw reg set "$COUNTRY_CODE" 2>/dev/null || true
+  iw dev "$WLAN_IF" set type managed 2>/dev/null || true
+  ip link set "$WLAN_IF" up 2>/dev/null || true
+  iw dev "$WLAN_IF" set power_save off 2>/dev/null || true
+  sleep 0.3
+}
+
+
+wifi_prepare_ap(){
+  rfkill unblock all 2>/dev/null || true
+  ip link set "$WLAN_IF" down 2>/dev/null || true
+  iw reg set "$COUNTRY_CODE" 2>/dev/null || true
+
+  # alguns drivers aceitam "__ap__" (mais comum), outros "ap"
+  iw dev "$WLAN_IF" set type __ap__ 2>/dev/null || \
+  iw dev "$WLAN_IF" set type ap 2>/dev/null || true
+
+  ip link set "$WLAN_IF" up 2>/dev/null || true
+  iw dev "$WLAN_IF" set power_save off 2>/dev/null || true
+
+  sleep 0.3
+}
+
+
+wifi_driver_reset(){
+  if lsmod 2>/dev/null | grep -q '^unisoc_wifi'; then
+    log "resetando driver unisoc_wifi"
+
+    pkill -x hostapd dnsmasq wpa_supplicant 2>/dev/null || true
+    ip link set "$WLAN_IF" down 2>/dev/null || true
+
+    # dá um "hard toggle" no rádio (ajuda muito no unisoc)
+    rfkill block all 2>/dev/null || true
+    sleep 0.5
+
+    rmmod unisoc_wifi 2>/dev/null || true
+    sleep 0.8
+
+    modprobe unisoc_wifi 2>/dev/null || true
+    sleep 0.8
+
+    rfkill unblock all 2>/dev/null || true
+
+    # ✅ espera wlan0 voltar a existir
+    for i in $(seq 1 50); do
+      ip link show "$WLAN_IF" >/dev/null 2>&1 && break
+      sleep 0.1
+    done
+  fi
+}
+
+
 
 nat_on(){
   local LAN="$1" WAN="$2"
@@ -3062,28 +3568,53 @@ stop_all(){
 
 # ================= WIFI SCAN CACHE (corrigido) =================
 wifi_scan_cache_update(){
-  # Cacheia redes detectadas para a UI (não quebra o script se falhar).
   [ -n "$PY_BIN" ] || return 0
 
-  rf_on
+  # 0) limpeza: evita scan falhar por “busy”
+  pkill -x hostapd dnsmasq wpa_supplicant 2>/dev/null || true
 
-  local raw=""
-  local ok=0
+  # 1) garante rádio liberado e interface rearmada
+  rfkill unblock all 2>/dev/null || true
+  ip link set "$WLAN_IF" down 2>/dev/null || true
+  sleep 0.3
+  ip link set "$WLAN_IF" up 2>/dev/null || true
+
+  # 2) força regdomain (ajuda MUITO em scan/canais)
+  if command -v iw >/dev/null 2>&1; then
+    iw reg set "$COUNTRY_CODE" 2>/dev/null || true
+  fi
+
+  # 3) tenta forçar modo managed (nem todo driver deixa)
+  if command -v iw >/dev/null 2>&1; then
+    iw dev "$WLAN_IF" set type managed 2>/dev/null || true
+  fi
+
+  # 4) scan com timeout e fallback
+  local raw="" ok=0
 
   if [ -n "$IW_BIN" ]; then
-    raw="$($IW_BIN dev "$WLAN_IF" scan 2>/dev/null || true)"
+    if [ -n "$TIMEOUT_BIN" ]; then
+      raw="$($TIMEOUT_BIN 12 "$IW_BIN" dev "$WLAN_IF" scan 2>/dev/null || true)"
+    else
+      raw="$("$IW_BIN" dev "$WLAN_IF" scan 2>/dev/null || true)"
+    fi
     [ -n "$raw" ] && ok=1
   fi
 
   if [ "$ok" -ne 1 ] && [ -n "$IWLIST_BIN" ]; then
-    raw="$($IWLIST_BIN "$WLAN_IF" scan 2>/dev/null || true)"
+    if [ -n "$TIMEOUT_BIN" ]; then
+      raw="$($TIMEOUT_BIN 12 "$IWLIST_BIN" "$WLAN_IF" scan 2>/dev/null || true)"
+    else
+      raw="$("$IWLIST_BIN" "$WLAN_IF" scan 2>/dev/null || true)"
+    fi
     [ -n "$raw" ] && ok=2
   fi
 
-  # Passa o RAW via stdin para python (-c) (evita o bug do "python3 -" + heredoc)
+
+  # 5) salva cache (mesmo se vazio, pra UI não “sumir”)
   printf '%s' "$raw" | "$PY_BIN" -c '
 import sys, json, time, re
-mode = int(sys.argv[1])      # 0 none, 1 iw, 2 iwlist
+mode = int(sys.argv[1])
 outf = sys.argv[2]
 raw  = sys.stdin.read()
 nets = []
@@ -3092,12 +3623,13 @@ ts = int(time.time())
 def uniq_by_ssid(items):
     best = {}
     for n in items:
-        ssid = n.get("ssid") or ""
+        ssid = (n.get("ssid") or "").strip()
         if not ssid:
             continue
         if ssid not in best:
             best[ssid] = n
         else:
+            # tenta comparar sinal numérico quando dá
             try:
                 a = float(str(n.get("signal","")).split()[0])
                 b = float(str(best[ssid].get("signal","")).split()[0])
@@ -3112,8 +3644,7 @@ if mode == 1:
     for line in raw.splitlines():
         s = line.strip()
         if s.startswith("BSS "):
-            if bss:
-                nets.append(bss)
+            if bss: nets.append(bss)
             bss = {"ssid":"","signal":"","freq":"","security":"?"}
         elif s.startswith("SSID:"):
             if bss is None: bss = {"ssid":"","signal":"","freq":"","security":"?"}
@@ -3127,15 +3658,13 @@ if mode == 1:
         elif s.startswith("RSN:") or s.startswith("WPA:"):
             if bss is None: bss = {"ssid":"","signal":"","freq":"","security":"?"}
             bss["security"] = "WPA/WPA2"
-    if bss:
-        nets.append(bss)
-    nets = [n for n in nets if n.get("ssid")]
+    if bss: nets.append(bss)
+    nets = [n for n in nets if (n.get("ssid") or "").strip()]
 
 elif mode == 2:
     for cell in raw.split("Cell "):
         m_ssid = re.search(r"ESSID:\"(.*)\"", cell)
-        if not m_ssid:
-            continue
+        if not m_ssid: continue
         ssid = m_ssid.group(1)
         m_sig = re.search(r"Signal level=(-?\d+)", cell) or re.search(r"Quality=([0-9/]+)", cell)
         m_frq = re.search(r"Frequency:([0-9\.]+)", cell)
@@ -3146,17 +3675,16 @@ elif mode == 2:
                      "security": enc})
 
 nets = uniq_by_ssid(nets)
-payload = {"ts": ts, "nets": nets}
-try:
-    with open(outf, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
-except Exception:
-    pass
-' "$ok" "$WIFI_SCAN_CACHE" || true
+payload = {"ts": ts, "mode": mode, "count": len(nets), "nets": nets}
+with open(outf, "w", encoding="utf-8") as f:
+    json.dump(payload, f, ensure_ascii=False)
+' "$ok" "$WIFI_SCAN_CACHE" 2>/dev/null || true
 
   return 0
 }
 
+  
+ 
 # ================= AP =================
 write_hostapd(){
   if [ "${#AP_PASS}" -lt 8 ]; then
@@ -3168,8 +3696,8 @@ ssid=$AP_SSID
 country_code=$COUNTRY_CODE
 hw_mode=g
 channel=$AP_CHANNEL
-ieee80211n=1
-wmm_enabled=1
+ieee80211n=0
+wmm_enabled=0
 auth_algs=1
 wpa=2
 wpa_key_mgmt=WPA-PSK
@@ -3179,16 +3707,23 @@ EOF
 }
 
 start_ap_services(){
-  # Para UI: cacheia redes detectadas ANTES de subir hostapd
-  wifi_scan_cache_update
+  # ✅ Só faz scan se o último action foi scan_reboot
+  if [ -f "$LAST_ACTION_FILE" ] && grep -q "scan_reboot" "$LAST_ACTION_FILE"; then
+    wifi_scan_cache_update
+    rm -f "$LAST_ACTION_FILE" 2>/dev/null || true
+  fi
 
-  rf_on
+  pkill -x wpa_supplicant 2>/dev/null || true
+
+  wifi_prepare_ap
+  ip addr replace "$AP_IP" dev "$WLAN_IF" 2>/dev/null || true
+
   write_hostapd
 
-  # dnsmasq isolado (não lê conf global)
   dnsmasq \
     --conf-file=/dev/null \
     --no-hosts --no-resolv \
+    --server=1.1.1.1 --server=8.8.8.8 \
     --interface="$WLAN_IF" --bind-interfaces \
     --dhcp-range="$AP_RANGE" \
     --dhcp-option=3,${AP_IP%/*} \
@@ -3197,6 +3732,7 @@ start_ap_services(){
 
   hostapd -B "$HOSTAPD_CONF"
 }
+
 
 # ================= CLIENT WIFI =================
 ensure_wpa(){
@@ -3231,6 +3767,7 @@ start_wifi_once(){
   pkill -x wpa_supplicant 2>/dev/null || true
 
   dhcp_release "$WLAN_IF"
+  wifi_prepare_managed
   rf_on
 
   [ -n "$WPA_SUPP_BIN" ] || { log "ERRO: wpa_supplicant não encontrado"; return 1; }
@@ -3277,13 +3814,11 @@ fallback_ap_runtime(){
 
   stop_all
 
-  rf_on
-  ip link set "$WLAN_IF" up 2>/dev/null || true
-  ip addr replace "$AP_IP" dev "$WLAN_IF" 2>/dev/null || true
+  # ✅ reset do driver antes de subir AP
+  wifi_driver_reset
 
   start_ap_services
 
-  # tenta uplink por cabo (WAN em end0), mas não bloqueia se falhar
   ip link set "$LAN_IF" up 2>/dev/null || true
   dhcp_acquire "$LAN_IF" "$DHCP_WAN_TIMEOUT" >/dev/null 2>&1 || true
 
@@ -3292,18 +3827,18 @@ fallback_ap_runtime(){
   log "AP temporário ativo ($AP_SSID) — last_profile preservado"
 }
 
+
 # ================= PROFILES =================
 profile_ap(){
-  local commit="${1:-1}"  # 1 = grava last_profile, 0 = não grava (fallback)
+  local commit="${1:-1}"
   stop_all
 
-  rf_on
-  ip link set "$WLAN_IF" up 2>/dev/null || true
-  ip addr replace "$AP_IP" dev "$WLAN_IF"
+  # ✅ reset do driver com interface DOWN (antes de qualquer iw/ip up)
+  wifi_driver_reset
 
+  # ✅ sobe AP (aqui dentro já chama wifi_prepare_ap + ip addr replace + hostapd/dnsmasq)
   start_ap_services
 
-  # uplink por cabo (WAN end0) + NAT
   ip link set "$LAN_IF" up 2>/dev/null || true
   dhcp_acquire "$LAN_IF" "$DHCP_WAN_TIMEOUT" >/dev/null 2>&1 || true
 
@@ -3314,6 +3849,7 @@ profile_ap(){
   [ "$commit" = "1" ] && set_last "ap"
   log "AP ativo ($AP_SSID)"
 }
+
 
 profile_client_wifi(){
   local commit="${1:-1}"  # 1 = grava last_profile, 0 = não grava (uso interno)
@@ -3353,11 +3889,13 @@ profile_wifi_router(){
   dnsmasq \
     --conf-file=/dev/null \
     --no-hosts --no-resolv \
+    --server=1.1.1.1 --server=8.8.8.8 \
     --interface="$LAN_IF" --bind-interfaces \
     --dhcp-range="$WR_RANGE" \
     --dhcp-option=3,${WR_IP%/*} \
     --dhcp-option=6,${WR_IP%/*} \
     >/dev/null 2>&1 || true
+
 
   nat_on "$LAN_IF" "$WLAN_IF"
 
@@ -3371,13 +3909,18 @@ profile_client_lan(){
   stop_all
   ip link set "$LAN_IF" up 2>/dev/null || true
 
-  dhcp_acquire "$LAN_IF" "$DHCP_WAN_TIMEOUT" >/dev/null 2>&1 || true
+  # Se não pegar DHCP no cabo, volta para AP para não perder acesso
+  if ! dhcp_acquire "$LAN_IF" "$DHCP_WAN_TIMEOUT" >/dev/null 2>&1; then
+    fallback_ap_runtime "client-lan: sem DHCP em $LAN_IF"
+    return 1
+  fi
 
   clear_ap_fallback_window
   set_active "client-lan"
   set_last "client-lan"
-  log "client-lan ativo"
+  log "client-lan ativo (DHCP ok em $LAN_IF)"
 }
+
 
 profile_3g(){
   stop_all
@@ -3940,7 +4483,7 @@ Wants=systemd-udev-settle.service network-online.target
 # Só executa se estes caminhos existirem/forem válidos:
 ConditionPathExists=/usr/local/bin/mirako-apply-last-profile.sh
 ConditionPathIsExecutable=/usr/local/bin/mirako-apply-last-profile.sh
-ConditionPathExists=/var/lib/mirako/last_profile
+
 
 [Service]
 Type=oneshot
@@ -4156,7 +4699,14 @@ sudo systemctl restart mirako-autodial.service
 
 
 
+sudo systemctl enable watchdog
+sudo systemctl start watchdog
 
+
+
+
+sudo apt install certbot python3-certbot-nginx
+sudo certbot --nginx -d alien.mirako.org
 
 
 
