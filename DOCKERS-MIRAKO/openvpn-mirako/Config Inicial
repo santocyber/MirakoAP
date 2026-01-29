@@ -1,0 +1,4 @@
+sudo cp INTRANETMIRAKO.ovpn /etc/openvpn/client/INTRANETMIRAKO.conf
+sudo systemctl enable openvpn-client@INTRANETMIRAKO.service
+sudo systemctl start openvpn-client@INTRANETMIRAKO.service
+echo "lxsession" > ~/.xsession

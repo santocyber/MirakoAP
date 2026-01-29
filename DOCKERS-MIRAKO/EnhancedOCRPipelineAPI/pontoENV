@@ -1,0 +1,13 @@
+# .env - configuração da API OCR
+
+# Chave de acesso simples (pode ser qualquer string por enquanto)
+OCR_API_KEY=troque_esta_chave
+
+# Engine padrão de OCR:
+#   auto     = o serviço escolhe
+#   tesseract, easyocr ou doctr
+DEFAULT_ENGINE=auto
+
+# Caminho dos modelos dentro do container
+MODELS_DIR=/app/models
+

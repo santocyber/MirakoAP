@@ -1,0 +1,16 @@
+
+services:
+  ocr_api:
+    image: futureedgeltd/ocr-deepseek-ai:latest
+    container_name: ocr-api
+    env_file: .env
+    environment:
+      - OCR_API_KEY=${OCR_API_KEY}
+      - DEFAULT_ENGINE=${DEFAULT_ENGINE}
+      - MODELS_DIR=/app/models
+    volumes:
+      - ./models:/app/models
+      - ./uploads:/app/uploads
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
