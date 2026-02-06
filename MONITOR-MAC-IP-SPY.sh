@@ -38,6 +38,8 @@ systemctl enable --now network-watcher.service
 tee /root/netwatch.py >/dev/null <<'EOF'
 #!/usr/bin/env python3
 # NetWatch - Monitoramento de dispositivos (MAC/IP) + Web UI (Flask + Socket.IO)
+# Ajuste solicitado: enviar WhatsApp APENAS quando o MAC alvo ficar ONLINE (transição offline->online)
+# Mantém a interface Web e o restante do monitoramento/DB.
 
 import os
 import re
@@ -52,7 +54,7 @@ from functools import lru_cache
 from urllib.parse import quote
 
 import requests
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string
 from flask_socketio import SocketIO
 
 # =========================
@@ -77,19 +79,23 @@ ARPING_MAX_RUNTIME_SEC = int(os.environ.get("NETWATCH_ARPING_MAX_RUNTIME_SEC", "
 # Reverse DNS pode atrasar; permita desativar
 ENABLE_RDNS = os.environ.get("NETWATCH_RDNS", "1").strip() not in ("0", "false", "False", "no", "NO")
 
-# Notificações: enviar mesmo para MAC ignorado?
-NOTIFY_IGNORED = os.environ.get("NETWATCH_NOTIFY_IGNORED", "0").strip() in ("1", "true", "True", "yes", "YES")
-
 # Evolution API (WhatsApp)
 EVO_API_URL = os.environ.get("NETWATCH_EVO_URL", "https://evolution.mirako.org").rstrip("/")
 EVO_API_INSTANCE = os.environ.get("NETWATCH_EVO_INSTANCE", "Mirako")
-EVO_API_KEY = os.environ.get("NETWATCH_EVO_KEY", "f2824a60ab1042f1144fd1e3c83ea5e3b8f8645884a035609782c287401bafbe")
-
+EVO_API_KEY = os.environ.get(
+    "NETWATCH_EVO_KEY",
+    "f2824a60ab1042f1144fd1e3c83ea5e3b8f8645884a035609782c287401bafbe",
+)
 
 # Fallback caso a variável não exista no systemd
-DEFAULT_WA_NUMBERS = "5521999191736,5521998886179"
+DEFAULT_WA_NUMBERS = os.environ.get("NETWATCH_DEFAULT_WA_NUMBERS", "5521999191736,5521998886179")
 
+# MAC alvo: enviar mensagem somente quando esse MAC ficar ONLINE
+TARGET_MAC = os.environ.get("NETWATCH_TARGET_MAC", "d6:8c:4f:1e:a7:6e").strip().lower()
 
+# Cooldown opcional (segundos) para evitar spam caso oscile rápido.
+# Se quiser "toda vez" sem limite, deixe 0.
+ONLINE_NOTIFY_COOLDOWN_SEC = int(os.environ.get("NETWATCH_ONLINE_COOLDOWN_SEC", "0"))
 
 IGNORE_FILE = os.path.expanduser(os.environ.get("NETWATCH_IGNORE_FILE", "~/ignore_macs.txt"))
 DB_FILE = os.path.expanduser(os.environ.get("NETWATCH_DB_FILE", "~/netwatch.db"))
@@ -117,6 +123,9 @@ last_seen_cache = {}   # mac -> datetime
 # Cache de fabricante obtido diretamente do arp-scan (3ª coluna)
 vendor_cache = {}      # mac -> vendor str
 
+# Cooldown por MAC (para não spammar)
+last_online_notify = {}  # mac -> datetime
+
 
 # =========================
 # Utilidades
@@ -132,6 +141,9 @@ def log_event(msg: str, level: str = "INFO"):
         socketio.emit("log", payload)
     except Exception:
         pass
+
+def is_target_mac(mac: str) -> bool:
+    return (mac or "").strip().lower() == TARGET_MAC
 
 def load_ignore_set() -> set:
     s = set()
@@ -197,7 +209,7 @@ def init_db():
         )
     """)
 
-    # Migrações leves (não quebram se já existir)
+    # Migrações leves
     for stmt in [
         "ALTER TABLE devices ADD COLUMN vendor TEXT",
         "ALTER TABLE events ADD COLUMN old_ip TEXT",
@@ -210,9 +222,7 @@ def init_db():
     con.commit()
     con.close()
 
-
 def normalize_wa_number(s: str) -> str:
-    # remove tudo que não for dígito (aceita +55..., (21) 999..., etc.)
     digits = re.sub(r"\D+", "", (s or "").strip())
     return digits
 
@@ -220,8 +230,6 @@ WHATSAPP_NUMBERS = [
     normalize_wa_number(n)
     for n in os.environ.get("NETWATCH_WA_NUMBERS", DEFAULT_WA_NUMBERS).split(",")
 ]
-
-# remove vazios (se algum virar "")
 WHATSAPP_NUMBERS = [n for n in WHATSAPP_NUMBERS if n]
 
 def evo_send_text(number: str, text: str) -> dict:
@@ -231,9 +239,6 @@ def evo_send_text(number: str, text: str) -> dict:
     - instance com url-encode
     - JSON UTF-8 sem escape
     """
-    if not WHATSAPP_NUMBERS:
-        log_event("WHATSAPP_NUMBERS vazio; não há destino para enviar.", "WARN")
-
     url = f"{EVO_API_URL.rstrip('/')}/message/sendText/{quote(EVO_API_INSTANCE, safe='')}"
     headers = {"Content-Type": "application/json", "apikey": EVO_API_KEY}
     payload = {"number": str(number), "text": str(text)}
@@ -260,33 +265,39 @@ def evo_send_text(number: str, text: str) -> dict:
         log_event(f"Falha ao enviar WhatsApp para {number}: {e}", "ERROR")
         return {"http_code": 0, "error": str(e), "response": None}
 
-def should_notify(ignored: bool) -> bool:
-    return (not ignored) or NOTIFY_IGNORED
+def notify_target_online(mac: str, ip: str, hostname: str, vendor: str, ignored: bool, since: datetime):
+    """
+    Envia mensagem SOMENTE para o MAC alvo quando ele entrar online (transição offline -> online_state).
+    """
+    if not is_target_mac(mac):
+        return
 
-def notify_new_mac(mac: str, ip: str, hostname: str, vendor: str, ignored: bool):
+    if not WHATSAPP_NUMBERS:
+        log_event("WHATSAPP_NUMBERS vazio; não há destino para enviar.", "WARN")
+        return
+
+    if ONLINE_NOTIFY_COOLDOWN_SEC > 0:
+        now_ = now_tz()
+        last = last_online_notify.get(mac)
+        if last and (now_ - last).total_seconds() < ONLINE_NOTIFY_COOLDOWN_SEC:
+            log_event(
+                f"Alerta ONLINE suprimido por cooldown ({ONLINE_NOTIFY_COOLDOWN_SEC}s) para {mac}.",
+                "INFO",
+            )
+            return
+        last_online_notify[mac] = now_
+
     msg = (
-        "Novo dispositivo na rede\n"
+        "ALERTA: dispositivo alvo ONLINE\n"
         f"MAC: {mac}\n"
         f"IP: {ip}\n"
         f"Fabricante: {vendor or '-'}\n"
         f"Host: {hostname or '-'}\n"
         f"Ignorado: {'sim' if ignored else 'não'}\n"
+        f"Online desde: {since.strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"Hora: {now_tz().strftime('%Y-%m-%d %H:%M:%S')}"
     )
-    for num in WHATSAPP_NUMBERS:
-        evo_send_text(num, msg)
 
-def notify_ip_change(mac: str, old_ip: str, new_ip: str, hostname: str, vendor: str, ignored: bool):
-    msg = (
-        "Dispositivo mudou de IP\n"
-        f"MAC: {mac}\n"
-        f"IP antigo: {old_ip or '-'}\n"
-        f"IP novo: {new_ip}\n"
-        f"Fabricante: {vendor or '-'}\n"
-        f"Host: {hostname or '-'}\n"
-        f"Ignorado: {'sim' if ignored else 'não'}\n"
-        f"Hora: {now_tz().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
     for num in WHATSAPP_NUMBERS:
         evo_send_text(num, msg)
 
@@ -620,12 +631,11 @@ def build_devices_payload() -> list[dict]:
 
 def build_today_report_text() -> str:
     """
-    Relatório do dia: novos MACs + mudanças de IP (não ignorados, a menos que NOTIFY_IGNORED=1)
-    Inclui:
-      - first_seen
-      - hora que entrou hoje (primeiro online do dia)
-      - tempo conectado hoje (sessions + trecho atual)
-      - status atual e online_since (se estiver online)
+    Relatório do dia (para o MAC alvo):
+    - lista eventos do dia (online/offline/ip_change/new_mac)
+    - inclui "entrou hoje" (primeiro online do dia)
+    - tempo conectado hoje
+    - status atual
     """
     start_day = datetime.combine(now_tz().date(), datetime.min.time(), tzinfo=TZ)
     end_day = start_day + timedelta(days=1)
@@ -633,90 +643,81 @@ def build_today_report_text() -> str:
     con = db()
     cur = con.cursor()
 
-    # Pega eventos relevantes do dia
+    # Dados do device alvo
+    cur.execute("SELECT * FROM devices WHERE mac=?", (TARGET_MAC,))
+    dev = cur.fetchone()
+
+    # Eventos do dia do MAC alvo
     cur.execute("""
-        SELECT e.ts, e.type, e.mac, e.ip, e.old_ip, e.hostname,
-               d.vendor, d.ignored, d.first_seen
-        FROM events e
-        JOIN devices d ON d.mac = e.mac
-        WHERE e.ts >= ? AND e.ts < ?
-          AND (e.type='new_mac' OR e.type='ip_change')
-        ORDER BY e.ts DESC
+        SELECT ts, type, mac, ip, old_ip, hostname
+        FROM events
+        WHERE mac = ?
+          AND ts >= ? AND ts < ?
+        ORDER BY ts DESC
         LIMIT 200
-    """, (start_day.isoformat(), end_day.isoformat()))
-    rows = cur.fetchall()
+    """, (TARGET_MAC, start_day.isoformat(), end_day.isoformat()))
+    evs = cur.fetchall()
 
-    if not rows:
-        con.close()
-        return ""
-
-    # Para cada MAC, achar o primeiro "online" do dia (hora que entrou)
-    macs = list({r["mac"] for r in rows})
-    first_online_today = {}
-    if macs:
-        placeholders = ",".join(["?"] * len(macs))
-        cur.execute(f"""
-            SELECT mac, MIN(ts) AS first_online_ts
-            FROM events
-            WHERE type='online'
-              AND ts >= ? AND ts < ?
-              AND mac IN ({placeholders})
-            GROUP BY mac
-        """, [start_day.isoformat(), end_day.isoformat(), *macs])
-        for r in cur.fetchall():
-            first_online_today[r["mac"]] = r["first_online_ts"]
-
+    # Primeiro online do dia
+    cur.execute("""
+        SELECT MIN(ts) AS first_online_ts
+        FROM events
+        WHERE mac = ?
+          AND type = 'online'
+          AND ts >= ? AND ts < ?
+    """, (TARGET_MAC, start_day.isoformat(), end_day.isoformat()))
+    first_online = cur.fetchone()
     con.close()
 
-    def fmt_dt_iso(iso: str) -> str:
+    def fmt_iso(iso: str) -> str:
         if not iso:
             return "-"
         return iso.split(".")[0].replace("T", " ")
 
-    lines = []
-    for r in rows:
-        ignored = bool(r["ignored"])
-        if not should_notify(ignored):
-            continue
-
-        mac = r["mac"]
-        ts = fmt_dt_iso(r["ts"] or "")
-        vendor = r["vendor"] or "-"
-        hn = r["hostname"] or "-"
-
-        # first seen (quando apareceu pela primeira vez no sistema)
-        first_seen = fmt_dt_iso(r["first_seen"] or "")
-
-        # hora que entrou hoje (primeiro evento online do dia)
-        entered_today = fmt_dt_iso(first_online_today.get(mac, ""))
-
-        # tempo conectado hoje (sessions + trecho atual se online)
-        online_since = online_state[mac]["since"] if mac in online_state else None
-        td_sec = seconds_today(mac, online_since)
-        td = format_seconds(td_sec)
-
-        # status atual
-        is_online_now = mac in online_state
-        online_since_str = fmt_dt_iso(online_since.isoformat()) if online_since else "-"
-
-        if r["type"] == "new_mac":
-            lines.append(
-                f"[{ts}] NOVO  | {mac} | {r['ip'] or '-'} | {vendor} | {hn}\n"
-                f"         entrou_hoje: {entered_today} | tempo_hoje: {td} | agora: {'ONLINE' if is_online_now else 'offline'} | online_desde: {online_since_str} | first_seen: {first_seen}"
-            )
-
-        elif r["type"] == "ip_change":
-            old_ip = r["old_ip"] or "-"
-            lines.append(
-                f"[{ts}] IPCHG | {mac} | {old_ip} -> {r['ip'] or '-'} | {vendor} | {hn}\n"
-                f"         entrou_hoje: {entered_today} | tempo_hoje: {td} | agora: {'ONLINE' if is_online_now else 'offline'} | online_desde: {online_since_str} | first_seen: {first_seen}"
-            )
-
-    if not lines:
+    if not dev and not evs:
         return ""
 
-    header = f"Relatório NetWatch (hoje {now_tz().date().isoformat()})"
-    return header + "\n" + "\n".join(lines[:60])
+    vendor = (dev["vendor"] if dev else "") or "-"
+    ignored = bool(dev["ignored"]) if dev else False
+    last_ip = (dev["last_ip"] if dev else "") or "-"
+    hostname = (dev["hostname"] if dev else "") or "-"
+
+    entered_today = fmt_iso((first_online["first_online_ts"] if first_online else "") or "")
+    online_since = online_state[TARGET_MAC]["since"] if TARGET_MAC in online_state else None
+    td_sec = seconds_today(TARGET_MAC, online_since)
+    td = format_seconds(td_sec)
+    status_now = "ONLINE" if TARGET_MAC in online_state else "offline"
+    online_since_str = fmt_iso(online_since.isoformat()) if online_since else "-"
+
+    header = (
+        f"Relatório NetWatch (hoje {now_tz().date().isoformat()})\n"
+        f"MAC alvo: {TARGET_MAC}\n"
+        f"Status agora: {status_now} | online_desde: {online_since_str}\n"
+        f"IP atual (last_ip): {last_ip}\n"
+        f"Fabricante: {vendor}\n"
+        f"Host: {hostname}\n"
+        f"Ignorado: {'sim' if ignored else 'não'}\n"
+        f"Entrou hoje: {entered_today}\n"
+        f"Tempo conectado hoje: {td}\n"
+        f"Eventos do dia:"
+    )
+
+    if not evs:
+        return header + "\n- (nenhum evento hoje)"
+
+    lines = []
+    for e in evs[:60]:
+        ts = fmt_iso(e["ts"] or "")
+        t = e["type"]
+        ip = e["ip"] or "-"
+        old_ip = e["old_ip"] or "-"
+        hn = e["hostname"] or "-"
+        if t == "ip_change":
+            lines.append(f"- [{ts}] IPCHG {old_ip} -> {ip} | host={hn}")
+        else:
+            lines.append(f"- [{ts}] {t.upper()} ip={ip} | host={hn}")
+
+    return header + "\n" + "\n".join(lines)
 
 
 # =========================
@@ -784,34 +785,31 @@ def scanner_loop():
                 vendor = vendor_cache.get(mac, "") or vendor_from_mac(mac)
 
                 is_new, ip_changed, old_ip = upsert_device(mac, ip, hn, ignored, vendor)
-
                 last_seen_cache[mac] = t0
 
+                # ONLINE transition
                 if mac not in online_state:
                     online_state[mac] = {"ip": ip, "hostname": hn, "vendor": vendor, "since": t0}
                     insert_event("online", mac, ip, hn, "")
                     log_event(f"ONLINE: {mac} {ip} {vendor or '-'} {hn or '-'} (ignored={ignored})")
+
+                    # WhatsApp: APENAS quando o MAC alvo entra online
+                    notify_target_online(mac, ip, hn, vendor, ignored, t0)
+
                 else:
                     online_state[mac]["ip"] = ip
                     online_state[mac]["hostname"] = hn
                     online_state[mac]["vendor"] = vendor
 
-                # Notifica novo MAC
+                # Mantém histórico (sem WhatsApp) para new_mac e ip_change
                 if is_new:
                     log_event(f"NOVO MAC detectado: {mac} {ip} {vendor or '-'} {hn or '-'} (ignored={ignored})", "INFO")
-                    if should_notify(ignored):
-                        notify_new_mac(mac, ip, hn, vendor, ignored)
-                    else:
-                        log_event(f"Notificação suprimida (ignored={ignored}, NOTIFY_IGNORED={NOTIFY_IGNORED}).", "WARN")
 
-                # Notifica mudança de IP
                 if ip_changed:
                     insert_event("ip_change", mac, ip, hn, old_ip)
                     log_event(f"IP ALTERADO: {mac} {old_ip} -> {ip} (ignored={ignored})", "INFO")
-                    if should_notify(ignored):
-                        notify_ip_change(mac, old_ip, ip, hn, vendor, ignored)
 
-            # offline (grace)
+            # OFFLINE (grace)
             now_ = now_tz()
             for mac in list(online_state.keys()):
                 last = last_seen_cache.get(mac)
@@ -819,7 +817,9 @@ def scanner_loop():
                     sess_start = online_state[mac]["since"]
                     close_session(mac, sess_start, now_)
                     insert_event("offline", mac, online_state[mac]["ip"], online_state[mac]["hostname"], "")
-                    log_event(f"OFFLINE: {mac} (sessão {sess_start.strftime('%H:%M:%S')} -> {now_.strftime('%H:%M:%S')})")
+                    log_event(
+                        f"OFFLINE: {mac} (sessão {sess_start.strftime('%H:%M:%S')} -> {now_.strftime('%H:%M:%S')})"
+                    )
                     del online_state[mac]
 
             socketio.emit("devices", {"ts": now_tz().isoformat(), "devices": build_devices_payload()})
@@ -829,16 +829,16 @@ def scanner_loop():
 
         socketio.sleep(SCAN_INTERVAL_SEC)
 
+
 # =========================
-# Daily report loop (mantido)
+# Daily report loop
 # =========================
 REPORT_HOUR = int(os.environ.get("NETWATCH_REPORT_HOUR", "9"))
 REPORT_MIN = int(os.environ.get("NETWATCH_REPORT_MIN", "0"))
 
 def daily_report_loop():
     """
-    Mantém o seu comportamento original: envia 1x por dia se houver new_mac (não ignorados).
-    O botão /api/send_report cobre envio manual "a qualquer hora".
+    Envia 1x por dia (no horário configurado) um relatório do MAC alvo (se houver algo a reportar).
     """
     while True:
         try:
@@ -853,28 +853,9 @@ def daily_report_loop():
                 con.close()
 
                 if not already:
-                    start_day = datetime.combine(now_.date(), datetime.min.time(), tzinfo=TZ)
-                    end_day = start_day + timedelta(days=1)
+                    text = build_today_report_text()
 
-                    con = db()
-                    cur = con.cursor()
-                    cur.execute("""
-                        SELECT e.mac, e.ip, e.hostname, d.ignored, d.first_seen
-                        FROM events e
-                        JOIN devices d ON d.mac = e.mac
-                        WHERE e.type='new_mac' AND e.ts >= ? AND e.ts < ?
-                    """, (start_day.isoformat(), end_day.isoformat()))
-                    rows = cur.fetchall()
-                    con.close()
-
-                    new_rows = [r for r in rows if int(r["ignored"]) == 0]
-
-                    if new_rows:
-                        lines = []
-                        for r in new_rows[:25]:
-                            fs = (r["first_seen"] or "").split(".")[0].replace("T", " ")
-                            lines.append(f"- {r['mac']} | {r['ip'] or '-'} | {r['hostname'] or '-'} | {fs}")
-                        text = "Relatório diário (novos dispositivos detectados)\n" + "\n".join(lines)
+                    if text and WHATSAPP_NUMBERS:
                         for num in WHATSAPP_NUMBERS:
                             evo_send_text(num, text)
 
@@ -882,12 +863,12 @@ def daily_report_loop():
                         cur = con.cursor()
                         cur.execute(
                             "INSERT INTO daily_reports(day, sent_ts, new_count) VALUES(?,?,?)",
-                            (today_str, now_.isoformat(), len(new_rows))
+                            (today_str, now_.isoformat(), 1)
                         )
                         con.commit()
                         con.close()
 
-                        log_event(f"Relatório diário enviado. Novos={len(new_rows)}", "INFO")
+                        log_event("Relatório diário enviado (MAC alvo).", "INFO")
                     else:
                         con = db()
                         cur = con.cursor()
@@ -898,7 +879,7 @@ def daily_report_loop():
                         con.commit()
                         con.close()
 
-                        log_event("Relatório diário: nenhum MAC novo hoje (nenhuma mensagem enviada).", "INFO")
+                        log_event("Relatório diário: nada a enviar (MAC alvo sem eventos ou WA vazio).", "INFO")
 
                 socketio.sleep(65)
             else:
@@ -907,6 +888,7 @@ def daily_report_loop():
         except Exception as e:
             log_event(f"Erro no daily_report_loop: {e}", "ERROR")
             socketio.sleep(10)
+
 
 # =========================
 # Web UI
@@ -1061,29 +1043,31 @@ def api_health():
         "scan_interval_sec": SCAN_INTERVAL_SEC,
         "offline_grace_sec": OFFLINE_GRACE_SEC,
         "rdns": ENABLE_RDNS,
-        "notify_ignored": NOTIFY_IGNORED,
-        "wa_numbers": WHATSAPP_NUMBERS
+        "wa_numbers": WHATSAPP_NUMBERS,
+        "target_mac": TARGET_MAC,
+        "online_notify_cooldown_sec": ONLINE_NOTIFY_COOLDOWN_SEC,
     })
 
 @app.route("/api/send_report", methods=["POST"])
 def api_send_report():
     """
     Botão do site chama isso.
-    Envia relatório do dia (novos MACs + mudanças de IP).
+    Envia relatório do dia (MAC alvo).
     """
     if not WHATSAPP_NUMBERS:
         return jsonify({"sent": False, "reason": "WHATSAPP_NUMBERS vazio"}), 400
 
     text = build_today_report_text()
     if not text:
-        log_event("Relatório manual: nada para enviar.", "INFO")
-        return jsonify({"sent": False, "reason": "nenhum evento hoje"}), 200
+        log_event("Relatório manual: nada para enviar (MAC alvo sem eventos).", "INFO")
+        return jsonify({"sent": False, "reason": "nenhum evento do MAC alvo hoje"}), 200
 
     for num in WHATSAPP_NUMBERS:
         evo_send_text(num, text)
 
     log_event("Relatório manual enviado (botão).", "INFO")
     return jsonify({"sent": True}), 200
+
 
 # =========================
 # Main
@@ -1092,11 +1076,14 @@ if __name__ == "__main__":
     ensure_interface()
     init_db()
 
+    log_event(f"Config: TARGET_MAC={TARGET_MAC}, WA={WHATSAPP_NUMBERS}", "INFO")
+
     socketio.start_background_task(scanner_loop)
     socketio.start_background_task(daily_report_loop)
 
     log_event(f"Web UI iniciada em http://0.0.0.0:{PORT}", "INFO")
     socketio.run(app, host="0.0.0.0", port=PORT, allow_unsafe_werkzeug=True)
+
 EOF
 
 

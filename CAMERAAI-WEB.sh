@@ -1,12 +1,5 @@
 sudo apt update
- sudo apt-get install -y python3-requests  ffmpeg v4l-utils libgl1-mesa-glx libglib2.0-0
-
-
- 
- 
-
-
-
+sudo apt-get install -y  python3-flask python3-requests  ffmpeg v4l-utils libgl1-mesa-glx libglib2.0-0 python3-pip
 
 pip install flask opencv-python opencv-python-headless --break-system-packages
 
@@ -18,14 +11,17 @@ pip install flask opencv-python opencv-python-headless --break-system-packages
 
 
 
-finalmente o codigo 
+
 
 
 
 
 //app.py
 
-sudo tee /usr/local/bin/app.py >/dev/null <<'PYEOF'
+
+sudo mkdir -p /opt/mirakocam
+
+sudo tee /opt/mirakocam/app.py >/dev/null <<'PYEOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os, cv2, time, glob, threading, platform, subprocess, re, json, stat
@@ -2965,8 +2961,8 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/usr/local/bin/
-ExecStart=/usr/bin/python3 /usr/local/bin/app.py
+WorkingDirectory=/opt/mirakocam/
+ExecStart=/usr/bin/python3 /opt/mirakocam/app.py
 Restart=always
 RestartSec=5
 Environment=PORT=5000

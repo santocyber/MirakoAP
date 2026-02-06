@@ -5,8 +5,9 @@ lsblk
 
 Com o SD desmontado (sudo umount /dev/sdb*), crie a imagem:
 
+sudo umount /dev/mmcblk*
 
-sudo dd if=/dev/mmcblk0 of=MirakoAP_orangepi_zero3.img bs=4M status=progress
+sudo dd if=/dev/mmcblk0 of=MirakoAP_orangepi_zero3_by_santocyber_FINAL.img bs=4M status=progress
 
 
 sync
@@ -24,14 +25,14 @@ sudo chmod +x pishrink.sh
 
 
 
-sudo ./pishrink.sh MirakoAP_orangepi_zero3.img MirakoAP-final-orangepi-distro-by-santocyber.img
+sudo ./pishrink.sh MirakoAP_orangepi_zero3_by_santocyber_FINAL.img MirakoAP_orangepi_zero3_by_santocyber_FINAL-shrink.img
 
 
 
 
 
 
-gzip MirakoAP-final-orangepi-distro-by-santocyber.img
+gzip MirakoAP_orangepi_zero3_by_santocyber_FINAL-shrink.img
 
 
 sudo apt install rpi-imager
