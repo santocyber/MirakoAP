@@ -3272,7 +3272,7 @@ WIFI_DHCP_TIMEOUT="${WIFI_DHCP_TIMEOUT:-12}"            # timeout DHCP no wlan0
 WIFI_GW_PING_TIMEOUT="${WIFI_GW_PING_TIMEOUT:-2}"       # ping gateway (seg)
 
 DHCP_WAN_TIMEOUT="${DHCP_WAN_TIMEOUT:-12}"              # dhcp no WAN (ex: end0 no perfil AP)
-AP_FALLBACK_MARK_WINDOW="${AP_FALLBACK_MARK_WINDOW:-180}"  # marcação do fallback (seg)
+AP_FALLBACK_MARK_WINDOW="${AP_FALLBACK_MARK_WINDOW:-1800}"  # marcação do fallback (seg)
 
 # ================= WIFI VALIDATION =================
 # Modos:
