@@ -3,10 +3,7 @@ sudo pip3 install dbus-next --break-system-packages
 sudo modprobe rfcomm
 sudo modprobe bnep
 
-sudo nano /etc/bluetooth/main.conf
-[General]
-JustWorksRepairing = always
-Experimental = true
+
 
 
 
@@ -1210,7 +1207,10 @@ ls -l /dev/rfcomm0
 
 
 
-
+sudo nano /etc/bluetooth/main.conf
+[General]
+JustWorksRepairing = always
+Experimental = true
 
 
 

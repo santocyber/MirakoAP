@@ -4,7 +4,7 @@ EOF
 
 apt update
 apt install -y python3 python3-pip android-tools-adb adb
-pip3 install flask
+pip3 install flask --break-system-packages
 
 
 
